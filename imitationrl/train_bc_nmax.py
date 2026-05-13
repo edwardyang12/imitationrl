@@ -146,7 +146,7 @@ class StudentActor(nn.Module):
 def train_behavioral_cloning():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    n_max = 10
+    n_max = 8
     batch_size = 32768
     n_values_to_train = [3, 4, 5, 6, 7, 8]
     
