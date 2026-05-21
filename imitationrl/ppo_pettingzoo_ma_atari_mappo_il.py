@@ -213,7 +213,7 @@ class Agent(nn.Module):
         obs_shape = envs.single_observation_space.shape
         self.obs_dim = np.array(obs_shape).prod()
         # self.value_normalizer = ValueNormalizer(num_agents)
-        self.obs_normalizer = ObservationNormalizer(self.obs_dim)
+        # self.obs_normalizer = ObservationNormalizer(self.obs_dim)
 
         self.continuous_state_dim = state_dim - self.num_agents
         self.state_normalizer = ObservationNormalizer(self.continuous_state_dim)
@@ -265,10 +265,10 @@ class Agent(nn.Module):
 
     def get_value(self, x, centralized_state=None, denormalize=False):
         if centralized_state is None:
-            x_norm = self.obs_normalizer.normalize(x)
+            # x_norm = self.obs_normalizer.normalize(x)
             batch_size = x.shape[0]
             num_games = batch_size // self.num_agents
-            proxy_state = x_norm.view(num_games, -1)
+            proxy_state = x.view(num_games, -1)
             centralized_state = self.critic_projection(proxy_state)
         else:
             continuous_part = centralized_state[..., :-self.num_agents]
@@ -286,11 +286,11 @@ class Agent(nn.Module):
 
     # Shared Actor
     def get_action_and_value(self, x, action=None, centralized_state=None, denormalize=False):
-        x_norm = self.obs_normalizer.normalize(x)
+        # x_norm = self.obs_normalizer.normalize(x)
         batch_size = x.shape[0]
         
         # Reshape to [NumGames, NumAgents, ObsDim]
-        obs_reshaped = x_norm.view(-1, self.num_agents, self.obs_dim)
+        obs_reshaped = x.view(-1, self.num_agents, self.obs_dim)
         
         # VECTORIZED FORWARD PASS: Process all agents simultaneously
         logits = self.actor(obs_reshaped) 
@@ -602,7 +602,7 @@ if __name__ == "__main__":
     #                 list(agent.critic_projection.parameters()), 'lr': 1e-3} 
     #     ], eps=1e-5)
     
-    agent.load_bc_weights("expert_data/student_bc_best_6.pt")
+    agent.load_bc_weights("expert_data/student_bc_best_8.pt")
 
     # behavorial clone optimizer
     optimizer = optim.Adam([
@@ -630,10 +630,18 @@ if __name__ == "__main__":
             for i, param_group in enumerate(optimizer.param_groups):
                 # We fetch the initial_lr we set in the Adam constructor
                 # If we didn't store it, we can use the current group's base
-                if i == 0: # this one needs to match actor initial learning rate
-                    initial_lr = 5e-5 
-                    param_group["lr"] = max(5e-5, frac * initial_lr)
-                else:
+                if i == 0: # ACTOR
+                    if update <= 50:
+                        # PHASE 1: CRITIC WARMUP
+                        # Freeze the Actor completely so the Critic can map the Value 
+                        # of the expert BC weights without destroying them.
+                        param_group["lr"] = 0.0
+                    else:
+                        # PHASE 2: GENTLE FINE-TUNING
+                        # Unfreeze with the conservative learning rate
+                        initial_lr = 5e-5 
+                        param_group["lr"] = max(5e-6, frac * initial_lr)
+                else: # CRITIC
                     initial_lr = 1e-3
                     param_group["lr"] = max(1e-4, frac * initial_lr)
                 
@@ -829,7 +837,7 @@ if __name__ == "__main__":
             # 2. UPDATE STATS NOW (Before SGD)1
             # This aligns the normalizers with the data we just collected
             agent.critic.update(b_returns.view(-1, agent.num_agents))
-            agent.obs_normalizer.update(b_obs)
+            # agent.obs_normalizer.update(b_obs)
 
             continuous_b_states = b_states[:, :-args.num_landmarks]
             agent.state_normalizer.update(continuous_b_states)

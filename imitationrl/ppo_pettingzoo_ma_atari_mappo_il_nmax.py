@@ -166,7 +166,7 @@ class Agent(nn.Module):
         obs_shape = envs.single_observation_space.shape
         self.obs_dim = np.array(obs_shape).prod()
         # self.value_normalizer = ValueNormalizer(num_agents)
-        self.obs_normalizer = ObservationNormalizer(self.obs_dim)
+        # self.obs_normalizer = ObservationNormalizer(self.obs_dim)
 
         self.continuous_state_dim = state_dim - self.num_agents
         self.state_normalizer = ObservationNormalizer(self.continuous_state_dim)
@@ -218,10 +218,10 @@ class Agent(nn.Module):
 
     def get_value(self, x, centralized_state=None, denormalize=False):
         if centralized_state is None:
-            x_norm = self.obs_normalizer.normalize(x)
+            # x_norm = self.obs_normalizer.normalize(x)
             batch_size = x.shape[0]
             num_games = batch_size // self.num_agents
-            proxy_state = x_norm.view(num_games, -1)
+            proxy_state = x.view(num_games, -1)
             centralized_state = self.critic_projection(proxy_state)
         else:
             continuous_part = centralized_state[..., :-self.num_agents]
@@ -239,11 +239,11 @@ class Agent(nn.Module):
 
     # Shared Actor
     def get_action_and_value(self, x, action=None, centralized_state=None, denormalize=False):
-        x_norm = self.obs_normalizer.normalize(x)
+        # x_norm = self.obs_normalizer.normalize(x)
         batch_size = x.shape[0]
         
         # Reshape to [NumGames, NumAgents, ObsDim]
-        obs_reshaped = x_norm.view(-1, self.num_agents, self.obs_dim)
+        obs_reshaped = x.view(-1, self.num_agents, self.obs_dim)
         
         # VECTORIZED FORWARD PASS: Process all agents simultaneously
         logits = self.actor(obs_reshaped) 
@@ -329,20 +329,36 @@ class NMaxObservationWrapper(BaseParallelWrapper):
             for agent in self.possible_agents
         }
         
+        # Initialize locked slot placeholders
+        self.landmark_slots = None
+        self.agent_slots = None
+        self.id_slots = None
+
+    def reset(self, seed=None, options=None):
+        # 1. LOCK THE PERMUTATION ONCE PER EPISODE
+        self.landmark_slots = np.random.choice(self.n_max, self.current_n, replace=False)
+        self.agent_slots = np.random.choice(self.n_max - 1, self.current_n - 1, replace=False)
+        self.id_slots = np.random.choice(self.n_max, self.current_n, replace=False)
+
+        obs, infos = self.env.reset(seed=seed, options=options)
+        for agent in self.agents:
+            infos[agent]["raw_obs"] = obs[agent]
+        padded_obs = {agent: self.pad_obs(obs[agent]) for agent in obs}
+        return padded_obs, infos
+        
     def pad_obs(self, raw_obs):
         N = self.current_n
         frames_part = raw_obs[:-N]
         indicator_part = raw_obs[-N:]
         frames = frames_part.reshape(4, 6 * N)
         
-        landmark_slots = np.random.choice(self.n_max, N, replace=False)
-        agent_slots = np.random.choice(self.n_max - 1, N - 1, replace=False)
-        
         padded_frames = np.zeros((4, 6 * self.n_max), dtype=np.float32)
         padded_frames[:, 0:4] = frames[:, 0:4]
         
         landmarks = frames[:, 4:4+2*N].reshape(4, N, 2)
-        for i, slot in enumerate(landmark_slots):
+        
+        # 2. USE THE LOCKED SLOTS (No more random generation here)
+        for i, slot in enumerate(self.landmark_slots):
             idx_offset = 4 + (slot * 2)
             padded_frames[:, idx_offset:idx_offset+2] = landmarks[:, i, :]
             
@@ -351,15 +367,14 @@ class NMaxObservationWrapper(BaseParallelWrapper):
         other_vel_start = other_pos_start + 2*(N-1)
         other_vel = frames[:, other_vel_start:6*N].reshape(4, N-1, 2)
         
-        for i, slot in enumerate(agent_slots):
+        for i, slot in enumerate(self.agent_slots):
             pos_idx = 4 + 2*self.n_max + (slot * 2)
             padded_frames[:, pos_idx:pos_idx+2] = other_pos[:, i, :]
             vel_idx = 4 + 2*self.n_max + 2*(self.n_max - 1) + (slot * 2)
             padded_frames[:, vel_idx:vel_idx+2] = other_vel[:, i, :]
             
         original_agent_idx = np.argmax(indicator_part)
-        available_id_slots = np.random.choice(self.n_max, N, replace=False)
-        new_agent_idx = available_id_slots[original_agent_idx]
+        new_agent_idx = self.id_slots[original_agent_idx]
         
         padded_indicator = np.zeros(self.n_max, dtype=np.float32)
         padded_indicator[new_agent_idx] = 1.0
@@ -369,18 +384,10 @@ class NMaxObservationWrapper(BaseParallelWrapper):
         
     def step(self, actions):
         obs, rews, terms, truncs, infos = self.env.step(actions)
-        # Store the unpadded physics for the Critic
         for agent in self.agents:
             infos[agent]["raw_obs"] = obs[agent] 
         padded_obs = {agent: self.pad_obs(obs[agent]) for agent in obs}
         return padded_obs, rews, terms, truncs, infos
-        
-    def reset(self, seed=None, options=None):
-        obs, infos = self.env.reset(seed=seed, options=options)
-        for agent in self.agents:
-            infos[agent]["raw_obs"] = obs[agent]
-        padded_obs = {agent: self.pad_obs(obs[agent]) for agent in obs}
-        return padded_obs, infos
 
 # 1. Base Environment Factory
 def make_env(args, env_id, seed, current_local_ratio=0.5):
@@ -660,10 +667,18 @@ if __name__ == "__main__":
             for i, param_group in enumerate(optimizer.param_groups):
                 # We fetch the initial_lr we set in the Adam constructor
                 # If we didn't store it, we can use the current group's base
-                if i == 0: # this one needs to match actor initial learning rate
-                    initial_lr = 5e-5 
-                    param_group["lr"] = max(5e-6, frac * initial_lr)
-                else:
+                if i == 0: # ACTOR
+                    if update <= 50:
+                        # PHASE 1: CRITIC WARMUP
+                        # Freeze the Actor completely so the Critic can map the Value 
+                        # of the expert BC weights without destroying them.
+                        param_group["lr"] = 0.0
+                    else:
+                        # PHASE 2: GENTLE FINE-TUNING
+                        # Unfreeze with the conservative learning rate
+                        initial_lr = 5e-5 
+                        param_group["lr"] = max(5e-6, frac * initial_lr)
+                else: # CRITIC
                     initial_lr = 1e-3
                     param_group["lr"] = max(1e-4, frac * initial_lr)
                 
@@ -832,7 +847,7 @@ if __name__ == "__main__":
                 final_state = next_obs.view(num_games, -1)
 
                 raw_obs_tensor = torch.Tensor(next_info["raw_obs"]).to(device)
-                landmark_dist = next_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
+                landmark_dist = raw_obs_tensor.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
                 landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
                 occupied = (torch.norm(landmark_dist, dim=-1) < strict_occupancy_radius).any(dim=1).float()
                 final_state = torch.cat([final_state, occupied], dim=-1)
@@ -863,7 +878,7 @@ if __name__ == "__main__":
             # 2. UPDATE STATS NOW (Before SGD)1
             # This aligns the normalizers with the data we just collected
             agent.critic.update(b_returns.view(-1, agent.num_agents))
-            agent.obs_normalizer.update(b_obs)
+            # agent.obs_normalizer.update(b_obs)
 
             continuous_b_states = b_states[:, :-args.num_landmarks]
             agent.state_normalizer.update(continuous_b_states)
