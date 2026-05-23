@@ -407,7 +407,7 @@ def make_env(args, env_id, seed, current_local_ratio=0.5):
         env = ss.frame_stack_v1(env, 4)
         env = ss.agent_indicator_v0(env, type_only=False)
 
-        env = NMaxObservationWrapper(env, n_max=8, current_n=args.num_landmarks)
+        env = NMaxObservationWrapper(env, n_max=10, current_n=args.num_landmarks)
         
         # SuperSuit natively converts (Agents, Obs) -> (Batch, Obs)
         env = ss.pettingzoo_env_to_vec_env_v1(env)
@@ -614,7 +614,9 @@ if __name__ == "__main__":
     if "global_state" in next_info:
         # Use the actual shape of the global state provided by your wrappers
         # state_dim = next_info["global_state"].shape[-1]
-        state_dim = (num_agents_per_game * np.array(envs.single_observation_space.shape).prod()) + args.num_landmarks
+        raw_obs_dim = len(next_info["raw_obs"][0])
+        state_dim = (num_agents_per_game * raw_obs_dim) + args.num_landmarks
+        # state_dim = (num_agents_per_game * np.array(envs.single_observation_space.shape).prod()) + args.num_landmarks
 
         state0 = next_info["global_state"][0]
         state1 = next_info["global_state"][num_agents_per_game] if len(next_info["global_state"]) > 1 else None
@@ -639,7 +641,7 @@ if __name__ == "__main__":
     #                 list(agent.critic_projection.parameters()), 'lr': 1e-3} 
     #     ], eps=1e-5)
     
-    agent.load_bc_weights("student_bc_best_nmax8.pt")
+    agent.load_bc_weights("student_bc_best_nmax10.pt")
 
     # behavorial clone optimizer
     optimizer = optim.Adam([
@@ -676,8 +678,8 @@ if __name__ == "__main__":
                     else:
                         # PHASE 2: GENTLE FINE-TUNING
                         # Unfreeze with the conservative learning rate
-                        initial_lr = 5e-5 
-                        param_group["lr"] = max(5e-6, frac * initial_lr)
+                        initial_lr = 1e-5 
+                        param_group["lr"] = max(1e-6, frac * initial_lr)
                 else: # CRITIC
                     initial_lr = 1e-3
                     param_group["lr"] = max(1e-4, frac * initial_lr)
@@ -731,9 +733,10 @@ if __name__ == "__main__":
             dones[step] = next_done
             if "global_state" in next_info:
                 # current_game_states = torch.Tensor(next_info["global_state"][::num_agents_per_game]).to(device)
-                current_game_states = next_obs.view(num_games, -1)
-
                 raw_obs_tensor = torch.Tensor(next_info["raw_obs"]).to(device)
+
+                current_game_states = raw_obs_tensor.view(num_games, -1)
+
                 landmark_dist = raw_obs_tensor.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
                 landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
                 occupied = (torch.norm(landmark_dist, dim=-1) < strict_occupancy_radius).any(dim=1).float()
@@ -844,9 +847,9 @@ if __name__ == "__main__":
             if "global_state" in next_info:
                 # True global state for MPE
                 # final_state = torch.Tensor(next_info["global_state"][::num_agents_per_game]).to(device)
-                final_state = next_obs.view(num_games, -1)
-
                 raw_obs_tensor = torch.Tensor(next_info["raw_obs"]).to(device)
+                final_state = raw_obs_tensor.view(num_games, -1)
+
                 landmark_dist = raw_obs_tensor.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
                 landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
                 occupied = (torch.norm(landmark_dist, dim=-1) < strict_occupancy_radius).any(dim=1).float()
