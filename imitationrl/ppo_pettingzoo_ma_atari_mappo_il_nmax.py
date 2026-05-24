@@ -346,6 +346,9 @@ class NMaxObservationWrapper(BaseParallelWrapper):
         padded_obs = {agent: self.pad_obs(obs[agent]) for agent in obs}
         return padded_obs, infos
         
+    def observation_space(self, agent):
+        return self.observation_spaces[agent]
+    
     def pad_obs(self, raw_obs):
         N = self.current_n
         frames_part = raw_obs[:-N]
@@ -678,8 +681,8 @@ if __name__ == "__main__":
                     else:
                         # PHASE 2: GENTLE FINE-TUNING
                         # Unfreeze with the conservative learning rate
-                        initial_lr = 1e-5 
-                        param_group["lr"] = max(1e-6, frac * initial_lr)
+                        initial_lr = 5e-5 
+                        param_group["lr"] = max(5e-6, frac * initial_lr)
                 else: # CRITIC
                     initial_lr = 1e-3
                     param_group["lr"] = max(1e-4, frac * initial_lr)
