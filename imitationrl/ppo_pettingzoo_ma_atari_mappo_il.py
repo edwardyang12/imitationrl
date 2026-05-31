@@ -379,7 +379,7 @@ def make_env(args, env_id, seed, current_local_ratio=0.5):
             env = ss.color_reduction_v0(env, mode="B")
             env = ss.resize_v1(env, x_size=84, y_size=84)
             env = ss.clip_reward_v0(env, lower_bound=-1, upper_bound=1)
-        env = ss.frame_stack_v1(env, 4) ### IMPORTANT WE COULD PROBABLY REMOVE FRAME STACK
+            env = ss.frame_stack_v1(env, 4) ### IMPORTANT ONLY FOR ATARI GAMES
         env = ss.agent_indicator_v0(env, type_only=False)
         
         # SuperSuit natively converts (Agents, Obs) -> (Batch, Obs)
@@ -717,7 +717,7 @@ if __name__ == "__main__":
             # Gymnasium step returns (obs, reward, terminations, truncations, infos)
             if len(step_data) == 5:
                 next_obs, reward, terminations, truncations, next_info = step_data
-                done = np.logical_or(terminations, truncations) # Combine for PPO
+                done = terminations
             else:
                 next_obs, reward, done, next_info = step_data
 
@@ -839,9 +839,6 @@ if __name__ == "__main__":
             agent.critic.update(b_returns.view(-1, agent.num_agents))
             # agent.obs_normalizer.update(b_obs)
 
-            continuous_b_states = b_states[:, :-args.num_landmarks]
-            agent.state_normalizer.update(continuous_b_states)
-
             # 3. Second Pass: RE-CALCULATE Values and Advantages with NEW stats
             # This is the crucial step you were missing. 
             # It ensures 'values' and 'returns' are in the same normalized space for SGD.
@@ -850,7 +847,7 @@ if __name__ == "__main__":
                 # get_value now uses the updated normalization buffers
                 new_values[t] = agent.get_value(obs[t], centralized_state=states[t], denormalize=True).flatten()
             
-            new_next_value = agent.get_value(next_obs, centralized_state=final_state, denormalize=True).reshape(1, -1)
+            new_next_value = agent.get_value(next_obs, centralized_state=final_state, denormalize=True).flatten()
             
             # Final GAE calculation for the actual SGD update
             advantages = torch.zeros_like(rewards).to(device)
@@ -969,6 +966,9 @@ if __name__ == "__main__":
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
                     break
+
+        continuous_b_states = b_states[:, :-args.num_landmarks]
+        agent.state_normalizer.update(continuous_b_states)
         if update % 500 == 0:
                 gc.collect()
 

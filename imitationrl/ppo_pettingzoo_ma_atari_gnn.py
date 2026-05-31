@@ -103,23 +103,26 @@ class GraphObservationNormalizer(nn.Module):
         self.feature_dim = feature_dim
         self.continuous_dim = continuous_dim
         
-        # Only track stats for the continuous spatial features
-        shape = (n_max, continuous_dim)
+        # FIX 1: Track a single global (4,) vector for the physics space, NOT per-node
+        shape = (continuous_dim,)
         self.register_buffer("running_mean", torch.zeros(shape))
         self.register_buffer("running_var", torch.ones(shape))
         self.count = epsilon
 
     def update(self, x_flat):
-        # x_flat shape: [Batch, n_max * feature_dim]
         B = x_flat.shape[0]
         x_reshaped = x_flat.view(B, self.n_max, self.feature_dim)
         
-        # Only extract and update based on the continuous features
-        continuous_x = x_reshaped[:, :, :self.continuous_dim]
+        # FIX 2: Only extract and calculate statistics on VALID, active nodes
+        active_mask = x_reshaped[:, :, 6] > 0.5 
+        valid_x = x_reshaped[active_mask] # Shape: [Total_Valid_Nodes_in_Batch, 7]
         
-        batch_mean = continuous_x.mean(dim=0)
+        continuous_x = valid_x[:, :self.continuous_dim] # Shape: [Total_Valid_Nodes_in_Batch, 4]
+        
+        # Average across all valid nodes, regardless of which slot they sit in
+        batch_mean = continuous_x.mean(dim=0) 
         batch_var = continuous_x.var(dim=0, unbiased=False)
-        batch_count = B
+        batch_count = continuous_x.shape[0]
 
         delta = batch_mean - self.running_mean
         new_mean = self.running_mean + delta * batch_count / (self.count + batch_count)
@@ -135,11 +138,15 @@ class GraphObservationNormalizer(nn.Module):
         B = x_flat.shape[0]
         x_reshaped = x_flat.view(B, self.n_max, self.feature_dim).clone()
         
-        continuous_x = x_reshaped[:, :, :self.continuous_dim]
-        normalized_continuous = (continuous_x - self.running_mean) / torch.sqrt(self.running_var + 1e-8)
+        # FIX 3: Apply the global normalization ONLY to active nodes
+        active_mask = x_reshaped[:, :, 6] > 0.5
         
-        # Inject the normalized continuous features back in, preserving the booleans
-        x_reshaped[:, :, :self.continuous_dim] = normalized_continuous
+        valid_continuous = x_reshaped[active_mask][:, :self.continuous_dim]
+        normalized_continuous = (valid_continuous - self.running_mean) / torch.sqrt(self.running_var + 1e-8)
+        
+        # Inject the normalized continuous features back into the cloned tensor
+        x_reshaped[active_mask, :self.continuous_dim] = normalized_continuous
+        
         return x_reshaped.view(B, -1)
 
 class MultiHeadGATBackbone(nn.Module):
@@ -782,7 +789,7 @@ if __name__ == "__main__":
             # Gymnasium step returns (obs, reward, terminations, truncations, infos)
             if len(step_data) == 5:
                 next_obs, reward, terminations, truncations, next_info = step_data
-                done = np.logical_or(terminations, truncations) # Combine for PPO
+                done = terminations
             else:
                 next_obs, reward, done, next_info = step_data
 
@@ -904,7 +911,6 @@ if __name__ == "__main__":
             # 2. UPDATE STATS NOW (Before SGD)1
             # This aligns the normalizers with the data we just collected
             agent.critic_popart.update(b_returns.view(-1, agent.num_agents))
-            agent.obs_normalizer.update(b_obs)
 
             # 3. Second Pass: RE-CALCULATE Values and Advantages with NEW stats
             # This is the crucial step you were missing. 
@@ -1033,6 +1039,8 @@ if __name__ == "__main__":
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
                     break
+
+        agent.obs_normalizer.update(b_obs)
         if update % 500 == 0:
                 gc.collect()
 

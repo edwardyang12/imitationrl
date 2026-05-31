@@ -121,39 +121,6 @@ class ObservationNormalizer(nn.Module):
     def normalize(self, x):
         return (x - self.running_mean) / torch.sqrt(self.running_var + 1e-8)
 
-class ValueNormalizer(nn.Module):
-    def __init__(self, num_agents, epsilon=1e-5):
-        super().__init__()
-        # Initialize as 1D tensors for broadcasting
-        self.register_buffer("running_mean", torch.zeros(num_agents))
-        self.register_buffer("running_var", torch.ones(num_agents))
-        self.epsilon = epsilon
-
-    def update(self, x):
-        num_agents = self.running_mean.shape[0]
-        # Reshape flattened batch to [N, num_agents]
-        x_reshaped = x.view(-1, num_agents)
-        batch_mean = x_reshaped.mean(dim=0)
-        batch_var = x_reshaped.var(dim=0)
-        
-        self.running_mean = 0.99 * self.running_mean + 0.01 * batch_mean
-        self.running_var = 0.99 * self.running_var + 0.01 * batch_var
-
-    def normalize(self, x):
-        num_agents = self.running_mean.shape[0]
-        # Reshape to [N, num_agents] to allow broadcasting across rows
-        original_shape = x.shape
-        x_reshaped = x.view(-1, num_agents)
-        normalized = (x_reshaped - self.running_mean) / torch.sqrt(self.running_var + self.epsilon)
-        return normalized.view(original_shape)
-
-    def denormalize(self, x):
-        num_agents = self.running_mean.shape[0]
-        original_shape = x.shape
-        x_reshaped = x.view(-1, num_agents)
-        denormalized = x_reshaped * torch.sqrt(self.running_var + self.epsilon) + self.running_mean
-        return denormalized.view(original_shape)
-
 class PopArt(nn.Module):
     def __init__(self, input_dim, output_dim, beta=0.99):
         super().__init__()
@@ -191,20 +158,6 @@ class PopArt(nn.Module):
     
     def normalize(self, x):
         return (x - self.mean) / torch.sqrt(self.std**2 + 1e-8)
-
-class RewardNormalizer:
-    def __init__(self, num_envs, gamma=0.99):
-        self.returns = np.zeros(num_envs)
-        self.gamma = gamma
-        self.running_std = 1.0
-
-    def __call__(self, rewards, dones):
-        # Track discounted returns to estimate reward scale
-        self.returns = self.returns * self.gamma + rewards
-        self.running_std = 0.99 * self.running_std + 0.01 * np.std(self.returns)
-        # Reset returns for finished episodes
-        self.returns[dones > 0] = 0
-        return rewards / (self.running_std + 1e-8)
 
 class Agent(nn.Module):
     def __init__(self, envs, num_agents, state_dim):
@@ -332,7 +285,7 @@ def make_env(args, env_id, seed, current_local_ratio=0.5):
             env = ss.color_reduction_v0(env, mode="B")
             env = ss.resize_v1(env, x_size=84, y_size=84)
             env = ss.clip_reward_v0(env, lower_bound=-1, upper_bound=1)
-            env = ss.frame_stack_v1(env, 4) ### IMPORTANT ONLY FOR ATARI GAMES
+        env = ss.frame_stack_v1(env, 4) ### IMPORTANT WE COULD PROBABLY REMOVE FRAME STACK
         env = ss.agent_indicator_v0(env, type_only=False)
         
         # SuperSuit natively converts (Agents, Obs) -> (Batch, Obs)
@@ -354,15 +307,12 @@ class DictInfoWrapper(gym.vector.VectorEnv):
 
     def step(self, action):
         obs, rew, term, trunc, info = self.env.step(action)
+        # SuperSuit's concat_vec_envs returns a list of agent info dicts
         if isinstance(info, list):
+            # Flatten the info for Gymnasium wrappers while preserving our custom key
+            # Extract global_state from the first agent's info to the top level
             global_state_list = [i.get("global_state") for i in info]
-            # Safely extract true final observations if they exist
-            final_obs_list = [i.get("final_observation", None) for i in info]
-            info = {
-                "global_state": np.array(global_state_list), 
-                "final_obs": final_obs_list, # PRESERVE THIS
-                "agents": info
-            }
+            info = {"global_state": np.array(global_state_list), "agents": info}
         return obs, rew, term, trunc, info
         
     def reset(self, seed=None, options=None):
@@ -462,7 +412,7 @@ def build_environments(args, run_name, base_seed, current_local_ratio=0.5, updat
     if args.capture_video:
         envs = gym.wrappers.vector.RecordVideo(
             envs, 
-            f"videos_mlp/{run_name}", 
+            f"videos/{run_name}", 
             episode_trigger=lambda x: x % 2000 == 0,
             name_prefix=f"rl-video-update_{update_step}"
         )
@@ -655,7 +605,7 @@ if __name__ == "__main__":
             # Gymnasium step returns (obs, reward, terminations, truncations, infos)
             if len(step_data) == 5:
                 next_obs, reward, terminations, truncations, next_info = step_data
-                done = terminations
+                done = np.logical_or(terminations, truncations) # Combine for PPO
             else:
                 next_obs, reward, done, next_info = step_data
 
@@ -740,28 +690,19 @@ if __name__ == "__main__":
 
         # bootstrap value if not done
         with torch.no_grad():
-            
-            # 1. CREATE BOOTSTRAP_OBS FIRST
-            bootstrap_obs = next_obs.clone() 
-            if "final_obs" in next_info:
-                for agent_idx, final_obs in enumerate(next_info["final_obs"]):
-                    if final_obs is not None:
-                        # Direct 1-to-1 assignment for the specific agent
-                        bootstrap_obs[agent_idx] = torch.Tensor(final_obs).to(device)
-
-            # 2. BUILD FINAL STATE FROM BOOTSTRAP_OBS (Not next_obs!)
             if "global_state" in next_info:
-                final_state = bootstrap_obs.view(num_games, -1)
-                landmark_dist = bootstrap_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
+                # True global state for MPE
+                # final_state = torch.Tensor(next_info["global_state"][::num_agents_per_game]).to(device)
+                final_state = next_obs.view(num_games, -1)
+                landmark_dist = next_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
                 landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
                 occupied = (torch.norm(landmark_dist, dim=-1) < strict_occupancy_radius).any(dim=1).float()
                 final_state = torch.cat([final_state, occupied], dim=-1)
             else:
                 # Fallback for Atari: Proxy state from observations
-                final_state = bootstrap_obs.view(num_games, -1)
+                final_state = next_obs.view(num_games, -1)
 
-            # 3. FIRST PASS (Uses the true final physics)
-            next_value = agent.get_value(bootstrap_obs, centralized_state=final_state, denormalize=True).flatten()
+            next_value = agent.get_value(next_obs, centralized_state=final_state, denormalize=True).flatten()
     
             # Standard GAE to get returns
             temp_advantages = torch.zeros_like(rewards).to(device)
@@ -776,20 +717,28 @@ if __name__ == "__main__":
                 delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
                 temp_advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
             
+            # This is our optimization target
             b_returns = (temp_advantages + values).reshape(-1)
             b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
             b_states = states.reshape((-1, state_dim))
 
-            # 4. UPDATE STATS NOW (Using uncorrupted b_returns)
+            # 2. UPDATE STATS NOW (Before SGD)1
+            # This aligns the normalizers with the data we just collected
             agent.critic.update(b_returns.view(-1, agent.num_agents))
+            agent.obs_normalizer.update(b_obs)
 
-            # 5. SECOND PASS
+            continuous_b_states = b_states[:, :-args.num_landmarks]
+            agent.state_normalizer.update(continuous_b_states)
+
+            # 3. Second Pass: RE-CALCULATE Values and Advantages with NEW stats
+            # This is the crucial step you were missing. 
+            # It ensures 'values' and 'returns' are in the same normalized space for SGD.
             new_values = torch.zeros_like(values)
             for t in range(args.num_steps):
+                # get_value now uses the updated normalization buffers
                 new_values[t] = agent.get_value(obs[t], centralized_state=states[t], denormalize=True).flatten()
             
-            # Re-calculate next_value with updated stats (Reusing our correct arrays)
-            new_next_value = agent.get_value(bootstrap_obs, centralized_state=final_state, denormalize=True).flatten()
+            new_next_value = agent.get_value(next_obs, centralized_state=final_state, denormalize=True).reshape(1, -1)
             
             # Final GAE calculation for the actual SGD update
             advantages = torch.zeros_like(rewards).to(device)
@@ -908,11 +857,6 @@ if __name__ == "__main__":
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
                     break
-
-        agent.obs_normalizer.update(b_obs)
-        continuous_b_states = b_states[:, :-args.num_landmarks]
-        agent.state_normalizer.update(continuous_b_states)
-
         if update % 500 == 0:
                 gc.collect()
 

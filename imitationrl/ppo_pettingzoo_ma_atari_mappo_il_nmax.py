@@ -322,7 +322,7 @@ class NMaxObservationWrapper(BaseParallelWrapper):
         super().__init__(env)
         self.n_max = n_max
         self.current_n = current_n
-        self.target_dim = (4 * 6 * n_max) + n_max
+        self.target_dim = (5 * n_max) + 2
         
         self.observation_spaces = {
             agent: gym.spaces.Box(low=-np.inf, high=np.inf, shape=(self.target_dim,), dtype=np.float32)
@@ -353,39 +353,49 @@ class NMaxObservationWrapper(BaseParallelWrapper):
     
     def pad_obs(self, raw_obs):
         N = self.current_n
+        # raw_obs is now a flat 1D array. 
+        # The MPE simple_spread observation size per agent without communication is:
+        # [self_vel (2), self_pos (2), landmark_rel_pos (N * 2), other_agent_rel_pos ((N-1) * 2)]
+        # Plus the indicator one-hot at the very end
+        
         frames_part = raw_obs[:-N]
         indicator_part = raw_obs[-N:]
-        frames = frames_part.reshape(4, 6 * N)
         
-        padded_frames = np.zeros((4, 6 * self.n_max), dtype=np.float32)
-        padded_frames[:, 0:4] = frames[:, 0:4]
+        # 1. EXTRACT COMPONENTS (No more 4x reshape)
+        self_state = frames_part[0:4] # [vx, vy, px, py]
         
-        landmarks = frames[:, 4:4+2*N].reshape(4, N, 2)
+        lm_start = 4
+        lm_end = 4 + (N * 2)
+        landmarks = frames_part[lm_start:lm_end].reshape(N, 2)
         
-        # 2. USE THE LOCKED SLOTS (No more random generation here)
+        other_start = lm_end
+        # Other agents only have relative position, no velocity in standard simple_spread obs
+        other_pos = frames_part[other_start:other_start + ((N-1) * 2)].reshape(N-1, 2)
+
+        # 2. ASSEMBLE PADDED VECTOR
+        # 4 (self) + (N_max * 2) (landmarks) + ((N_max - 1) * 2) (other agents)
+        padded_frames = np.zeros(4 + (self.n_max * 2) + ((self.n_max - 1) * 2), dtype=np.float32)
+        
+        padded_frames[0:4] = self_state
+        
+        # Insert Landmarks
         for i, slot in enumerate(self.landmark_slots):
             idx_offset = 4 + (slot * 2)
-            padded_frames[:, idx_offset:idx_offset+2] = landmarks[:, i, :]
+            padded_frames[idx_offset:idx_offset+2] = landmarks[i, :]
             
-        other_pos_start = 4 + 2*N
-        other_pos = frames[:, other_pos_start:other_pos_start + 2*(N-1)].reshape(4, N-1, 2)
-        other_vel_start = other_pos_start + 2*(N-1)
-        other_vel = frames[:, other_vel_start:6*N].reshape(4, N-1, 2)
-        
+        # Insert Other Agents
         for i, slot in enumerate(self.agent_slots):
-            pos_idx = 4 + 2*self.n_max + (slot * 2)
-            padded_frames[:, pos_idx:pos_idx+2] = other_pos[:, i, :]
-            vel_idx = 4 + 2*self.n_max + 2*(self.n_max - 1) + (slot * 2)
-            padded_frames[:, vel_idx:vel_idx+2] = other_vel[:, i, :]
+            pos_idx = 4 + (self.n_max * 2) + (slot * 2)
+            padded_frames[pos_idx:pos_idx+2] = other_pos[i, :]
             
+        # 3. ASSEMBLE PADDED INDICATOR
         original_agent_idx = np.argmax(indicator_part)
         new_agent_idx = self.id_slots[original_agent_idx]
         
         padded_indicator = np.zeros(self.n_max, dtype=np.float32)
         padded_indicator[new_agent_idx] = 1.0
         
-        padded_frames_flat = padded_frames.reshape(4 * 6 * self.n_max)
-        return np.concatenate([padded_frames_flat, padded_indicator])
+        return np.concatenate([padded_frames, padded_indicator])
         
     def step(self, actions):
         obs, rews, terms, truncs, infos = self.env.step(actions)
@@ -409,7 +419,7 @@ def make_env(args, env_id, seed, current_local_ratio=0.5):
             env = ss.color_reduction_v0(env, mode="B")
             env = ss.resize_v1(env, x_size=84, y_size=84)
             env = ss.clip_reward_v0(env, lower_bound=-1, upper_bound=1)
-        env = ss.frame_stack_v1(env, 4)
+            env = ss.frame_stack_v1(env, 4) ### IMPORTANT ONLY FOR ATARI GAMES
         env = ss.agent_indicator_v0(env, type_only=False)
 
         env = NMaxObservationWrapper(env, n_max=6, current_n=args.num_landmarks)
@@ -765,7 +775,7 @@ if __name__ == "__main__":
             # Gymnasium step returns (obs, reward, terminations, truncations, infos)
             if len(step_data) == 5:
                 next_obs, reward, terminations, truncations, next_info = step_data
-                done = np.logical_or(terminations, truncations) # Combine for PPO
+                done = terminations
             else:
                 next_obs, reward, done, next_info = step_data
 
@@ -890,9 +900,6 @@ if __name__ == "__main__":
             agent.critic.update(b_returns.view(-1, agent.num_agents))
             # agent.obs_normalizer.update(b_obs)
 
-            continuous_b_states = b_states[:, :-args.num_landmarks]
-            agent.state_normalizer.update(continuous_b_states)
-
             # 3. Second Pass: RE-CALCULATE Values and Advantages with NEW stats
             # This is the crucial step you were missing. 
             # It ensures 'values' and 'returns' are in the same normalized space for SGD.
@@ -901,7 +908,7 @@ if __name__ == "__main__":
                 # get_value now uses the updated normalization buffers
                 new_values[t] = agent.get_value(obs[t], centralized_state=states[t], denormalize=True).flatten()
             
-            new_next_value = agent.get_value(next_obs, centralized_state=final_state, denormalize=True).reshape(1, -1)
+            new_next_value = agent.get_value(next_obs, centralized_state=final_state, denormalize=True).flatten()
             
             # Final GAE calculation for the actual SGD update
             advantages = torch.zeros_like(rewards).to(device)
@@ -1020,6 +1027,10 @@ if __name__ == "__main__":
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
                     break
+                
+        continuous_b_states = b_states[:, :-args.num_landmarks]
+        agent.state_normalizer.update(continuous_b_states)
+
         if update % 500 == 0:
                 gc.collect()
 
