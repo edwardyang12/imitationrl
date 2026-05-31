@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
+from torch_geometric.nn import GATConv, global_mean_pool
 import numpy as np
 import os
 from tqdm import tqdm
@@ -11,6 +12,60 @@ def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32
     np.random.seed(worker_seed)
     random.seed(worker_seed)
+
+class MultiHeadGATBackbone(nn.Module):
+    def __init__(self, n_max, feature_dim=7, hidden_dim=64, out_dim=128, heads=4):
+        super().__init__()
+        self.n_max = n_max
+        self.feature_dim = feature_dim
+        
+        # GAT Layer 1: feature_dim -> hidden_dim * heads
+        self.gat1 = GATConv(feature_dim, hidden_dim, heads=heads, concat=True)
+        # GAT Layer 2: hidden_dim * heads -> hidden_dim * heads
+        self.gat2 = GATConv(hidden_dim * heads, hidden_dim, heads=heads, concat=True)
+        # GAT Layer 3 (Final): hidden_dim * heads -> out_dim (Averaged)
+        self.gat3 = GATConv(hidden_dim * heads, out_dim, heads=heads, concat=False)
+        
+        self.elu = nn.ELU()
+
+    def _build_dynamic_graph(self, x_flat):
+        """
+        Converts the flat CleanRL tensor into a dynamic, dummy-free PyG Graph.
+        """
+        B = x_flat.shape[0]
+        device = x_flat.device
+        
+        # Reshape to [Batch, N_max, Feature_Dim]
+        x_padded = x_flat.view(B, self.n_max, self.feature_dim)
+        
+        # 1. Mask out dummy nodes (Feature index 6 is the active flag)
+        active_mask = x_padded[:, :, 6] > 0.5
+        
+        # 2. Extract strictly valid node features
+        valid_x = x_padded[active_mask] # Shape: [Total_Valid_Nodes_in_Batch, 7]
+        
+        # 3. Create PyG Batch Indexing
+        batch_indices = torch.arange(B, device=device).view(-1, 1).expand(B, self.n_max)
+        valid_batch = batch_indices[active_mask] # Shape: [Total_Valid_Nodes_in_Batch]
+        
+        # 4. Generate Fully Connected Edge Index per graph inside the batch
+        # Create a boolean adjacency matrix matching nodes in the same batch item
+        adj_mask = valid_batch.unsqueeze(1) == valid_batch.unsqueeze(0)
+        edge_index = adj_mask.nonzero(as_tuple=False).t().contiguous()
+        
+        return valid_x, edge_index, valid_batch
+
+    def forward(self, x_flat):
+        valid_x, edge_index, valid_batch = self._build_dynamic_graph(x_flat)
+        
+        # Message Passing
+        h = self.gat1(valid_x, edge_index)
+        h = self.elu(h)
+        h = self.gat2(h, edge_index)
+        h = self.elu(h)
+        node_embeddings = self.gat3(h, edge_index) # [Total_Valid_Nodes, out_dim]
+        
+        return valid_x, node_embeddings, valid_batch
 
 class VectorizedBatchDataset(Dataset):
     def __init__(self, n_values, n_max=10, batch_size=32768):
@@ -125,23 +180,29 @@ class VectorizedBatchDataset(Dataset):
         
         return torch.Tensor(final_obs), torch.tensor(action_batch, dtype=torch.long)
 
-class StudentActor(nn.Module):
-    def __init__(self, obs_dim, num_actions):
+class StudentGraphActor(nn.Module):
+    def __init__(self, n_max, num_actions):
         super().__init__()
-        self.network = nn.Sequential(
-            nn.Linear(obs_dim, 1024),
-            nn.LayerNorm(1024), nn.ReLU(),
-            nn.Linear(1024, 1024),
-            nn.LayerNorm(1024), nn.ReLU(),
-            nn.Linear(1024, 512),
-            nn.LayerNorm(512), nn.ReLU(),
-            nn.Linear(512, 512),
-            nn.ReLU(),
-            nn.Linear(512, num_actions)
+        self.backbone = MultiHeadGATBackbone(n_max=n_max, feature_dim=7)
+        gat_out_dim = 128
+        
+        self.actor_mlp = nn.Sequential(
+            nn.Linear(gat_out_dim, 128),
+            nn.LayerNorm(128), nn.ReLU(),
+            nn.Linear(128, 64),
+            nn.LayerNorm(64), nn.ReLU(),
+            nn.Linear(64, num_actions)
         )
         
-    def forward(self, x):
-        return self.network(x)
+    def forward(self, x_flat):
+        valid_x, node_embeddings, _ = self.backbone(x_flat)
+        
+        # Boolean Masking to isolate only the agents taking actions
+        agent_mask = valid_x[:, 4] > 0.5
+        agent_embeddings = node_embeddings[agent_mask]
+        
+        logits = self.actor_mlp(agent_embeddings)
+        return logits
 
 def train_behavioral_cloning():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

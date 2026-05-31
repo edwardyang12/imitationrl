@@ -379,7 +379,7 @@ def make_env(args, env_id, seed, current_local_ratio=0.5):
             env = ss.color_reduction_v0(env, mode="B")
             env = ss.resize_v1(env, x_size=84, y_size=84)
             env = ss.clip_reward_v0(env, lower_bound=-1, upper_bound=1)
-        env = ss.frame_stack_v1(env, 4)
+        env = ss.frame_stack_v1(env, 4) ### IMPORTANT WE COULD PROBABLY REMOVE FRAME STACK
         env = ss.agent_indicator_v0(env, type_only=False)
         
         # SuperSuit natively converts (Agents, Obs) -> (Batch, Obs)
