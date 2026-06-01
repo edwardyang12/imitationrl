@@ -167,6 +167,7 @@ class MultiHeadGATBackbone(nn.Module):
     def _build_dynamic_graph(self, x_flat):
         """
         Converts the flat CleanRL tensor into a dynamic, dummy-free PyG Graph.
+        Optimized to prevent O(V^2) VRAM explosions during massive Minibatch updates.
         """
         B = x_flat.shape[0]
         device = x_flat.device
@@ -174,7 +175,7 @@ class MultiHeadGATBackbone(nn.Module):
         # Reshape to [Batch, N_max, Feature_Dim]
         x_padded = x_flat.view(B, self.n_max, self.feature_dim)
         
-        # 1. Mask out dummy nodes (Feature index 6 is the active flag)
+        # 1. Mask out dummy nodes
         active_mask = x_padded[:, :, 6] > 0.5
         
         # 2. Extract strictly valid node features
@@ -182,12 +183,21 @@ class MultiHeadGATBackbone(nn.Module):
         
         # 3. Create PyG Batch Indexing
         batch_indices = torch.arange(B, device=device).view(-1, 1).expand(B, self.n_max)
-        valid_batch = batch_indices[active_mask] # Shape: [Total_Valid_Nodes_in_Batch]
+        valid_batch = batch_indices[active_mask] 
         
-        # 4. Generate Fully Connected Edge Index per graph inside the batch
-        # Create a boolean adjacency matrix matching nodes in the same batch item
-        adj_mask = valid_batch.unsqueeze(1) == valid_batch.unsqueeze(0)
-        edge_index = adj_mask.nonzero(as_tuple=False).t().contiguous()
+        # 4. Generate Fully Connected Edge Index (Optimized Tile Method)
+        # Instead of a dense 46k x 46k matrix, we build one small graph and mathematically tile it B times.
+        num_active = int(active_mask[0].sum().item())
+        
+        # Base graph for a single environment (e.g., 6x6)
+        base_edge_index = torch.ones(num_active, num_active, device=device).nonzero(as_tuple=False).t().contiguous()
+        
+        # Add the node offset for each batch item
+        batch_offsets = (torch.arange(B, device=device) * num_active).view(1, B, 1)
+        edge_index = base_edge_index.unsqueeze(1).repeat(1, B, 1) + batch_offsets
+        
+        # Flatten into the standard PyG [2, E] format
+        edge_index = edge_index.view(2, -1)
         
         return valid_x, edge_index, valid_batch
 
@@ -479,11 +489,24 @@ class DictInfoWrapper(gym.vector.VectorEnv):
         if isinstance(info, list):
             global_state_list = [i.get("global_state") for i in info]
             raw_obs_list = [i.get("raw_obs") for i in info]
-            info = {
+            
+            # FIX: Safely extract true final observations and infos
+            final_obs_list = [i.get("final_observation", None) for i in info]
+            final_info_list = [i.get("final_info", None) for i in info]
+            
+            new_info = {
                 "global_state": np.array(global_state_list), 
                 "raw_obs": np.array(raw_obs_list),
                 "agents": info
             }
+            
+            # Only add them if an episode actually ended to prevent KeyErrors
+            if any(x is not None for x in final_obs_list):
+                new_info["final_observation"] = final_obs_list
+            if any(x is not None for x in final_info_list):
+                new_info["final_info"] = final_info_list
+                
+            info = new_info
         return obs, rew, term, trunc, info
         
     def reset(self, seed=None, options=None):
@@ -686,10 +709,10 @@ if __name__ == "__main__":
 
     # Fix: Point the optimizer parameter groups to the real attributes inside GraphAgent
     optimizer = optim.Adam([
-            {'params': list(agent.actor_mlp.parameters()), 'lr': 3e-4}, 
             {'params': list(agent.backbone.parameters()) + 
-                    list(agent.critic_mlp.parameters()) + 
-                    list(agent.critic_popart.parameters()), 'lr': 1e-3} 
+                       list(agent.actor_mlp.parameters()), 'lr': 3e-4}, 
+            {'params': list(agent.critic_mlp.parameters()) + 
+                       list(agent.critic_popart.parameters()), 'lr': 1e-3} 
         ], eps=1e-5)
 
     # ALGO Logic: Storage setup
@@ -790,14 +813,23 @@ if __name__ == "__main__":
             if len(step_data) == 5:
                 next_obs, reward, terminations, truncations, next_info = step_data
                 done = terminations
+
+                resets = np.logical_or(terminations, truncations)
             else:
                 next_obs, reward, done, next_info = step_data
+                resets = done
 
             if args.reward_cheat:
                 agent_radius = 0.15
                 collision_penalty = 0.5
                 
-                raw_obs_tensor = torch.Tensor(next_info["raw_obs"]).to(device)
+                cheat_raw_obs = next_info["raw_obs"].copy()
+                if "final_info" in next_info:
+                    for i, fin_info in enumerate(next_info["final_info"]):
+                        if fin_info is not None and "raw_obs" in fin_info:
+                            cheat_raw_obs[i] = fin_info["raw_obs"]
+
+                raw_obs_tensor = torch.Tensor(cheat_raw_obs).to(device)
                 new_landmark_dist = raw_obs_tensor.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
                 new_landmark_dist = new_landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
                 
@@ -806,8 +838,8 @@ if __name__ == "__main__":
                 
                 # --- 1. EPISODIC STATIC ASSIGNMENT ---
                 # Check which games just reset (or are at step 0)
-                game_dones = torch.Tensor(done).to(device).view(num_games, num_agents_per_game)[:, 0].bool()
-                needs_assignment = needs_assignment | game_dones
+                game_resets = torch.Tensor(resets).to(device).view(num_games, num_agents_per_game)[:, 0].bool()
+                needs_assignment = needs_assignment | game_resets
                 
                 # If any game reset, recalculate its optimal shortest-path routing
                 if needs_assignment.any():
@@ -874,21 +906,45 @@ if __name__ == "__main__":
 
         # bootstrap value if not done
         with torch.no_grad():
+            boot_obs = next_obs.clone()
+            
             if "global_state" in next_info:
-                # True global state for MPE
-                # final_state = torch.Tensor(next_info["global_state"][::num_agents_per_game]).to(device)
-                final_state = next_obs.view(num_games, -1)
-                raw_obs_tensor = torch.Tensor(next_info["raw_obs"]).to(device)
+                # 1. Create a separate tracker for the Raw MPE physics
+                boot_raw_obs = next_info["raw_obs"].copy()
+                
+                # --- TELEPORTATION FIX ---
+                # A. Inject Final Graph Obs
+                if "final_observation" in next_info:
+                    for agent_idx, final_obs in enumerate(next_info["final_observation"]):
+                        if final_obs is not None:
+                            boot_obs[agent_idx] = torch.Tensor(final_obs).to(device)
+                
+                # B. Inject Final Raw Obs
+                if "final_info" in next_info:
+                    for idx, fin_info in enumerate(next_info["final_info"]):
+                        if fin_info is not None and "raw_obs" in fin_info:
+                            boot_raw_obs[idx] = fin_info["raw_obs"]
 
+                # 2. Build the Final State correctly
+                final_state = boot_obs.view(num_games, -1)
+                
+                # 3. FIX: Calculate distances strictly from the RAW OBS!
+                raw_obs_tensor = torch.Tensor(boot_raw_obs).to(device)
                 landmark_dist = raw_obs_tensor.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
                 landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
+                
                 occupied = (torch.norm(landmark_dist, dim=-1) < strict_occupancy_radius).any(dim=1).float()
                 final_state = torch.cat([final_state, occupied], dim=-1)
             else:
-                # Fallback for Atari: Proxy state from observations
-                final_state = next_obs.view(num_games, -1)
+                # Fallback for Atari
+                if "final_observation" in next_info:
+                    for idx, final_obs in enumerate(next_info["final_observation"]):
+                        if final_obs is not None:
+                            boot_obs[idx] = torch.Tensor(final_obs).to(device)
+                final_state = boot_obs.view(num_games, -1)
 
-            next_value = agent.get_value(next_obs, centralized_state=final_state, denormalize=True).flatten()
+            # First Pass
+            next_value = agent.get_value(boot_obs, centralized_state=final_state, denormalize=True).flatten()
     
             # Standard GAE to get returns
             temp_advantages = torch.zeros_like(rewards).to(device)
@@ -920,7 +976,7 @@ if __name__ == "__main__":
                 # get_value now uses the updated normalization buffers
                 new_values[t] = agent.get_value(obs[t], centralized_state=states[t], denormalize=True).flatten()
             
-            new_next_value = agent.get_value(next_obs, centralized_state=final_state, denormalize=True).reshape(1, -1)
+            new_next_value = agent.get_value(boot_obs, centralized_state=final_state, denormalize=True).flatten()
             
             # Final GAE calculation for the actual SGD update
             advantages = torch.zeros_like(rewards).to(device)

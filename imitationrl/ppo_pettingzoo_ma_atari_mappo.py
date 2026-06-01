@@ -656,8 +656,11 @@ if __name__ == "__main__":
             if len(step_data) == 5:
                 next_obs, reward, terminations, truncations, next_info = step_data
                 done = terminations
+
+                resets = np.logical_or(terminations, truncations)
             else:
                 next_obs, reward, done, next_info = step_data
+                resets = done
 
             if args.reward_cheat:
                 agent_radius = 0.15
@@ -672,8 +675,8 @@ if __name__ == "__main__":
                 
                 # --- 1. EPISODIC STATIC ASSIGNMENT ---
                 # Check which games just reset (or are at step 0)
-                game_dones = torch.Tensor(done).to(device).view(num_games, num_agents_per_game)[:, 0].bool()
-                needs_assignment = needs_assignment | game_dones
+                game_resets = torch.Tensor(resets).to(device).view(num_games, num_agents_per_game)[:, 0].bool()
+                needs_assignment = needs_assignment | game_resets
                 
                 # If any game reset, recalculate its optimal shortest-path routing
                 if needs_assignment.any():
