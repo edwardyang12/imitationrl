@@ -1,72 +1,32 @@
-absl-py==2.4.0
-ale-py==0.11.2
-annotated-types==0.7.0
-AutoROM==0.6.1
-AutoROM.accept-rom-license==0.6.1
-certifi==2026.2.25
-cffi==2.0.0
-charset-normalizer==3.4.4
-chess==1.11.2
-click==8.3.1
-cloudpickle==3.1.2
-cmake==4.2.1
-colorama==0.4.6
-decorator==5.2.1
-docstring_parser==0.17.0
-Farama-Notifications==0.0.4
-filelock==3.20.0
-fsspec==2025.12.0
-gitdb==4.0.12
-GitPython==3.1.46
-grpcio==1.78.0
-gym==0.26.2
-gym-notices==0.1.0
-gymnasium==1.2.3
-idna==3.11
-ImageIO==2.37.2
-imageio-ffmpeg==0.6.0
-Jinja2==3.1.6
-Markdown==3.10.2
-MarkupSafe==3.0.2
-moviepy==2.2.1
-mpe2==0.0.1
-mpmath==1.3.0
-networkx==3.6.1
-numpy==2.4.2
-opencv-python==4.13.0.92
-packaging==25.0
-pettingzoo==1.25.0
-pillow==11.3.0
-pip==26.0.1
-platformdirs==4.9.2
-proglog==0.1.12
-protobuf==6.33.5
-pycparser==3.0
-pydantic==2.12.5
-pydantic_core==2.41.5
-pygame==2.6.1
-pymunk==7.2.0
-python-dotenv==1.2.1
-PyYAML==6.0.3
-requests==2.32.5
-rlcard==1.2.0
-sentry-sdk==2.53.0
-setuptools==82.0.0
-smmap==5.0.2
-SuperSuit==3.10.0
-sympy==1.14.0
-tensorboard==2.20.0
-tensorboard-data-server==0.7.2
-termcolor==3.3.0
-tinyscaler==1.2.8
-torch==2.10.0+cu130
-torchvision==0.25.0+cu130
-tqdm==4.67.3
-typeguard==4.5.1
-typing_extensions==4.15.0
-typing-inspection==0.4.2
-tyro==1.0.8
-urllib3==2.6.3
-wandb==0.25.0
-Werkzeug==3.1.6
-wheel==0.46.3
+boltons @ file:///C:/ci_311/boltons_1677729932371/work
+Brotli @ file:///C:/b/abs_3d36mno480/croot/brotli-split_1714483178642/work
+certifi @ file:///C:/b/abs_55jxithrm3/croot/certifi_1717618077850/work/certifi
+cffi @ file:///C:/b/abs_78eb1_vq6z/croot/cffi_1714483206096/work
+charset-normalizer @ file:///tmp/build/80754af9/charset-normalizer_1630003229654/work
+colorama @ file:///C:/ci_311/colorama_1676422310965/work
+conda @ file:///C:/b/abs_04cd8uayv2/croot/conda_1696257511532/work
+conda-content-trust @ file:///C:/b/abs_e3bcpyv7sw/croot/conda-content-trust_1693490654398/work
+conda-libmamba-solver @ file:///C:/b/abs_a4898ikyjr/croot/conda-libmamba-solver_1696257577002/work/src
+conda-package-handling @ file:///C:/b/abs_831_pypuuz/croot/conda-package-handling_1718138287790/work
+conda_package_streaming @ file:///C:/b/abs_fe6zb0_j8_/croot/conda-package-streaming_1718136098642/work
+cryptography @ file:///C:/b/abs_97lgskwerx/croot/cryptography_1714664736250/work
+idna @ file:///C:/b/abs_aad84bnnw5/croot/idna_1714398896795/work
+jsonpatch @ file:///C:/b/abs_4fdm88t7zi/croot/jsonpatch_1714483974578/work
+jsonpointer==2.1
+libmambapy @ file:///C:/b/abs_89suv9zwkz/croot/mamba-split_1714484512428/work/libmambapy
+menuinst @ file:///C:/ci_311/menuinst_1678730372782/work
+numpy==1.26.3
+packaging @ file:///C:/b/abs_cc1h2xfosn/croot/packaging_1710807447479/work
+pillow==10.2.0
+pluggy @ file:///C:/ci_311/pluggy_1676422178143/work
+pycosat @ file:///C:/b/abs_5csdern___/croot/pycosat_1714513102923/work
+pycparser @ file:///tmp/build/80754af9/pycparser_1636541352034/work
+pyOpenSSL @ file:///C:/b/abs_baj0aupznq/croot/pyopenssl_1708380486701/work
+PySocks @ file:///C:/ci_311/pysocks_1676425991111/work
+requests @ file:///C:/b/abs_9c5n24p1y7/croot/requests_1716902867639/work
+ruamel.yaml @ file:///C:/ci_311/ruamel.yaml_1676439214109/work
+tqdm @ file:///C:/b/abs_a7h7n45ccq/croot/tqdm_1716395987133/work
+truststore @ file:///C:/b/abs_55z7b3r045/croot/truststore_1695245455435/work
+urllib3 @ file:///C:/b/abs_8e4z8_gh1l/croot/urllib3_1715636317140/work
+win-inet-pton @ file:///C:/ci_311/win_inet_pton_1676425458225/work
+zstandard @ file:///C:/b/abs_e46tf0_91g/croot/zstandard_1714678303615/work
