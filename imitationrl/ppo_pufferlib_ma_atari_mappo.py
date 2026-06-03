@@ -1,21 +1,24 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_pettingzoo_ma_ataripy
 import argparse
+import importlib
 import os
 import random
 import time
-import math
-import vmas 
-import imageio
 from distutils.util import strtobool
 import gc
 
 import gymnasium as gym
 import numpy as np
+import cv2
+import supersuit as ss
+from supersuit.vector import ConcatVecEnv
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
+
+from pettingzoo.utils.wrappers import BaseParallelWrapper
 
 def parse_args():
     # fmt: off
@@ -38,15 +41,15 @@ def parse_args():
         help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # Algorithm specific arguments
-    parser.add_argument("--env-id", type=str, default="discovery",
+    parser.add_argument("--env-id", type=str, default="pong_v3",
         help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=70000000,
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=7e-4,
         help="the learning rate of the optimizer")
-    parser.add_argument("--num-envs", type=int, default=1024,
+    parser.add_argument("--num-envs", type=int, default=32,
         help="the number of parallel game environments")
-    parser.add_argument("--num-steps", type=int, default=128,
+    parser.add_argument("--num-steps", type=int, default=2048,
         help="the number of steps to run in each environment per policy rollout")
     parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggle learning rate annealing for policy and value networks")
@@ -118,6 +121,39 @@ class ObservationNormalizer(nn.Module):
     def normalize(self, x):
         return (x - self.running_mean) / torch.sqrt(self.running_var + 1e-8)
 
+class ValueNormalizer(nn.Module):
+    def __init__(self, num_agents, epsilon=1e-5):
+        super().__init__()
+        # Initialize as 1D tensors for broadcasting
+        self.register_buffer("running_mean", torch.zeros(num_agents))
+        self.register_buffer("running_var", torch.ones(num_agents))
+        self.epsilon = epsilon
+
+    def update(self, x):
+        num_agents = self.running_mean.shape[0]
+        # Reshape flattened batch to [N, num_agents]
+        x_reshaped = x.view(-1, num_agents)
+        batch_mean = x_reshaped.mean(dim=0)
+        batch_var = x_reshaped.var(dim=0)
+        
+        self.running_mean = 0.99 * self.running_mean + 0.01 * batch_mean
+        self.running_var = 0.99 * self.running_var + 0.01 * batch_var
+
+    def normalize(self, x):
+        num_agents = self.running_mean.shape[0]
+        # Reshape to [N, num_agents] to allow broadcasting across rows
+        original_shape = x.shape
+        x_reshaped = x.view(-1, num_agents)
+        normalized = (x_reshaped - self.running_mean) / torch.sqrt(self.running_var + self.epsilon)
+        return normalized.view(original_shape)
+
+    def denormalize(self, x):
+        num_agents = self.running_mean.shape[0]
+        original_shape = x.shape
+        x_reshaped = x.view(-1, num_agents)
+        denormalized = x_reshaped * torch.sqrt(self.running_var + self.epsilon) + self.running_mean
+        return denormalized.view(original_shape)
+
 class PopArt(nn.Module):
     def __init__(self, input_dim, output_dim, beta=0.99):
         super().__init__()
@@ -156,12 +192,26 @@ class PopArt(nn.Module):
     def normalize(self, x):
         return (x - self.mean) / torch.sqrt(self.std**2 + 1e-8)
 
+class RewardNormalizer:
+    def __init__(self, num_envs, gamma=0.99):
+        self.returns = np.zeros(num_envs)
+        self.gamma = gamma
+        self.running_std = 1.0
+
+    def __call__(self, rewards, dones):
+        # Track discounted returns to estimate reward scale
+        self.returns = self.returns * self.gamma + rewards
+        self.running_std = 0.99 * self.running_std + 0.01 * np.std(self.returns)
+        # Reset returns for finished episodes
+        self.returns[dones > 0] = 0
+        return rewards / (self.running_std + 1e-8)
+
 class Agent(nn.Module):
-    def __init__(self, single_action_space, single_obs_shape, num_agents, state_dim):
+    def __init__(self, envs, num_agents, state_dim):
         super().__init__()
         self.num_agents = num_agents
-
-        self.obs_dim = np.array(single_obs_shape).prod()
+        obs_shape = envs.single_observation_space.shape
+        self.obs_dim = np.array(obs_shape).prod()
         # self.value_normalizer = ValueNormalizer(num_agents)
         self.obs_normalizer = ObservationNormalizer(self.obs_dim)
 
@@ -180,7 +230,7 @@ class Agent(nn.Module):
                 nn.LayerNorm(256), nn.ReLU(),
                 layer_init(nn.Linear(256, 256)),
                 nn.ReLU(),
-                layer_init(nn.Linear(256, single_action_space.n), std=0.01)
+                layer_init(nn.Linear(256, envs.single_action_space.n), std=0.01)
             ) for _ in range(num_agents)
         ])
 
@@ -243,153 +293,187 @@ class Agent(nn.Module):
             
         return action, probs.log_prob(action), probs.entropy(), self.get_value(x, centralized_state, denormalize)
 
-class VMASVectorizedEnv:
-    def __init__(self, args, seed, run_name, local_ratio=0.5, update_step=0):
-        self.args = args
-        self.device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
-        self.num_agents = args.num_landmarks
-        self.num_games = args.num_envs // self.num_agents
-        self.num_envs = self.num_games * self.num_agents
-        self.local_ratio = local_ratio # FIX: Now stored
-        self.run_name = run_name
-        self.update_step = update_step
-        
-        # FIX: Passed local_ratio into the scenario
-        self.env = vmas.make_env(
-            scenario="discovery",
-            num_envs=self.num_games,
-            device=self.device,
-            continuous_actions=False, # CHANGED: Let VMAS natively handle discrete actions
-            n_agents=self.num_agents,
-            n_targets=args.num_landmarks, 
-            agents_with_lidar=False, 
-            seed=seed,
-            dict_spaces=False
+class StateWrapper(BaseParallelWrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        # Calculate and store state_space so it persists after vectorization
+        self.state_space = gym.spaces.Box(
+            low=-np.inf, 
+            high=np.inf, 
+            shape=self.env.unwrapped.state().shape
         )
-        
-        vmas_obs_dim = self.env.observation_space[0].shape[0]
-        self.single_action_space = gym.spaces.Discrete(9) # Standard VMAS discrete action space
-        
-        target_dim = (vmas_obs_dim * 4) + self.num_agents
-        self.single_observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(target_dim,))
-        
-        self.frames = torch.zeros((self.num_games, self.num_agents, 4, vmas_obs_dim), device=self.device)
-        self.episode_returns = torch.zeros(self.num_envs, device=self.device)
-        
-        self.step_count = 0
-        self.episode_count = 0
-        self.record_this_episode = self.args.capture_video
-        self.video_frames = []
-
-    def _apply_stack_and_indicator(self, stacked_vmas_obs):
-        self.frames = torch.roll(self.frames, shifts=-1, dims=2)
-        self.frames[:, :, -1, :] = stacked_vmas_obs
-        stacked_flat = self.frames.view(self.num_games, self.num_agents, -1)
-        indicators = torch.eye(self.num_agents, device=self.device).unsqueeze(0).expand(self.num_games, -1, -1)
-        final_obs = torch.cat([stacked_flat, indicators], dim=-1)
-        return final_obs.reshape(self.num_envs, -1)
-
-    def reset(self, seed=None):
-        if seed is not None:
-            self.env.seed(seed)
-            
-        vmas_obs = self.env.reset()
-        self.frames.zero_()
-        self.episode_returns.zero_()
-        self.step_count = 0
-        
-        stacked_obs = torch.stack(vmas_obs, dim=1)
-        for _ in range(4):
-            final_obs = self._apply_stack_and_indicator(stacked_obs)
-            
-        info = {
-            "raw_obs": stacked_obs.reshape(self.num_envs, -1),
-            "global_state": final_obs 
-        }
-        return final_obs, info
 
     def step(self, actions):
-        actions_reshaped = actions.view(self.num_games, self.num_agents)
-        
-        # Pass discrete actions directly to VMAS
-        vmas_actions = [actions_reshaped[:, i] for i in range(self.num_agents)]
-        
-        vmas_obs, vmas_rews, _, vmas_info = self.env.step(vmas_actions)
-        self.step_count += 1
-        
-        rewards = torch.stack(vmas_rews, dim=1).reshape(-1)
-        self.episode_returns += rewards
+        obs, rews, terms, truncs, infos = self.env.step(actions)
+        state = self.env.unwrapped.state()
+        for agent in self.agents:
+            infos[agent]["global_state"] = state
+        return obs, rews, terms, truncs, infos
 
-        if self.record_this_episode:
-            frames = []
-            num_to_render = min(9, self.num_games)
-            for i in range(num_to_render):
-                frame = self.env.render(mode="rgb_array", env_index=i, agent_index_focus=None)
-                if isinstance(frame, list): frame = frame[0]
-                frames.append(frame)
+    def reset(self, seed=None, options=None):
+        obs, infos = self.env.reset(seed=seed, options=options)
+        state = self.env.unwrapped.state()
+        for agent in self.agents:
+            infos[agent]["global_state"] = state
+        return obs, infos
 
-            n = len(frames)
-            cols = math.ceil(math.sqrt(n))
-            rows = math.ceil(n / cols)
-            H, W, C = frames[0].shape
-            blank = np.zeros((H, W, C), dtype=np.uint8)
-            
-            while len(frames) < rows * cols:
-                frames.append(blank)
-                
-            grid = np.vstack([np.hstack(frames[i*cols:(i+1)*cols]) for i in range(rows)])
-            self.video_frames.append(grid)
+# 1. Base Environment Factory
+def make_env(args, env_id, seed, current_local_ratio=0.5):
+    def thunk():
+        if "simple_spread" in env_id:
+            from mpe2 import simple_spread_v3
+            env = simple_spread_v3.parallel_env(N=args.num_landmarks, max_cycles=args.max_cycles, 
+                                                local_ratio=current_local_ratio, dynamic_rescaling=True, render_mode="rgb_array")
+            env = StateWrapper(env)
+        else:
+            env = importlib.import_module(f"pettingzoo.atari.{env_id}").parallel_env(render_mode="rgb_array")
+            env = ss.max_observation_v0(env, 2)
+            env = ss.frame_skip_v0(env, 4)
+            env = ss.color_reduction_v0(env, mode="B")
+            env = ss.resize_v1(env, x_size=84, y_size=84)
+            env = ss.clip_reward_v0(env, lower_bound=-1, upper_bound=1)
+            env = ss.frame_stack_v1(env, 4) ### IMPORTANT ONLY FOR ATARI GAMES
+        env = ss.agent_indicator_v0(env, type_only=False)
+        
+        # SuperSuit natively converts (Agents, Obs) -> (Batch, Obs)
+        env = ss.pettingzoo_env_to_vec_env_v1(env)
+        return env
+    return thunk
 
-        stacked_obs = torch.stack(vmas_obs, dim=1)
-        final_obs = self._apply_stack_and_indicator(stacked_obs)
-        
-        is_done = self.step_count >= self.args.max_cycles
-        dones = torch.full((self.num_envs,), is_done, device=self.device, dtype=torch.float32)
-        
-        info = {
-            "raw_obs": stacked_obs.reshape(self.num_envs, -1),
-            "global_state": final_obs.clone()
-        }
-        
-        if is_done:
-            self.episode_count += 1
-            
-            info["terminal_raw_obs"] = info["raw_obs"].clone()
-            info["terminal_global_state"] = info["global_state"].clone()
-            
-            if self.record_this_episode and self.video_frames:
-                os.makedirs(f"videos/{self.run_name}", exist_ok=True)
-                file_path = f"videos/{self.run_name}/rl-video-update_{self.update_step}-ep_{self.episode_count}.mp4"
-                imageio.mimsave(file_path, self.video_frames, fps=15)
-                self.video_frames = []
-            
-            if self.args.capture_video and self.episode_count % 100 == 0:
-                self.record_this_episode = True
-            else:
-                self.record_this_episode = False
+# 4. SURGICAL WRAPPER: Inherits from VectorEnv to safely bypass Gymnasium type-checks
+class DictInfoWrapper(gym.vector.VectorEnv):
+    def __init__(self, env):
+        self.env = env
+        self.num_envs = env.num_envs
+        self.observation_space = env.observation_space
+        self.action_space = env.action_space
+        self.render_mode = "rgb_array"
+        self.metadata = {"render_modes": ["rgb_array"], "render_fps": 5}
+        self._is_vector_env = True
+        self.target_video_size = None
 
-            # Surface the completed returns before wiping them
-            info["episode"] = {
-                "r": self.episode_returns.clone(),
-                "l": torch.full((self.num_envs,), self.step_count, device=self.device)
+    def step(self, action):
+        obs, rew, term, trunc, info = self.env.step(action)
+        if isinstance(info, list):
+            global_state_list = [i.get("global_state") for i in info]
+            # Safely extract true final observations if they exist
+            final_obs_list = [i.get("final_observation", None) for i in info]
+            info = {
+                "global_state": np.array(global_state_list), 
+                "final_obs": final_obs_list, # PRESERVE THIS
+                "agents": info
             }
+        return obs, rew, term, trunc, info
+        
+    def reset(self, seed=None, options=None):
+        # If a seed is provided, we must manually stagger it for the sub-environments
+        # Because ConcatVecEnv usually passes the same seed to all workers
+        if seed is not None:
+            # We access the internal list of environments in ConcatVecEnv
+            # And call reset on each with a unique staggered seed
+            obs_list = []
+            info_list = []
+            for i, sub_env in enumerate(self.env.vec_envs):
+                o, f = sub_env.reset(seed=seed + i*1000, options=options)
+                obs_list.append(o)
+                info_list.append(f)
+            
+            # Combine observations and infos manually to match VectorEnv format
+            obs = np.concatenate(obs_list)
+            info = [item for sublist in info_list for item in (sublist if isinstance(sublist, list) else [sublist])]
+        else:
+            # If no seed, fall back to default reset
+            obs, info = self.env.reset(options=options)
+            
+        if isinstance(info, list):
+            global_state_list = [i.get("global_state") for i in info]
+            info = {"global_state": np.array(global_state_list), "agents": info}
+        return obs, info
+        
+    def render(self):
+        # 1. Safely attempt to get raw frames
+        try:
+            game_frames = [sub_env.render() for sub_env in self.env.vec_envs]
+        except Exception:
+            game_frames = [None for _ in self.env.vec_envs]
+        
+        processed_frames = []
+        for f in game_frames:
+            valid_frame = False
+            
+            # FIX: Hardcode a safe maximum resolution. 
+            # 256x256 in a 6x6 grid = 1536x1536 video (Well below the 4096px H.264 limit)
+            if self.target_video_size is None:
+                self.target_video_size = (256, 256)
 
-            vmas_obs = self.env.reset()
-            self.frames.zero_()
-            self.episode_returns.zero_()
-            self.step_count = 0
+            if f is not None:
+                try:
+                    img = np.array(f, dtype=np.uint8, copy=True)
+                    
+                    # Handle dimensionality safely
+                    if len(img.shape) >= 2:
+                        if len(img.shape) == 2:
+                            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+                        elif len(img.shape) >= 3:
+                            img = img[:, :, :3]
+                            if img.shape[2] == 1:
+                                img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
+                            elif img.shape[2] == 2:
+                                pad = np.zeros((img.shape[0], img.shape[1], 1), dtype=np.uint8)
+                                img = np.concatenate([img, pad], axis=-1)
+                        
+                        # Guaranteed resize down to safe resolution
+                        if (img.shape[1], img.shape[0]) != self.target_video_size:
+                            img = cv2.resize(img, self.target_video_size, interpolation=cv2.INTER_LINEAR)
+                        
+                        # Force contiguous memory and explicitly check the byte count
+                        img = np.ascontiguousarray(img[:, :, :3], dtype=np.uint8)
+                        expected_bytes = self.target_video_size[0] * self.target_video_size[1] * 3
+                        
+                        if len(img.tobytes()) == expected_bytes:
+                            processed_frames.append(img)
+                            valid_frame = True
+                except Exception:
+                    pass 
             
-            stacked_obs = torch.stack(vmas_obs, dim=1)
-            for _ in range(4):
-                final_obs = self._apply_stack_and_indicator(stacked_obs)
-            
-            info["raw_obs"] = stacked_obs.reshape(self.num_envs, -1)
-            info["global_state"] = final_obs.clone()
+            # Impervious Fallback
+            if not valid_frame:
+                blank = np.zeros((self.target_video_size[1], self.target_video_size[0], 3), dtype=np.uint8)
+                processed_frames.append(blank)
                 
-        return final_obs, rewards, dones, info
+        num_agents_per_game = self.num_envs // len(self.env.vec_envs)
+        return [f for f in processed_frames for _ in range(num_agents_per_game)]
+        
+    def close(self): 
+        return self.env.close()
 
-    def close(self):
-        pass
+def build_environments(args, run_name, base_seed, current_local_ratio=0.5, update_step=0):
+    temp_env = make_env(args, args.env_id, base_seed, current_local_ratio)()
+    num_agents_per_game = temp_env.num_envs
+    num_games = args.num_envs // num_agents_per_game
+
+    env_list = [make_env(args, args.env_id, base_seed + i, current_local_ratio) for i in range(num_games)]
+    envs = ConcatVecEnv(env_list)
+    envs = DictInfoWrapper(envs)
+
+    envs.is_vector_env = True
+    
+    envs = gym.wrappers.vector.RecordEpisodeStatistics(envs)
+    if args.capture_video:
+        envs = gym.wrappers.vector.RecordVideo(
+            envs, 
+            f"videos_mlp/{run_name}", 
+            episode_trigger=lambda x: x % 2000 == 0,
+            name_prefix=f"rl-video-update_{update_step}"
+        )
+
+    # Set Final CleanRL attributes
+    envs.single_action_space = temp_env.action_space
+    envs.single_observation_space = temp_env.observation_space
+    temp_env.close()
+    
+    envs.is_vector_env = True
+    return envs, num_agents_per_game, num_games
 
 if __name__ == "__main__":
 
@@ -425,10 +509,10 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    envs = VMASVectorizedEnv(args, args.seed, run_name, local_ratio=current_ratio, update_step=0)
+    envs, num_agents_per_game, num_games = build_environments(args, run_name, args.seed, current_ratio, update_step=0)
     actual_num_envs = envs.num_envs
-    num_agents_per_game = envs.num_agents
-    num_games = envs.num_games
+
+    # reward_norm = RewardNormalizer(actual_num_envs, args.gamma)
 
     args.batch_size = int(actual_num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -464,7 +548,7 @@ if __name__ == "__main__":
 
     states = torch.zeros((args.num_steps, num_games, state_dim)).to(device)
 
-    agent = Agent(envs.single_action_space, envs.single_observation_space.shape, num_agents_per_game, state_dim=state_dim).to(device)
+    agent = Agent(envs, num_agents_per_game, state_dim=state_dim).to(device)
     # agent = Agent(envs).to(device)
     # optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
     optimizer = optim.Adam([
@@ -525,7 +609,7 @@ if __name__ == "__main__":
 
             # Rebuild with a staggered seed so we don't repeat the exact same scenarios
             new_seed = args.seed + update 
-            envs = VMASVectorizedEnv(args, new_seed, run_name, local_ratio=current_ratio, update_step=update)
+            envs, _, _ = build_environments(args, run_name, new_seed, current_ratio, update_step=update)
             
             # Re-initialize the starting observations for PPO
             reset_data = envs.reset(seed=new_seed)
@@ -566,7 +650,7 @@ if __name__ == "__main__":
             logprobs[step] = logprob
 
             # TRY NOT TO MODIFY: execute the game and log data.
-            step_data = envs.step(action)
+            step_data = envs.step(action.cpu().numpy())
     
             # Gymnasium step returns (obs, reward, terminations, truncations, infos)
             if len(step_data) == 5:
@@ -582,14 +666,8 @@ if __name__ == "__main__":
                 agent_radius = 0.15
                 collision_penalty = 0.5
                 
-                cheat_raw_obs = next_info["raw_obs"].clone()
-                if "final_info" in next_info:
-                    for i, fin_info in enumerate(next_info["final_info"]):
-                        if fin_info is not None and "raw_obs" in fin_info:
-                            cheat_raw_obs[i] = fin_info["raw_obs"].clone()
-
-                raw_obs_tensor = torch.Tensor(cheat_raw_obs).to(device)
-                new_landmark_dist = raw_obs_tensor.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
+                next_obs_tensor = torch.Tensor(next_obs).to(device)
+                new_landmark_dist = next_obs_tensor.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
                 new_landmark_dist = new_landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
                 
                 # Shape: [num_games, num_agents, num_landmarks]
@@ -643,54 +721,50 @@ if __name__ == "__main__":
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
 
             # LOGGING TEAM DATA
-            if done.any() and "episode" in next_info:
-                done_bool = done.bool()
-                # Grab the first agent's index for each completed game to avoid duplicate logs
-                done_games = done_bool.view(num_games, num_agents_per_game)[:, 0]
-                
-                if done_games.any():
-                    avg_return = next_info["episode"]["r"].view(num_games, num_agents_per_game)[done_games, 0].mean().item()
-                    avg_length = next_info["episode"]["l"].view(num_games, num_agents_per_game)[done_games, 0].mean().item()
-                    
-                    print(f"global_step={global_step}, episodic_return={avg_return}")
-                    writer.add_scalar("charts/team_episodic_return", avg_return, global_step)
-                    writer.add_scalar("charts/team_episodic_length", avg_length, global_step)
+            if "final_info" in next_info:
+                # Standard Gymnasium / SyncVectorEnv format
+                for item in next_info["final_info"]:
+                    if item is not None and "episode" in item:
+                        r = item["episode"]["r"]
+                        print(f"global_step={global_step}, episodic_return={r}")
+                        writer.add_scalar("charts/team_episodic_return", item["episode"]["r"], global_step)
+                        writer.add_scalar("charts/team_episodic_length", item["episode"]["l"], global_step)
+                        break 
+            elif "_episode" in next_info:
+                # gym.wrappers.vector.RecordEpisodeStatistics format
+                for i, done in enumerate(next_info["_episode"]):
+                    if done:
+                        r = next_info["episode"]["r"][i]
+                        print(f"global_step={global_step}, episodic_return={r}")
+                        # Extract the return from the arrays
+                        writer.add_scalar("charts/team_episodic_return", next_info["episode"]["r"][i], global_step)
+                        writer.add_scalar("charts/team_episodic_length", next_info["episode"]["l"][i], global_step)
+                        break # Break after first item since all agents in one game share the reward
+
         # bootstrap value if not done
         with torch.no_grad():
-            boot_obs = next_obs.clone()
             
-            if "global_state" in next_info:
-                # 1. Create a separate tracker for the Raw MPE physics
-                boot_raw_obs = next_info["raw_obs"].clone()
-                
-                # --- TELEPORTATION FIX ---
-                # A. Inject Final Graph Obs
-                if "terminal_global_state" in next_info:
-                    boot_obs = next_info["terminal_global_state"].clone()
-                
-                if "terminal_raw_obs" in next_info:
-                    boot_raw_obs = next_info["terminal_raw_obs"].clone()
+            # 1. CREATE BOOTSTRAP_OBS FIRST
+            bootstrap_obs = next_obs.clone() 
+            if "final_obs" in next_info:
+                for agent_idx, final_obs in enumerate(next_info["final_obs"]):
+                    if final_obs is not None:
+                        # Direct 1-to-1 assignment for the specific agent
+                        bootstrap_obs[agent_idx] = torch.Tensor(final_obs).to(device)
 
-                # 2. Build the Final State correctly
-                final_state = boot_obs.view(num_games, -1)
-                
-                # 3. FIX: Calculate distances strictly from the RAW OBS!
-                raw_obs_tensor = torch.Tensor(boot_raw_obs).to(device)
-                landmark_dist = raw_obs_tensor.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
+            # 2. BUILD FINAL STATE FROM BOOTSTRAP_OBS (Not next_obs!)
+            if "global_state" in next_info:
+                final_state = bootstrap_obs.view(num_games, -1)
+                landmark_dist = bootstrap_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
                 landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
-                
                 occupied = (torch.norm(landmark_dist, dim=-1) < strict_occupancy_radius).any(dim=1).float()
                 final_state = torch.cat([final_state, occupied], dim=-1)
             else:
-                # Fallback for Atari
-                if "final_observation" in next_info:
-                    for idx, final_obs in enumerate(next_info["final_observation"]):
-                        if final_obs is not None:
-                            boot_obs[idx] = torch.Tensor(final_obs).to(device)
-                final_state = boot_obs.view(num_games, -1)
+                # Fallback for Atari: Proxy state from observations
+                final_state = bootstrap_obs.view(num_games, -1)
 
-            # First Pass
-            next_value = agent.get_value(boot_obs, centralized_state=final_state, denormalize=True).flatten()
+            # 3. FIRST PASS (Uses the true final physics)
+            next_value = agent.get_value(bootstrap_obs, centralized_state=final_state, denormalize=True).flatten()
     
             # Standard GAE to get returns
             temp_advantages = torch.zeros_like(rewards).to(device)
@@ -705,25 +779,22 @@ if __name__ == "__main__":
                 delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
                 temp_advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
             
-            # This is our optimization target
             b_returns = (temp_advantages + values).reshape(-1)
             b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
             b_states = states.reshape((-1, state_dim))
 
-            # 2. UPDATE STATS NOW (Before SGD)1
-            # This aligns the normalizers with the data we just collected
+            # 4. UPDATE STATS NOW (Using uncorrupted b_returns)
             agent.critic.update(b_returns.view(-1, agent.num_agents))
 
-            # 3. Second Pass: RE-CALCULATE Values and Advantages with NEW stats
-            # This is the crucial step you were missing. 
-            # It ensures 'values' and 'returns' are in the same normalized space for SGD.
+            # 5. SECOND PASS
             new_values = agent.get_value(
                 obs.view(-1, agent.obs_dim), 
                 centralized_state=states.view(-1, state_dim), 
                 denormalize=True
             ).view(args.num_steps, actual_num_envs)
             
-            new_next_value = agent.get_value(boot_obs, centralized_state=final_state, denormalize=True).flatten()
+            # Re-calculate next_value with updated stats (Reusing our correct arrays)
+            new_next_value = agent.get_value(bootstrap_obs, centralized_state=final_state, denormalize=True).flatten()
             
             # Final GAE calculation for the actual SGD update
             advantages = torch.zeros_like(rewards).to(device)
@@ -842,6 +913,11 @@ if __name__ == "__main__":
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
                     break
+
+        agent.obs_normalizer.update(b_obs)
+        continuous_b_states = b_states[:, :-args.num_landmarks]
+        agent.state_normalizer.update(continuous_b_states)
+
         if update % 500 == 0:
                 gc.collect()
 

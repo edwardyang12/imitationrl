@@ -567,9 +567,11 @@ if __name__ == "__main__":
     values = torch.zeros((args.num_steps, actual_num_envs)).to(device)
     ent_coef_now = 0
 
+    current_assignments = torch.arange(args.num_landmarks).unsqueeze(0).repeat(num_games, 1).to(device)
+    needs_assignment = torch.ones(num_games, dtype=torch.bool).to(device)
+
     for update in range(1, num_updates + 1):
-        current_assignments = torch.arange(args.num_landmarks).unsqueeze(0).repeat(num_games, 1).to(device)
-        needs_assignment = torch.ones(num_games, dtype=torch.bool).to(device)
+    
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
@@ -624,6 +626,8 @@ if __name__ == "__main__":
             # Re-sync the global state tracking
             if "global_state" in next_info:
                 current_game_states = next_obs.view(num_games, -1)
+
+            needs_assignment.fill_(True)
             print("--- PHOENIX REBOOT COMPLETE ---")
 
         for step in range(0, args.num_steps):
@@ -663,26 +667,58 @@ if __name__ == "__main__":
                 resets = done
 
             if args.reward_cheat:
-                agent_radius = 0.15
-                collision_penalty = 0.5
-                
+                # CAST TO TENSOR FIRST to enable .clone() and .view()
                 next_obs_tensor = torch.Tensor(next_obs).to(device)
-                new_landmark_dist = next_obs_tensor.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
-                new_landmark_dist = new_landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
+
+                # --- 1. REWARD CALCULATION FOR CURRENT STEP ---
+                true_next_obs = next_obs_tensor.clone()
+                if "final_obs" in next_info:
+                    for agent_idx, final_obs in enumerate(next_info["final_obs"]):
+                        if final_obs is not None:
+                            true_next_obs[agent_idx] = torch.Tensor(final_obs).to(device)
+
+                # Extract landmarks for the true physical state
+                true_landmark_dist = true_next_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
+                true_landmark_dist = true_landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
+                dist_for_reward = torch.norm(true_landmark_dist, dim=-1)
+
+                assigned_dist = torch.gather(dist_for_reward, 2, current_assignments.unsqueeze(-1)).squeeze(-1)
                 
-                # Shape: [num_games, num_agents, num_landmarks]
-                dist = torch.norm(new_landmark_dist, dim=-1)
+                # --- 1. THE SMOOTH BIPARTITE PULL ---
+                # A linear pull provides a constant, predictable gradient that the Critic can easily map.
+                # It naturally stops hovering because the acceleration doesn't approach infinity near 0.
+                individual_pull = -1.0 * assigned_dist
                 
-                # --- 1. EPISODIC STATIC ASSIGNMENT ---
-                # Check which games just reset (or are at step 0)
+                # --- 2. LOCALIZED COLLISION PENALTY (Fixes Sacrificial Agents) ---
+                landmarks_end = 4 + 2 * args.num_landmarks
+                other_agents_start = landmarks_end
+                other_agents_end = other_agents_start + 2 * (args.num_landmarks - 1)
+                
+                # Extract relative positions of neighbors natively
+                other_pos = true_next_obs.view(num_games, num_agents_per_game, -1)[:, :, other_agents_start:other_agents_end]
+                other_pos = other_pos.view(num_games, num_agents_per_game, args.num_landmarks - 1, 2)
+                
+                other_dist = torch.norm(other_pos, dim=-1)
+                
+                # Punish overlapping hitboxes strictly for the agents involved.
+                # We use -1.0 to ensure the math forces them to detour around traffic.
+                collisions = (other_dist < 0.3).float().sum(dim=-1)
+                individual_collision_penalty = -1.0 * collisions
+                
+                # --- 3. OVERWRITE NATIVE REWARD ---
+                # Pure localized, continuous credit assignment!
+                rewards[step] = individual_pull.view(-1) + individual_collision_penalty.view(-1)
+
+                # --- 4. ASSIGNMENT ROUTING FOR NEXT EPISODE ---
                 game_resets = torch.Tensor(resets).to(device).view(num_games, num_agents_per_game)[:, 0].bool()
                 needs_assignment = needs_assignment | game_resets
                 
-                # If any game reset, recalculate its optimal shortest-path routing
                 if needs_assignment.any():
-                    dist_clone = dist.clone()
-                    
-                    # Only calculate for games that need it
+                    reset_landmark_dist = next_obs_tensor.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
+                    reset_landmark_dist = reset_landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
+                    dist_for_new_episode = torch.norm(reset_landmark_dist, dim=-1)
+
+                    dist_clone = dist_for_new_episode.clone()
                     for g in range(num_games):
                         if needs_assignment[g]:
                             for _ in range(args.num_landmarks):
@@ -693,31 +729,13 @@ if __name__ == "__main__":
                                 landmark_idx = min_idx % args.num_landmarks
                                 
                                 current_assignments[g, agent_idx] = landmark_idx
-                                
                                 dist_clone[g, agent_idx, :] = float('inf')
                                 dist_clone[g, :, landmark_idx] = float('inf')
                                 
                     needs_assignment.fill_(False)
-                
-                # Extract the distance to the frozen, optimally assigned target
-                assigned_dist = torch.gather(dist, 2, current_assignments.unsqueeze(-1)).squeeze(-1)
-                
-                # --- 2. PROCEDURAL SQUARE ROOT CALCULUS ---
-                # Calculate the mathematical tipping point for the dead-center snap
-                min_snap_multiplier = collision_penalty / np.sqrt(agent_radius)
-                
-                # Apply a safety factor (> 1.0) to guarantee the snap overpowers engine physics
-                snap_factor = 1.5 
-                procedural_multiplier = min_snap_multiplier * snap_factor
-                
-                # R = -M * sqrt(d)
-                individual_pull = -procedural_multiplier * torch.sqrt(assigned_dist + 1e-8)
-                
-                # Combine with native environment reward
-                rewards[step] = torch.tensor(reward).to(device).view(-1) + individual_pull.view(-1)
             else:
-                # normalized_step_rewards = reward_norm(reward, done)
                 rewards[step] = torch.tensor(reward).to(device).view(-1)
+            
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
 
             # LOGGING TEAM DATA
@@ -787,9 +805,11 @@ if __name__ == "__main__":
             agent.critic.update(b_returns.view(-1, agent.num_agents))
 
             # 5. SECOND PASS
-            new_values = torch.zeros_like(values)
-            for t in range(args.num_steps):
-                new_values[t] = agent.get_value(obs[t], centralized_state=states[t], denormalize=True).flatten()
+            new_values = agent.get_value(
+                obs.view(-1, agent.obs_dim), 
+                centralized_state=states.view(-1, state_dim), 
+                denormalize=True
+            ).view(args.num_steps, actual_num_envs)
             
             # Re-calculate next_value with updated stats (Reusing our correct arrays)
             new_next_value = agent.get_value(bootstrap_obs, centralized_state=final_state, denormalize=True).flatten()
