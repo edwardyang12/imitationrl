@@ -30,7 +30,7 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="cleanRL_ma",
+    parser.add_argument("--wandb-project-name", type=str, default="vmas",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
@@ -38,13 +38,13 @@ def parse_args():
         help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # Algorithm specific arguments
-    parser.add_argument("--env-id", type=str, default="discovery",
+    parser.add_argument("--env-id", type=str, default="simple_spread",
         help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=70000000,
+    parser.add_argument("--total-timesteps", type=int, default=100000000,
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=7e-4,
         help="the learning rate of the optimizer")
-    parser.add_argument("--num-envs", type=int, default=1024,
+    parser.add_argument("--num-envs", type=int, default=2048,
         help="the number of parallel game environments")
     parser.add_argument("--num-steps", type=int, default=128,
         help="the number of steps to run in each environment per policy rollout")
@@ -244,25 +244,23 @@ class Agent(nn.Module):
         return action, probs.log_prob(action), probs.entropy(), self.get_value(x, centralized_state, denormalize)
 
 class VMASVectorizedEnv:
-    def __init__(self, args, seed, run_name, local_ratio=0.5, update_step=0):
+    def __init__(self, args, seed, run_name, update_step=0):
         self.args = args
         self.device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
         self.num_agents = args.num_landmarks
         self.num_games = args.num_envs // self.num_agents
         self.num_envs = self.num_games * self.num_agents
-        self.local_ratio = local_ratio # FIX: Now stored
         self.run_name = run_name
         self.update_step = update_step
         
-        # FIX: Passed local_ratio into the scenario
         self.env = vmas.make_env(
-            scenario="discovery",
+            scenario=args.env_id,
             num_envs=self.num_games,
             device=self.device,
             continuous_actions=False, # CHANGED: Let VMAS natively handle discrete actions
             n_agents=self.num_agents,
             n_targets=args.num_landmarks, 
-            agents_with_lidar=False, 
+            use_lidar=False, 
             seed=seed,
             dict_spaces=False
         )
@@ -270,10 +268,9 @@ class VMASVectorizedEnv:
         vmas_obs_dim = self.env.observation_space[0].shape[0]
         self.single_action_space = gym.spaces.Discrete(9) # Standard VMAS discrete action space
         
-        target_dim = (vmas_obs_dim * 4) + self.num_agents
+        target_dim = vmas_obs_dim + self.num_agents
         self.single_observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(target_dim,))
         
-        self.frames = torch.zeros((self.num_games, self.num_agents, 4, vmas_obs_dim), device=self.device)
         self.episode_returns = torch.zeros(self.num_envs, device=self.device)
         
         self.step_count = 0
@@ -282,11 +279,8 @@ class VMASVectorizedEnv:
         self.video_frames = []
 
     def _apply_stack_and_indicator(self, stacked_vmas_obs):
-        self.frames = torch.roll(self.frames, shifts=-1, dims=2)
-        self.frames[:, :, -1, :] = stacked_vmas_obs
-        stacked_flat = self.frames.view(self.num_games, self.num_agents, -1)
         indicators = torch.eye(self.num_agents, device=self.device).unsqueeze(0).expand(self.num_games, -1, -1)
-        final_obs = torch.cat([stacked_flat, indicators], dim=-1)
+        final_obs = torch.cat([stacked_vmas_obs, indicators], dim=-1)
         return final_obs.reshape(self.num_envs, -1)
 
     def reset(self, seed=None):
@@ -294,13 +288,11 @@ class VMASVectorizedEnv:
             self.env.seed(seed)
             
         vmas_obs = self.env.reset()
-        self.frames.zero_()
         self.episode_returns.zero_()
         self.step_count = 0
         
         stacked_obs = torch.stack(vmas_obs, dim=1)
-        for _ in range(4):
-            final_obs = self._apply_stack_and_indicator(stacked_obs)
+        final_obs = self._apply_stack_and_indicator(stacked_obs)
             
         info = {
             "raw_obs": stacked_obs.reshape(self.num_envs, -1),
@@ -375,13 +367,11 @@ class VMASVectorizedEnv:
             }
 
             vmas_obs = self.env.reset()
-            self.frames.zero_()
             self.episode_returns.zero_()
             self.step_count = 0
             
             stacked_obs = torch.stack(vmas_obs, dim=1)
-            for _ in range(4):
-                final_obs = self._apply_stack_and_indicator(stacked_obs)
+            final_obs = self._apply_stack_and_indicator(stacked_obs)
             
             info["raw_obs"] = stacked_obs.reshape(self.num_envs, -1)
             info["global_state"] = final_obs.clone()
@@ -425,7 +415,8 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    envs = VMASVectorizedEnv(args, args.seed, run_name, local_ratio=current_ratio, update_step=0)
+    envs = VMASVectorizedEnv(args, args.seed, run_name, update_step=0)
+    print("VMAS Observation Space:", envs.env.observation_space)
     actual_num_envs = envs.num_envs
     num_agents_per_game = envs.num_agents
     num_games = envs.num_games
@@ -439,10 +430,10 @@ if __name__ == "__main__":
     start_time = time.time()
     reset_data = envs.reset(seed=args.seed)
     if isinstance(reset_data, tuple):
-        next_obs = torch.Tensor(reset_data[0]).to(device)
+        next_obs = reset_data[0].clone().to(device)
         next_info = reset_data[1]
     else:
-        next_obs = torch.Tensor(reset_data).to(device)
+        next_obs = reset_data.clone().to(device)
         next_info = {}
     next_done = torch.zeros(actual_num_envs).to(device)
 
@@ -454,7 +445,7 @@ if __name__ == "__main__":
         state0 = next_info["global_state"][0]
         state1 = next_info["global_state"][num_agents_per_game] if len(next_info["global_state"]) > 1 else None
         if state1 is not None:
-            diff = np.abs(state0 - state1).sum()
+            diff = torch.abs(state0 - state1).sum().item()
             print(f"DEBUG: Environmental Divergence Score: {diff}")
             if diff == 0:
                 print("WARNING: Environments are still synchronized!")
@@ -525,15 +516,15 @@ if __name__ == "__main__":
 
             # Rebuild with a staggered seed so we don't repeat the exact same scenarios
             new_seed = args.seed + update 
-            envs = VMASVectorizedEnv(args, new_seed, run_name, local_ratio=current_ratio, update_step=update)
+            envs = VMASVectorizedEnv(args, new_seed, run_name, update_step=update)
             
             # Re-initialize the starting observations for PPO
             reset_data = envs.reset(seed=new_seed)
             if isinstance(reset_data, tuple):
-                next_obs = torch.Tensor(reset_data[0]).to(device)
+                next_obs = reset_data[0].clone().to(device)
                 next_info = reset_data[1]
             else:
-                next_obs = torch.Tensor(reset_data).to(device)
+                next_obs = reset_data.clone().to(device)
                 next_info = {}
             next_done = torch.zeros(actual_num_envs).to(device)
             
@@ -549,7 +540,10 @@ if __name__ == "__main__":
             if "global_state" in next_info:
                 # current_game_states = torch.Tensor(next_info["global_state"][::num_agents_per_game]).to(device)
                 current_game_states = next_obs.view(num_games, -1)
-                landmark_dist = next_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
+                teammate_features = 2 * (num_agents_per_game - 1)
+                landmark_start_idx = 4 + teammate_features
+                
+                landmark_dist = next_obs.view(num_games, num_agents_per_game, -1)[:, :, landmark_start_idx : landmark_start_idx + 2*args.num_landmarks]
                 landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
                 occupied = (torch.norm(landmark_dist, dim=-1) < strict_occupancy_radius).any(dim=1).float()
                 states[step] = torch.cat([current_game_states, occupied], dim=-1)
@@ -639,8 +633,8 @@ if __name__ == "__main__":
                 rewards[step] = torch.tensor(reward).to(device).view(-1) + individual_pull.view(-1)
             else:
                 # normalized_step_rewards = reward_norm(reward, done)
-                rewards[step] = torch.tensor(reward).to(device).view(-1)
-            next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
+                rewards[step] = reward.clone().to(device).view(-1)
+            next_obs, next_done = next_obs.clone().to(device), done.clone().to(device)
 
             # LOGGING TEAM DATA
             if done.any() and "episode" in next_info:
@@ -650,7 +644,7 @@ if __name__ == "__main__":
                 
                 if done_games.any():
                     avg_return = next_info["episode"]["r"].view(num_games, num_agents_per_game)[done_games, 0].mean().item()
-                    avg_length = next_info["episode"]["l"].view(num_games, num_agents_per_game)[done_games, 0].mean().item()
+                    avg_length = next_info["episode"]["l"].view(num_games, num_agents_per_game)[done_games, 0].float().mean().item()
                     
                     print(f"global_step={global_step}, episodic_return={avg_return}")
                     writer.add_scalar("charts/team_episodic_return", avg_return, global_step)
@@ -675,7 +669,7 @@ if __name__ == "__main__":
                 final_state = boot_obs.view(num_games, -1)
                 
                 # 3. FIX: Calculate distances strictly from the RAW OBS!
-                raw_obs_tensor = torch.Tensor(boot_raw_obs).to(device)
+                raw_obs_tensor = boot_raw_obs
                 landmark_dist = raw_obs_tensor.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
                 landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
                 
@@ -713,6 +707,10 @@ if __name__ == "__main__":
             # 2. UPDATE STATS NOW (Before SGD)1
             # This aligns the normalizers with the data we just collected
             agent.critic.update(b_returns.view(-1, agent.num_agents))
+
+            agent.obs_normalizer.update(b_obs)
+            continuous_b_states = b_states[:, :-args.num_landmarks]
+            agent.state_normalizer.update(continuous_b_states)
 
             # 3. Second Pass: RE-CALCULATE Values and Advantages with NEW stats
             # This is the crucial step you were missing. 
@@ -860,7 +858,6 @@ if __name__ == "__main__":
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
-        writer.add_scalar("charts/local_ratio", current_ratio, global_step)
         writer.add_scalar("charts/ent_coef_now", ent_coef_now, global_step)
 
         if update % 100 == 0 or update == num_updates:

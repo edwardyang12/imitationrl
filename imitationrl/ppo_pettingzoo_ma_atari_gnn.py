@@ -103,9 +103,8 @@ class GraphObservationNormalizer(nn.Module):
         self.feature_dim = feature_dim
         self.continuous_dim = continuous_dim
         
-        # FIX 1: Track a single global (4,) vector for the physics space, NOT per-node
+        # Track ONLY variance. Relative coordinates must always remain centered at 0.0
         shape = (continuous_dim,)
-        self.register_buffer("running_mean", torch.zeros(shape))
         self.register_buffer("running_var", torch.ones(shape))
         self.count = epsilon
 
@@ -113,25 +112,16 @@ class GraphObservationNormalizer(nn.Module):
         B = x_flat.shape[0]
         x_reshaped = x_flat.view(B, self.n_max, self.feature_dim)
         
-        # FIX 2: Only extract and calculate statistics on VALID, active nodes
         active_mask = x_reshaped[:, :, 6] > 0.5 
-        valid_x = x_reshaped[active_mask] # Shape: [Total_Valid_Nodes_in_Batch, 7]
+        valid_x = x_reshaped[active_mask] 
+        continuous_x = valid_x[:, :self.continuous_dim] 
         
-        continuous_x = valid_x[:, :self.continuous_dim] # Shape: [Total_Valid_Nodes_in_Batch, 4]
-        
-        # Average across all valid nodes, regardless of which slot they sit in
-        batch_mean = continuous_x.mean(dim=0) 
-        batch_var = continuous_x.var(dim=0, unbiased=False)
+        # RMS Update: Variance around zero
+        batch_var = (continuous_x ** 2).mean(dim=0)
         batch_count = continuous_x.shape[0]
 
-        delta = batch_mean - self.running_mean
-        new_mean = self.running_mean + delta * batch_count / (self.count + batch_count)
-        m_a = self.running_var * self.count
-        m_b = batch_var * batch_count
-        m_2 = m_a + m_b + delta**2 * self.count * batch_count / (self.count + batch_count)
-        
-        self.running_mean = new_mean
-        self.running_var = m_2 / (self.count + batch_count)
+        delta_var = batch_var - self.running_var
+        self.running_var = self.running_var + delta_var * (batch_count / (self.count + batch_count))
         self.count += batch_count
 
     def normalize(self, x_flat):
@@ -139,36 +129,29 @@ class GraphObservationNormalizer(nn.Module):
         x_reshaped = x_flat.view(B, self.n_max, self.feature_dim).clone()
         
         active_mask = x_reshaped[:, :, 6] > 0.5
-        
-        # FIX: Two-step slicing to bypass PyTorch's multidimensional indexing bug
-        # 1. Extract all features of the valid nodes
         valid_x = x_reshaped[active_mask] 
-        
-        # 2. Extract and normalize ONLY their continuous spatial features
         valid_continuous = valid_x[:, :self.continuous_dim]
-        normalized_continuous = (valid_continuous - self.running_mean) / torch.sqrt(self.running_var + 1e-8)
         
-        # 3. Inject the normalized features back into the valid nodes subset
+        # FIX: Only scale by std. Do NOT subtract a mean. Ego stays exactly at 0.0!
+        normalized_continuous = valid_continuous / torch.sqrt(self.running_var + 1e-8)
+        
         valid_x[:, :self.continuous_dim] = normalized_continuous
-        
-        # 4. Safely push the fully updated valid nodes back into the main batched tensor
         x_reshaped[active_mask] = valid_x
         
         return x_reshaped.view(B, -1)
 
 class MultiHeadGATBackbone(nn.Module):
-    def __init__(self, n_max, feature_dim=7, hidden_dim=64, out_dim=128, heads=4):
+    def __init__(self, n_max, feature_dim=8, hidden_dim=64, out_dim=128, heads=4):
         super().__init__()
         self.n_max = n_max
         self.feature_dim = feature_dim
         
-        # GAT Layer 1: feature_dim -> hidden_dim * heads
         self.gat1 = GATConv(feature_dim, hidden_dim, heads=heads, concat=True)
-        # GAT Layer 2: hidden_dim * heads -> hidden_dim * heads
         self.gat2 = GATConv(hidden_dim * heads, hidden_dim, heads=heads, concat=True)
-        # GAT Layer 3 (Final): hidden_dim * heads -> out_dim (Averaged)
         self.gat3 = GATConv(hidden_dim * heads, out_dim, heads=heads, concat=False)
         
+        # ADD: Linear projection to match dimensions for the first skip connection
+        self.skip_proj = nn.Linear(feature_dim, hidden_dim * heads)
         self.elu = nn.ELU()
 
     def _build_dynamic_graph(self, x_flat):
@@ -211,12 +194,19 @@ class MultiHeadGATBackbone(nn.Module):
     def forward(self, x_flat):
         valid_x, edge_index, valid_batch = self._build_dynamic_graph(x_flat)
         
-        # Message Passing
+        # Project original features for the skip connection
+        res = self.skip_proj(valid_x)
+        
+        # Layer 1 + Skip
         h = self.gat1(valid_x, edge_index)
-        h = self.elu(h)
-        h = self.gat2(h, edge_index)
-        h = self.elu(h)
-        node_embeddings = self.gat3(h, edge_index) # [Total_Valid_Nodes, out_dim]
+        h = self.elu(h) + res 
+        
+        # Layer 2 + Skip (Dimensions already match here, so we just add the previous 'h')
+        h2 = self.gat2(h, edge_index)
+        h2 = self.elu(h2) + h 
+        
+        # Layer 3 (Final Output)
+        node_embeddings = self.gat3(h2, edge_index) 
         
         return valid_x, node_embeddings, valid_batch
 
@@ -289,45 +279,40 @@ class GraphObservationWrapper(BaseParallelWrapper):
         super().__init__(env)
         self.n_max = n_max
         self.current_n = current_n
-        self.feature_dim = 7  # Must match your MultiHeadGATBackbone
+        self.feature_dim = 8  # FIX: Bumped from 7 to 8 to hold the Agent ID
+
+        self.random_tags = []
         
-        # The output must be flat because Gymnasium/SuperSuit expects 1D arrays for Box spaces
         self.observation_spaces = {
             agent: gym.spaces.Box(
-                low=-np.inf, 
-                high=np.inf, 
-                shape=(self.n_max * self.feature_dim,), 
-                dtype=np.float32
-            )
-            for agent in self.possible_agents
+                low=-np.inf, high=np.inf, 
+                shape=(self.n_max * self.feature_dim,), dtype=np.float32
+            ) for agent in self.possible_agents
         }
 
     def observation_space(self, agent):
         return self.observation_spaces[agent]
 
-    def process_obs(self, raw_obs):
+    def process_obs(self, raw_obs, ego_idx):
         N = self.current_n
         nodes = np.zeros((self.n_max, self.feature_dim), dtype=np.float32)
         
         self_vel = raw_obs[0:2]
-        # We no longer need self_pos for absolute math!
         
-        # --- NODE 0: Ego Agent (Self) ---
-        # Position is always exactly (0.0, 0.0) relative to itself
-        nodes[0] = [0.0, 0.0, self_vel[0], self_vel[1], 1.0, 0.0, 1.0]
+        # 1. Fetch the Ego Agent's specific Random Tag
+        ego_tag = self.random_tags[ego_idx]
+        
+        # [rel_x, rel_y, vel_x, vel_y, is_self, is_landmark, is_active, RANDOM_TAG]
+        nodes[0] = [0.0, 0.0, self_vel[0], self_vel[1], 1.0, 0.0, 1.0, ego_tag]
         
         idx = 1
-        
-        # --- NODES 1 to N: Landmarks ---
         lm_start = 4
         lm_end = 4 + 2 * N
         lm_rel_pos = raw_obs[lm_start:lm_end].reshape(N, 2)
         for i in range(N):
-            # FIX: Feed the exact relative distance vector directly to the GNN
-            nodes[idx] = [lm_rel_pos[i][0], lm_rel_pos[i][1], 0.0, 0.0, 0.0, 1.0, 1.0]
+            nodes[idx] = [lm_rel_pos[i][0], lm_rel_pos[i][1], 0.0, 0.0, 0.0, 1.0, 1.0, 0.0]
             idx += 1
             
-        # --- NODES N+1 to 2N-1: Other Agents ---
         oa_pos_start = lm_end
         oa_pos_end = oa_pos_start + 2 * (N - 1)
         oa_rel_pos = raw_obs[oa_pos_start:oa_pos_end].reshape(N - 1, 2)
@@ -336,9 +321,11 @@ class GraphObservationWrapper(BaseParallelWrapper):
         oa_vel_end = oa_vel_start + 2 * (N - 1)
         oa_vel = raw_obs[oa_vel_start:oa_vel_end].reshape(N - 1, 2)
         
+        # 2. Extract the other agents' Tags using MPE's internal ordering (skipping ego)
+        other_tags = [self.random_tags[j] for j in range(N) if j != ego_idx]
+        
         for i in range(N - 1):
-            # FIX: Exact relative distance and exact relative velocity
-            nodes[idx] = [oa_rel_pos[i][0], oa_rel_pos[i][1], oa_vel[i][0], oa_vel[i][1], 0.0, 0.0, 1.0]
+            nodes[idx] = [oa_rel_pos[i][0], oa_rel_pos[i][1], oa_vel[i][0], oa_vel[i][1], 0.0, 0.0, 1.0, other_tags[i]]
             idx += 1
             
         return nodes.flatten()
@@ -347,29 +334,40 @@ class GraphObservationWrapper(BaseParallelWrapper):
         obs, rews, terms, truncs, infos = self.env.step(actions)
         for agent in self.agents:
             infos[agent]["raw_obs"] = obs[agent] 
-        graph_obs = {agent: self.process_obs(obs[agent]) for agent in obs}
+            
+        graph_obs = {}
+        for i, agent in enumerate(self.agents):
+            graph_obs[agent] = self.process_obs(obs[agent], ego_idx=i)
+            
         return graph_obs, rews, terms, truncs, infos
 
     def reset(self, seed=None, options=None):
         obs, infos = self.env.reset(seed=seed, options=options)
+        
+        # FIX: Generate N random scalar tags for the entire episode
+        # This keeps the IDs consistent across all decentralized observations
+        self.random_tags = np.random.rand(self.current_n)
+        
         for agent in self.agents:
             infos[agent]["raw_obs"] = obs[agent]
-        graph_obs = {agent: self.process_obs(obs[agent]) for agent in obs}
+            
+        graph_obs = {}
+        for i, agent in enumerate(self.agents):
+            # Pass the ego index so the agent knows which tag belongs to it
+            graph_obs[agent] = self.process_obs(obs[agent], ego_idx=i)
+            
         return graph_obs, infos
 
 class GraphAgent(nn.Module):
-    def __init__(self, envs, n_max, num_agents, occupancy_dim, state_dim):
+    def __init__(self, envs, n_max, num_agents, occupancy_dim): # Remove state_dim
         super().__init__()
         self.num_agents = num_agents
         self.n_max = n_max
         self.occupancy_dim = occupancy_dim
-        self.state_dim = state_dim
         
-        # The Shared Visual Cortex
-        self.backbone = MultiHeadGATBackbone(n_max=n_max, feature_dim=7)
+        self.backbone = MultiHeadGATBackbone(n_max=n_max, feature_dim=8)
         gat_out_dim = 128
         
-        # Decoupled Actor Head (Operates on individual agent node embeddings)
         self.actor_mlp = nn.Sequential(
             layer_init(nn.Linear(gat_out_dim, 128)),
             nn.LayerNorm(128), nn.ReLU(),
@@ -378,8 +376,8 @@ class GraphAgent(nn.Module):
             layer_init(nn.Linear(64, envs.single_action_space.n), std=0.01)
         )
         
-        # Decoupled Critic Head (Operates on the pooled graph + exogenous occupancy)
-        critic_in_dim = gat_out_dim + state_dim 
+        # FIX: Critic only sees the invariant graph + occupancy flags
+        critic_in_dim = gat_out_dim + occupancy_dim 
         self.critic_mlp = nn.Sequential(
             layer_init(nn.Linear(critic_in_dim, 256)),
             nn.LayerNorm(256), nn.ReLU(),
@@ -387,11 +385,7 @@ class GraphAgent(nn.Module):
             nn.LayerNorm(128), nn.ReLU(),
         )
         self.critic_popart = PopArt(128, self.num_agents)
-
-        self.obs_normalizer = GraphObservationNormalizer(n_max=n_max, feature_dim=7, continuous_dim=4)
-
-        self.continuous_state_dim = state_dim - occupancy_dim
-        self.state_normalizer = ObservationNormalizer(self.continuous_state_dim)
+        self.obs_normalizer = GraphObservationNormalizer(n_max=n_max, feature_dim=8, continuous_dim=4)
 
     def get_value(self, x_flat, centralized_state, denormalize=False):
         x_norm = self.obs_normalizer.normalize(x_flat)
@@ -400,13 +394,9 @@ class GraphAgent(nn.Module):
         pooled_graph = global_mean_pool(node_embeddings, valid_batch)
         pooled_graph = pooled_graph.view(-1, self.num_agents, pooled_graph.shape[-1]).mean(dim=1)
 
-        continuous_part = centralized_state[:, :self.continuous_state_dim]
-        binary_part = centralized_state[:, self.continuous_state_dim:]
-        norm_continuous = self.state_normalizer.normalize(continuous_part)
-        norm_centralized_state = torch.cat([norm_continuous, binary_part], dim=-1)
-        
-        # Concatenate normalized state with pooled graph
-        centralized_state_vector = torch.cat([pooled_graph, norm_centralized_state], dim=-1)
+        # FIX: Simply extract the occupancy flags. No continuous state normalization needed.
+        occupancy_flags = centralized_state[:, -self.occupancy_dim:]
+        centralized_state_vector = torch.cat([pooled_graph, occupancy_flags], dim=-1)
         
         values = self.critic_popart(self.critic_mlp(centralized_state_vector))
         if denormalize:
@@ -417,7 +407,6 @@ class GraphAgent(nn.Module):
         x_norm = self.obs_normalizer.normalize(x_flat)
         valid_x, node_embeddings, valid_batch = self.backbone(x_norm)
         
-        # --- ACTOR EXTRACTION ---
         agent_mask = valid_x[:, 4] > 0.5
         agent_embeddings = node_embeddings[agent_mask] 
         
@@ -427,17 +416,12 @@ class GraphAgent(nn.Module):
         if action is None:
             action = probs.sample()
             
-        # --- CRITIC EXTRACTION ---
         pooled_graph = global_mean_pool(node_embeddings, valid_batch)
         pooled_graph = pooled_graph.view(-1, self.num_agents, pooled_graph.shape[-1]).mean(dim=1)
 
-        continuous_part = centralized_state[:, :self.continuous_state_dim]
-        binary_part = centralized_state[:, self.continuous_state_dim:]
-        norm_continuous = self.state_normalizer.normalize(continuous_part)
-        norm_centralized_state = torch.cat([norm_continuous, binary_part], dim=-1)
-        
-        # Concatenate normalized state with pooled graph
-        centralized_state_vector = torch.cat([pooled_graph, norm_centralized_state], dim=-1)
+        # FIX: Simply extract the occupancy flags.
+        occupancy_flags = centralized_state[:, -self.occupancy_dim:]
+        centralized_state_vector = torch.cat([pooled_graph, occupancy_flags], dim=-1)
         
         values = self.critic_popart(self.critic_mlp(centralized_state_vector))
         if denormalize:
@@ -498,7 +482,6 @@ def make_env(args, env_id, seed, current_local_ratio=0.5):
             env = ss.resize_v1(env, x_size=84, y_size=84)
             env = ss.clip_reward_v0(env, lower_bound=-1, upper_bound=1)
             env = ss.frame_stack_v1(env, 4)
-            env = ss.agent_indicator_v0(env, type_only=False)
         
         # SuperSuit natively converts (Agents, Obs) -> (Batch, Obs)
         env = ss.pettingzoo_env_to_vec_env_v1(env)
@@ -737,8 +720,7 @@ if __name__ == "__main__":
         envs=envs, 
         n_max=n_max, 
         num_agents=num_agents_per_game, 
-        occupancy_dim=occupancy_dim,
-        state_dim=state_dim
+        occupancy_dim=occupancy_dim
     ).to(device)
 
     # Fix: Point the optimizer parameter groups to the real attributes inside GraphAgent
@@ -1005,6 +987,8 @@ if __name__ == "__main__":
             # This aligns the normalizers with the data we just collected
             agent.critic_popart.update(b_returns.view(-1, agent.num_agents))
 
+            agent.obs_normalizer.update(b_obs)
+
             # 3. Second Pass: RE-CALCULATE Values and Advantages with NEW stats
             # This is the crucial step you were missing. 
             # It ensures 'values' and 'returns' are in the same normalized space for SGD.
@@ -1134,10 +1118,6 @@ if __name__ == "__main__":
                 if approx_kl > args.target_kl:
                     break
 
-        agent.obs_normalizer.update(b_obs)
-
-        continuous_b_states = b_states[:, :agent.continuous_state_dim]
-        agent.state_normalizer.update(continuous_b_states)
         if update % 500 == 0:
                 gc.collect()
 

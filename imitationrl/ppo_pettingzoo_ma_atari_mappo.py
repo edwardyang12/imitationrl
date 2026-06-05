@@ -4,6 +4,7 @@ import importlib
 import os
 import random
 import time
+import scipy
 from distutils.util import strtobool
 import gc
 
@@ -667,7 +668,7 @@ if __name__ == "__main__":
                 resets = done
 
             if args.reward_cheat:
-                # CAST TO TENSOR FIRST to enable .clone() and .view()
+                # CAST TO TENSOR FIRST
                 next_obs_tensor = torch.Tensor(next_obs).to(device)
 
                 # --- 1. REWARD CALCULATION FOR CURRENT STEP ---
@@ -677,39 +678,27 @@ if __name__ == "__main__":
                         if final_obs is not None:
                             true_next_obs[agent_idx] = torch.Tensor(final_obs).to(device)
 
-                # Extract landmarks for the true physical state
                 true_landmark_dist = true_next_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
                 true_landmark_dist = true_landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
                 dist_for_reward = torch.norm(true_landmark_dist, dim=-1)
 
                 assigned_dist = torch.gather(dist_for_reward, 2, current_assignments.unsqueeze(-1)).squeeze(-1)
                 
-                # --- 1. THE SMOOTH BIPARTITE PULL ---
-                # A linear pull provides a constant, predictable gradient that the Critic can easily map.
-                # It naturally stops hovering because the acceleration doesn't approach infinity near 0.
+                # --- 2. LOCALIZED REWARD ALGORITHMS ---
                 individual_pull = -1.0 * assigned_dist
                 
-                # --- 2. LOCALIZED COLLISION PENALTY (Fixes Sacrificial Agents) ---
                 landmarks_end = 4 + 2 * args.num_landmarks
-                other_agents_start = landmarks_end
-                other_agents_end = other_agents_start + 2 * (args.num_landmarks - 1)
-                
-                # Extract relative positions of neighbors natively
-                other_pos = true_next_obs.view(num_games, num_agents_per_game, -1)[:, :, other_agents_start:other_agents_end]
+                other_pos = true_next_obs.view(num_games, num_agents_per_game, -1)[:, :, landmarks_end:landmarks_end + 2 * (args.num_landmarks - 1)]
                 other_pos = other_pos.view(num_games, num_agents_per_game, args.num_landmarks - 1, 2)
-                
                 other_dist = torch.norm(other_pos, dim=-1)
                 
-                # Punish overlapping hitboxes strictly for the agents involved.
-                # We use -1.0 to ensure the math forces them to detour around traffic.
                 collisions = (other_dist < 0.3).float().sum(dim=-1)
-                individual_collision_penalty = -1.0 * collisions
+                individual_collision_penalty = -0.25 * collisions
+                success_bonus = (assigned_dist < 0.1).float() * 1.0
                 
-                # --- 3. OVERWRITE NATIVE REWARD ---
-                # Pure localized, continuous credit assignment!
-                rewards[step] = individual_pull.view(-1) + individual_collision_penalty.view(-1)
+                rewards[step] = individual_pull.view(-1) + individual_collision_penalty.view(-1) + success_bonus.view(-1)
 
-                # --- 4. ASSIGNMENT ROUTING FOR NEXT EPISODE ---
+                # --- 3. ASSIGNMENT ROUTING FOR NEXT EPISODE ---
                 game_resets = torch.Tensor(resets).to(device).view(num_games, num_agents_per_game)[:, 0].bool()
                 needs_assignment = needs_assignment | game_resets
                 
@@ -718,21 +707,33 @@ if __name__ == "__main__":
                     reset_landmark_dist = reset_landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
                     dist_for_new_episode = torch.norm(reset_landmark_dist, dim=-1)
 
-                    dist_clone = dist_for_new_episode.clone()
+                    dist_cpu = dist_for_new_episode.cpu().numpy()
+                    
                     for g in range(num_games):
                         if needs_assignment[g]:
-                            for _ in range(args.num_landmarks):
-                                flat_dist = dist_clone[g].view(-1)
-                                min_val, min_idx = flat_dist.min(dim=0)
-                                
-                                agent_idx = min_idx // args.num_landmarks
-                                landmark_idx = min_idx % args.num_landmarks
-                                
-                                current_assignments[g, agent_idx] = landmark_idx
-                                dist_clone[g, agent_idx, :] = float('inf')
-                                dist_clone[g, :, landmark_idx] = float('inf')
+                            row_ind, col_ind = scipy.optimize.linear_sum_assignment(dist_cpu[g])
+                            current_assignments[g] = torch.tensor(col_ind, device=device)
                                 
                     needs_assignment.fill_(False)
+
+                # --- 4. THE FIX: OBSERVABILITY INJECTION ---
+                # We physically re-order the landmarks in the agent's observation so the Hungarian target is always FIRST.
+                obs_reshaped = next_obs_tensor.clone().view(num_games, num_agents_per_game, -1)
+                landmarks_segment = obs_reshaped[:, :, 4:4+2*args.num_landmarks].view(num_games, num_agents_per_game, args.num_landmarks, 2)
+                
+                for g in range(num_games):
+                    for a in range(num_agents_per_game):
+                        target_idx = current_assignments[g, a].item()
+                        if target_idx != 0:
+                            # Swap target coordinates with index 0
+                            temp = landmarks_segment[g, a, 0].clone()
+                            landmarks_segment[g, a, 0] = landmarks_segment[g, a, target_idx]
+                            landmarks_segment[g, a, target_idx] = temp
+                            
+                obs_reshaped[:, :, 4:4+2*args.num_landmarks] = landmarks_segment.view(num_games, num_agents_per_game, -1)
+                
+                # Overwrite next_obs with the injected GPS coordinates before the next PPO step!
+                next_obs = obs_reshaped.view(actual_num_envs, -1).to(device)
             else:
                 rewards[step] = torch.tensor(reward).to(device).view(-1)
             
@@ -803,6 +804,10 @@ if __name__ == "__main__":
 
             # 4. UPDATE STATS NOW (Using uncorrupted b_returns)
             agent.critic.update(b_returns.view(-1, agent.num_agents))
+
+            agent.obs_normalizer.update(b_obs)
+            continuous_b_states = b_states[:, :-args.num_landmarks]
+            agent.state_normalizer.update(continuous_b_states)
 
             # 5. SECOND PASS
             new_values = agent.get_value(
@@ -931,10 +936,6 @@ if __name__ == "__main__":
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
                     break
-
-        agent.obs_normalizer.update(b_obs)
-        continuous_b_states = b_states[:, :-args.num_landmarks]
-        agent.state_normalizer.update(continuous_b_states)
 
         if update % 500 == 0:
                 gc.collect()
