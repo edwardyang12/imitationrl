@@ -14,7 +14,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.distributions.categorical import Categorical
+# from torch.distributions.categorical import Categorical
+from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
 def parse_args():
@@ -50,15 +51,15 @@ def parse_args():
         help="the number of steps to run in each environment per policy rollout")
     parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggle learning rate annealing for policy and value networks")
-    parser.add_argument("--anneal-ent", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+    parser.add_argument("--anneal-ent", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=False,
         help="Toggle learning rate annealing for policy and value networks")
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
     parser.add_argument("--gae-lambda", type=float, default=0.95,
         help="the lambda for the general advantage estimation")
-    parser.add_argument("--num-minibatches", type=int, default=8,
+    parser.add_argument("--num-minibatches", type=int, default=128,
         help="the number of mini-batches")
-    parser.add_argument("--update-epochs", type=int, default=10,
+    parser.add_argument("--update-epochs", type=int, default=5,
         help="the K epochs to update the policy")
     parser.add_argument("--norm-adv", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggles advantages normalization")
@@ -66,7 +67,7 @@ def parse_args():
         help="the surrogate clipping coefficient")
     parser.add_argument("--clip-vloss", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggles whether or not to use a clipped loss for the value function, as per the paper.")
-    parser.add_argument("--ent-coef", type=float, default=0.03,
+    parser.add_argument("--ent-coef", type=float, default=0.01,
         help="coefficient of the entropy")
     parser.add_argument("--vf-coef", type=float, default=0.5,
         help="coefficient of the value function")
@@ -76,7 +77,7 @@ def parse_args():
         help="the target KL divergence threshold")
     parser.add_argument("--num-landmarks", type=int, default=3,
         help="number of agents and landmarks")
-    parser.add_argument("--max-cycles", type=int, default=70,
+    parser.add_argument("--max-cycles", type=int, default=100,
         help="length of environment run")
     parser.add_argument("--reward-cheat", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will have extra reward cheats")
@@ -162,27 +163,36 @@ class Agent(nn.Module):
         self.num_agents = num_agents
 
         self.obs_dim = np.array(single_obs_shape).prod()
+        self.action_dim = np.prod(single_action_space.shape)
         # self.value_normalizer = ValueNormalizer(num_agents)
         self.obs_normalizer = ObservationNormalizer(self.obs_dim)
+
+        self.agent_id_embedding = nn.Embedding(num_agents, 10) # this 10 can be changed later
 
         self.continuous_state_dim = state_dim - self.num_agents
         self.state_normalizer = ObservationNormalizer(self.continuous_state_dim)
         # self.state_normalizer = ObservationNormalizer(state_dim)
 
-        # HETEROGENEOUS ACTORS: Each agent ID gets its own unique brain
-        self.actors = nn.ModuleList([
-            nn.Sequential(
-                layer_init(nn.Linear(self.obs_dim, 512)),
-                nn.LayerNorm(512), nn.ReLU(),
-                layer_init(nn.Linear(512, 512)),
-                nn.LayerNorm(512), nn.ReLU(),
-                layer_init(nn.Linear(512, 256)),
-                nn.LayerNorm(256), nn.ReLU(),
-                layer_init(nn.Linear(256, 256)),
-                nn.ReLU(),
-                layer_init(nn.Linear(256, single_action_space.n), std=0.01)
-            ) for _ in range(num_agents)
-        ])
+        # SHARED ACTOR: One brain for all agents
+        self.actor = nn.Sequential(
+            layer_init(nn.Linear(self.obs_dim + 10, 1024)),
+            nn.LayerNorm(1024), nn.ReLU(),
+            layer_init(nn.Linear(1024, 512)),
+            nn.LayerNorm(512), nn.ReLU(),
+            layer_init(nn.Linear(512, 256)),
+            nn.LayerNorm(256), nn.ReLU(),
+            layer_init(nn.Linear(256, 256)),
+            nn.ReLU(),
+        )
+
+        # The Mean Head (Restored Tanh for instant braking)
+        self.actor_mean = nn.Sequential(
+            layer_init(nn.Linear(256, self.action_dim), std=0.01),
+            nn.Tanh() 
+        )
+
+        # The Variance Head (Starts with a bias of -0.5 to match your original initialization)
+        self.actor_logstd = nn.Parameter(torch.zeros(1, self.action_dim))
 
         # SHARED CENTRALIZED CRITIC: One brain to judge the whole team
         concatenated_obs_dim = self.num_agents * self.obs_dim
@@ -223,25 +233,29 @@ class Agent(nn.Module):
 
     def get_action_and_value(self, x, action=None, centralized_state=None, denormalize=False):
         x_norm = self.obs_normalizer.normalize(x)
-        batch_size = x.shape[0]
+        batch_size = x.shape[0] 
         
-        # Reshape to [NumGames, NumAgents, ObsDim]
-        obs_reshaped = x_norm.view(-1, self.num_agents, self.obs_dim)
+        agent_ids = torch.arange(self.num_agents).to(x.device).repeat(batch_size // self.num_agents)
+        embedded_ids = self.agent_id_embedding(agent_ids)
+        actor_input = torch.cat([x_norm, embedded_ids], dim=-1)
         
-        logits_list = []
-        for i in range(self.num_agents):
-            # Each observation in the game is passed to its specific Actor
-            logits = self.actors[i](obs_reshaped[:, i, :])
-            logits_list.append(logits)
+        # Extract features
+        actor_features = self.actor(actor_input)
         
-        # Flatten back to [BatchSize, NumActions]
-        combined_logits = torch.stack(logits_list, dim=1).view(batch_size, -1)
-        probs = Categorical(logits=combined_logits)
+        # Branch into Mean and LogStd
+        action_means = self.actor_mean(actor_features)
+        action_logstds = self.actor_logstd.expand_as(action_means)
+        
+        # Loosely bound the logstd to prevent NaN explosions, allowing near-zero variance
+        safe_logstds = torch.clamp(action_logstds, min=-5.0, max=2.0)
+        action_stds = safe_logstds.exp()
+        
+        probs = Normal(action_means, action_stds)
         
         if action is None:
             action = probs.sample()
             
-        return action, probs.log_prob(action), probs.entropy(), self.get_value(x, centralized_state, denormalize)
+        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.get_value(x, centralized_state, denormalize)
 
 class VMASVectorizedEnv:
     def __init__(self, args, seed, run_name, update_step=0):
@@ -257,7 +271,7 @@ class VMASVectorizedEnv:
             scenario=args.env_id,
             num_envs=self.num_games,
             device=self.device,
-            continuous_actions=False, # CHANGED: Let VMAS natively handle discrete actions
+            continuous_actions=True,
             n_agents=self.num_agents,
             n_targets=args.num_landmarks, 
             use_lidar=False, 
@@ -266,7 +280,7 @@ class VMASVectorizedEnv:
         )
         
         vmas_obs_dim = self.env.observation_space[0].shape[0]
-        self.single_action_space = gym.spaces.Discrete(9) # Standard VMAS discrete action space
+        self.single_action_space = self.env.action_space[0]
         
         target_dim = vmas_obs_dim + self.num_agents
         self.single_observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(target_dim,))
@@ -301,10 +315,10 @@ class VMASVectorizedEnv:
         return final_obs, info
 
     def step(self, actions):
-        actions_reshaped = actions.view(self.num_games, self.num_agents)
+        actions_reshaped = actions.view(self.num_games, self.num_agents, -1)
         
-        # Pass discrete actions directly to VMAS
-        vmas_actions = [actions_reshaped[:, i] for i in range(self.num_agents)]
+        # Pass continuous force vectors directly to VMAS
+        vmas_actions = [actions_reshaped[:, i, :] for i in range(self.num_agents)]
         
         vmas_obs, vmas_rews, _, vmas_info = self.env.step(vmas_actions)
         self.step_count += 1
@@ -456,10 +470,12 @@ if __name__ == "__main__":
     states = torch.zeros((args.num_steps, num_games, state_dim)).to(device)
 
     agent = Agent(envs.single_action_space, envs.single_observation_space.shape, num_agents_per_game, state_dim=state_dim).to(device)
-    # agent = Agent(envs).to(device)
-    # optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
     optimizer = optim.Adam([
-            {'params': list(agent.actors.parameters()), 'lr': 3e-4}, 
+            {'params': list(agent.actor.parameters()) + 
+                       list(agent.actor_mean.parameters()) + 
+                       [agent.actor_logstd] + 
+                       list(agent.agent_id_embedding.parameters()), 'lr': 3e-4}, 
+            
             {'params': list(agent.critic_encoder.parameters()) + 
                     list(agent.critic.parameters()) + 
                     list(agent.critic_projection.parameters()), 'lr': 1e-3} 
@@ -541,7 +557,7 @@ if __name__ == "__main__":
                 # current_game_states = torch.Tensor(next_info["global_state"][::num_agents_per_game]).to(device)
                 current_game_states = next_obs.view(num_games, -1)
                 teammate_features = 2 * (num_agents_per_game - 1)
-                landmark_start_idx = 4 + teammate_features
+                landmark_start_idx = 4
                 
                 landmark_dist = next_obs.view(num_games, num_agents_per_game, -1)[:, :, landmark_start_idx : landmark_start_idx + 2*args.num_landmarks]
                 landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
@@ -559,8 +575,10 @@ if __name__ == "__main__":
             actions[step] = action
             logprobs[step] = logprob
 
+            clipped_action = torch.clamp(action, -1.0, 1.0)
+
             # TRY NOT TO MODIFY: execute the game and log data.
-            step_data = envs.step(action)
+            step_data = envs.step(clipped_action)
     
             # Gymnasium step returns (obs, reward, terminations, truncations, infos)
             if len(step_data) == 5:
@@ -670,7 +688,10 @@ if __name__ == "__main__":
                 
                 # 3. FIX: Calculate distances strictly from the RAW OBS!
                 raw_obs_tensor = boot_raw_obs
-                landmark_dist = raw_obs_tensor.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
+                teammate_features = 2 * (num_agents_per_game - 1)
+                landmark_start_idx = 4
+                
+                landmark_dist = raw_obs_tensor.view(num_games, num_agents_per_game, -1)[:, :, landmark_start_idx : landmark_start_idx + 2*args.num_landmarks]
                 landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
                 
                 occupied = (torch.norm(landmark_dist, dim=-1) < strict_occupancy_radius).any(dim=1).float()
@@ -770,7 +791,7 @@ if __name__ == "__main__":
 
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(
                     b_obs[mb_inds], 
-                    b_actions.long()[mb_inds],
+                    b_actions[mb_inds], 
                     centralized_state=mb_states_for_critic
                 )
                 logratio = newlogprob - b_logprobs[mb_inds]

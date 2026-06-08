@@ -15,9 +15,10 @@ from supersuit.vector import ConcatVecEnv
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch_geometric.nn import GATConv, global_mean_pool
+from torch_geometric.nn import GATConv, global_mean_pool, GATv2Conv
 from torch.distributions.categorical import Categorical
 from torch.utils.tensorboard import SummaryWriter
+from torch_geometric.nn import radius_graph
 
 from pettingzoo.utils.wrappers import BaseParallelWrapper
 
@@ -62,7 +63,7 @@ def parse_args():
         help="the lambda for the general advantage estimation")
     parser.add_argument("--num-minibatches", type=int, default=8,
         help="the number of mini-batches")
-    parser.add_argument("--update-epochs", type=int, default=10,
+    parser.add_argument("--update-epochs", type=int, default=5,
         help="the K epochs to update the policy")
     parser.add_argument("--norm-adv", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggles advantages normalization")
@@ -146,67 +147,51 @@ class MultiHeadGATBackbone(nn.Module):
         self.n_max = n_max
         self.feature_dim = feature_dim
         
-        self.gat1 = GATConv(feature_dim, hidden_dim, heads=heads, concat=True)
-        self.gat2 = GATConv(hidden_dim * heads, hidden_dim, heads=heads, concat=True)
-        self.gat3 = GATConv(hidden_dim * heads, out_dim, heads=heads, concat=False)
+        self.gat1 = GATConv(feature_dim, hidden_dim, heads=heads, concat=True, edge_dim=1)
+        self.gat2 = GATConv(hidden_dim * heads, hidden_dim, heads=heads, concat=True, edge_dim=1)
+        self.gat3 = GATConv(hidden_dim * heads, out_dim, heads=heads, concat=False, edge_dim=1)
         
         # ADD: Linear projection to match dimensions for the first skip connection
         self.skip_proj = nn.Linear(feature_dim, hidden_dim * heads)
         self.elu = nn.ELU()
 
     def _build_dynamic_graph(self, x_flat):
-        """
-        Converts the flat CleanRL tensor into a dynamic, dummy-free PyG Graph.
-        Optimized to prevent O(V^2) VRAM explosions during massive Minibatch updates.
-        """
         B = x_flat.shape[0]
         device = x_flat.device
         
-        # Reshape to [Batch, N_max, Feature_Dim]
         x_padded = x_flat.view(B, self.n_max, self.feature_dim)
-        
-        # 1. Mask out dummy nodes
         active_mask = x_padded[:, :, 6] > 0.5
+        valid_x = x_padded[active_mask] 
         
-        # 2. Extract strictly valid node features
-        valid_x = x_padded[active_mask] # Shape: [Total_Valid_Nodes_in_Batch, 7]
-        
-        # 3. Create PyG Batch Indexing
         batch_indices = torch.arange(B, device=device).view(-1, 1).expand(B, self.n_max)
         valid_batch = batch_indices[active_mask] 
         
-        # 4. Generate Fully Connected Edge Index (Optimized Tile Method)
-        # Instead of a dense 46k x 46k matrix, we build one small graph and mathematically tile it B times.
-        num_active = int(active_mask[0].sum().item())
+        edge_index = radius_graph(valid_x[:, :2], r=1.0, batch=valid_batch, loop=False)
         
-        # Base graph for a single environment (e.g., 6x6)
-        base_edge_index = torch.ones(num_active, num_active, device=device).nonzero(as_tuple=False).t().contiguous()
+        # --- NEW PHYSICS EXTRACTION ---
+        row, col = edge_index
+        # valid_x[:, :2] holds the exact [rel_x, rel_y] for every node.
+        # We calculate the Euclidean distance between the connected pairs.
+        diff = valid_x[row, :2] - valid_x[col, :2]
+        # Add 1e-8 inside the square root to prevent NaN gradients during perfect collisions
+        distances = torch.sqrt((diff ** 2).sum(dim=-1, keepdim=True) + 1e-8)
         
-        # Add the node offset for each batch item
-        batch_offsets = (torch.arange(B, device=device) * num_active).view(1, B, 1)
-        edge_index = base_edge_index.unsqueeze(1).repeat(1, B, 1) + batch_offsets
-        
-        # Flatten into the standard PyG [2, E] format
-        edge_index = edge_index.view(2, -1)
-        
-        return valid_x, edge_index, valid_batch
+        return valid_x, edge_index, distances, valid_batch
 
     def forward(self, x_flat):
-        valid_x, edge_index, valid_batch = self._build_dynamic_graph(x_flat)
+        # Unpack the distances as edge_attr
+        valid_x, edge_index, edge_attr, valid_batch = self._build_dynamic_graph(x_flat)
         
-        # Project original features for the skip connection
         res = self.skip_proj(valid_x)
         
-        # Layer 1 + Skip
-        h = self.gat1(valid_x, edge_index)
+        # Feed the physics directly into the dynamic attention heads
+        h = self.gat1(valid_x, edge_index, edge_attr=edge_attr)
         h = self.elu(h) + res 
         
-        # Layer 2 + Skip (Dimensions already match here, so we just add the previous 'h')
-        h2 = self.gat2(h, edge_index)
+        h2 = self.gat2(h, edge_index, edge_attr=edge_attr)
         h2 = self.elu(h2) + h 
         
-        # Layer 3 (Final Output)
-        node_embeddings = self.gat3(h2, edge_index) 
+        node_embeddings = self.gat3(h2, edge_index, edge_attr=edge_attr) 
         
         return valid_x, node_embeddings, valid_batch
 
@@ -247,32 +232,6 @@ class PopArt(nn.Module):
     
     def normalize(self, x):
         return (x - self.mean) / torch.sqrt(self.std**2 + 1e-8)
-
-class ObservationNormalizer(nn.Module):
-    def __init__(self, shape, epsilon=1e-5):
-        super().__init__()
-        self.register_buffer("running_mean", torch.zeros(shape))
-        self.register_buffer("running_var", torch.ones(shape))
-        self.count = epsilon
-
-    def update(self, x):
-        batch_mean = x.mean(dim=0)
-        batch_var = x.var(dim=0, unbiased=False)
-        batch_count = x.shape[0]
-
-        # Update running mean and variance using Welford's algorithm
-        delta = batch_mean - self.running_mean
-        new_mean = self.running_mean + delta * batch_count / (self.count + batch_count)
-        m_a = self.running_var * self.count
-        m_b = batch_var * batch_count
-        m_2 = m_a + m_b + delta**2 * self.count * batch_count / (self.count + batch_count)
-        
-        self.running_mean = new_mean
-        self.running_var = m_2 / (self.count + batch_count)
-        self.count += batch_count
-
-    def normalize(self, x):
-        return (x - self.running_mean) / torch.sqrt(self.running_var + 1e-8)
 
 class GraphObservationWrapper(BaseParallelWrapper):
     def __init__(self, env, n_max, current_n):
@@ -377,7 +336,7 @@ class GraphAgent(nn.Module):
         )
         
         # FIX: Critic only sees the invariant graph + occupancy flags
-        critic_in_dim = gat_out_dim + occupancy_dim 
+        critic_in_dim = gat_out_dim + occupancy_dim +1
         self.critic_mlp = nn.Sequential(
             layer_init(nn.Linear(critic_in_dim, 256)),
             nn.LayerNorm(256), nn.ReLU(),
@@ -396,7 +355,17 @@ class GraphAgent(nn.Module):
 
         # FIX: Simply extract the occupancy flags. No continuous state normalization needed.
         occupancy_flags = centralized_state[:, -self.occupancy_dim:]
-        centralized_state_vector = torch.cat([pooled_graph, occupancy_flags], dim=-1)
+
+        # Calculate network density (Mass)
+        # valid_batch tells us how many active nodes belong to each game
+        active_counts = torch.bincount(valid_batch, minlength=x_flat.shape[0])
+        density_scalar_per_agent = (active_counts.float() / self.n_max).view(-1, 1)
+        
+        # FIX: Pool the 30 agent densities down to the 6 global game densities
+        density_scalar = density_scalar_per_agent.view(-1, self.num_agents, 1).mean(dim=1)
+        
+        # Give the Critic the Graph, the Occupancy, and the Density
+        centralized_state_vector = torch.cat([pooled_graph, occupancy_flags, density_scalar], dim=-1)
         
         values = self.critic_popart(self.critic_mlp(centralized_state_vector))
         if denormalize:
@@ -421,7 +390,16 @@ class GraphAgent(nn.Module):
 
         # FIX: Simply extract the occupancy flags.
         occupancy_flags = centralized_state[:, -self.occupancy_dim:]
-        centralized_state_vector = torch.cat([pooled_graph, occupancy_flags], dim=-1)
+        # Calculate network density (Mass)
+        # valid_batch tells us how many active nodes belong to each game
+        active_counts = torch.bincount(valid_batch, minlength=x_flat.shape[0])
+        density_scalar_per_agent = (active_counts.float() / self.n_max).view(-1, 1)
+        
+        # FIX: Pool the 30 agent densities down to the 6 global game densities
+        density_scalar = density_scalar_per_agent.view(-1, self.num_agents, 1).mean(dim=1)
+        
+        # Give the Critic the Graph, the Occupancy, and the Density
+        centralized_state_vector = torch.cat([pooled_graph, occupancy_flags, density_scalar], dim=-1)
         
         values = self.critic_popart(self.critic_mlp(centralized_state_vector))
         if denormalize:

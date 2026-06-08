@@ -6,6 +6,7 @@ import random
 import time
 from distutils.util import strtobool
 import gc
+import scipy
 
 import gymnasium as gym
 import numpy as np
@@ -166,26 +167,11 @@ class Agent(nn.Module):
         obs_shape = envs.single_observation_space.shape
         self.obs_dim = np.array(obs_shape).prod()
         # self.value_normalizer = ValueNormalizer(num_agents)
-        # self.obs_normalizer = ObservationNormalizer(self.obs_dim)
+        self.obs_normalizer = ObservationNormalizer(self.obs_dim)
 
         self.continuous_state_dim = state_dim - self.num_agents
         self.state_normalizer = ObservationNormalizer(self.continuous_state_dim)
         # self.state_normalizer = ObservationNormalizer(state_dim)
-
-        # HETEROGENEOUS ACTORS: Each agent ID gets its own unique brain
-        # self.actors = nn.ModuleList([
-        #     nn.Sequential(
-        #         layer_init(nn.Linear(self.obs_dim, 512)),
-        #         nn.LayerNorm(512), nn.ReLU(),
-        #         layer_init(nn.Linear(512, 512)),
-        #         nn.LayerNorm(512), nn.ReLU(),
-        #         layer_init(nn.Linear(512, 256)),
-        #         nn.LayerNorm(256), nn.ReLU(),
-        #         layer_init(nn.Linear(256, 256)),
-        #         nn.ReLU(),
-        #         layer_init(nn.Linear(256, envs.single_action_space.n), std=0.01)
-        #     ) for _ in range(num_agents)
-        # ])
 
         # Shared Actor
         self.actor = nn.Sequential(
@@ -218,10 +204,10 @@ class Agent(nn.Module):
 
     def get_value(self, x, centralized_state=None, denormalize=False):
         if centralized_state is None:
-            # x_norm = self.obs_normalizer.normalize(x)
+            x_norm = self.obs_normalizer.normalize(x)
             batch_size = x.shape[0]
             num_games = batch_size // self.num_agents
-            proxy_state = x.view(num_games, -1)
+            proxy_state = x_norm.view(num_games, -1)
             centralized_state = self.critic_projection(proxy_state)
         else:
             continuous_part = centralized_state[..., :-self.num_agents]
@@ -239,11 +225,11 @@ class Agent(nn.Module):
 
     # Shared Actor
     def get_action_and_value(self, x, action=None, centralized_state=None, denormalize=False):
-        # x_norm = self.obs_normalizer.normalize(x)
+        x_norm = self.obs_normalizer.normalize(x)
         batch_size = x.shape[0]
         
         # Reshape to [NumGames, NumAgents, ObsDim]
-        obs_reshaped = x.view(-1, self.num_agents, self.obs_dim)
+        obs_reshaped = x_norm.view(-1, self.num_agents, self.obs_dim)
         
         # VECTORIZED FORWARD PASS: Process all agents simultaneously
         logits = self.actor(obs_reshaped) 
@@ -256,29 +242,6 @@ class Agent(nn.Module):
             action = probs.sample()
             
         return action, probs.log_prob(action), probs.entropy(), self.get_value(x, centralized_state, denormalize)
-    
-    # Heterogenous actors
-    # def get_action_and_value(self, x, action=None, centralized_state=None, denormalize=False):
-    #     x_norm = self.obs_normalizer.normalize(x)
-    #     batch_size = x.shape[0]
-        
-    #     # Reshape to [NumGames, NumAgents, ObsDim]
-    #     obs_reshaped = x_norm.view(-1, self.num_agents, self.obs_dim)
-        
-    #     logits_list = []
-    #     for i in range(self.num_agents):
-    #         # Each observation in the game is passed to its specific Actor
-    #         logits = self.actors[i](obs_reshaped[:, i, :])
-    #         logits_list.append(logits)
-        
-    #     # Flatten back to [BatchSize, NumActions]
-    #     combined_logits = torch.stack(logits_list, dim=1).view(batch_size, -1)
-    #     probs = Categorical(logits=combined_logits)
-        
-    #     if action is None:
-    #         action = probs.sample()
-            
-    #     return action, probs.log_prob(action), probs.entropy(), self.get_value(x, centralized_state, denormalize)
     
     def load_bc_weights(self, bc_model_path="student_bc_best.pt"):
         bc_state_dict = torch.load(bc_model_path)
@@ -343,8 +306,6 @@ class NMaxObservationWrapper(BaseParallelWrapper):
         self.id_slots = np.arange(self.current_n)
 
         obs, infos = self.env.reset(seed=seed, options=options)
-        for agent in self.agents:
-            infos[agent]["raw_obs"] = obs[agent]
         padded_obs = {agent: self.pad_obs(obs[agent]) for agent in obs}
         return padded_obs, infos
         
@@ -399,8 +360,6 @@ class NMaxObservationWrapper(BaseParallelWrapper):
         
     def step(self, actions):
         obs, rews, terms, truncs, infos = self.env.step(actions)
-        for agent in self.agents:
-            infos[agent]["raw_obs"] = obs[agent] 
         padded_obs = {agent: self.pad_obs(obs[agent]) for agent in obs}
         return padded_obs, rews, terms, truncs, infos
 
@@ -443,15 +402,13 @@ class DictInfoWrapper(gym.vector.VectorEnv):
 
     def step(self, action):
         obs, rew, term, trunc, info = self.env.step(action)
-        # SuperSuit's concat_vec_envs returns a list of agent info dicts
         if isinstance(info, list):
-            # Flatten the info for Gymnasium wrappers while preserving our custom key
-            # Extract global_state from the first agent's info to the top level
             global_state_list = [i.get("global_state") for i in info]
-            raw_obs_list = [i.get("raw_obs") for i in info]
+            # ADD THIS LINE TO CATCH THE TRUE END-STATE
+            final_obs_list = [i.get("final_observation", None) for i in info] 
             info = {
                 "global_state": np.array(global_state_list), 
-                "raw_obs": np.array(raw_obs_list),
+                "final_obs": final_obs_list, # EXPOSE IT TO PPO
                 "agents": info
             }
         return obs, rew, term, trunc, info
@@ -478,10 +435,10 @@ class DictInfoWrapper(gym.vector.VectorEnv):
             
         if isinstance(info, list):
             global_state_list = [i.get("global_state") for i in info]
-            raw_obs_list = [i.get("raw_obs") for i in info]
+            final_obs_list = [i.get("final_observation", None) for i in info] 
             info = {
                 "global_state": np.array(global_state_list), 
-                "raw_obs": np.array(raw_obs_list),
+                "final_obs": final_obs_list, # EXPOSE IT TO PPO
                 "agents": info
             }
         return obs, info
@@ -558,7 +515,7 @@ def build_environments(args, run_name, base_seed, current_local_ratio=0.5, updat
     if args.capture_video:
         envs = gym.wrappers.vector.RecordVideo(
             envs, 
-            f"videos/{run_name}", 
+            f"videos_il/{run_name}", 
             episode_trigger=lambda x: x % 2000 == 0,
             name_prefix=f"rl-video-update_{update_step}"
         )
@@ -647,14 +604,6 @@ if __name__ == "__main__":
     states = torch.zeros((args.num_steps, num_games, state_dim)).to(device)
 
     agent = Agent(envs, num_agents_per_game, state_dim=state_dim).to(device)
-
-    # from scratch optimizer
-    # optimizer = optim.Adam([
-    #         {'params': list(agent.actors.parameters()), 'lr': 3e-4}, 
-    #         {'params': list(agent.critic_encoder.parameters()) + 
-    #                 list(agent.critic.parameters()) + 
-    #                 list(agent.critic_projection.parameters()), 'lr': 1e-3} 
-    #     ], eps=1e-5)
     
     agent.load_bc_weights("student_bc_best_nmax6.pt")
 
@@ -675,9 +624,10 @@ if __name__ == "__main__":
     values = torch.zeros((args.num_steps, actual_num_envs)).to(device)
     ent_coef_now = 0
 
+    current_assignments = torch.arange(args.num_landmarks).unsqueeze(0).repeat(num_games, 1).to(device)
+    needs_assignment = torch.ones(num_games, dtype=torch.bool).to(device)
+
     for update in range(1, num_updates + 1):
-        current_assignments = torch.arange(args.num_landmarks).unsqueeze(0).repeat(num_games, 1).to(device)
-        needs_assignment = torch.ones(num_games, dtype=torch.bool).to(device)
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
@@ -740,20 +690,20 @@ if __name__ == "__main__":
             # Re-sync the global state tracking
             if "global_state" in next_info:
                 current_game_states = next_obs.view(num_games, -1)
+            needs_assignment.fill_(True)
             print("--- PHOENIX REBOOT COMPLETE ---")
 
+        g_idx = torch.arange(num_games, device=device).view(-1, 1)
+        a_idx = torch.arange(num_agents_per_game, device=device).view(1, -1)
         for step in range(0, args.num_steps):
             global_step += actual_num_envs
             obs[step] = next_obs
             dones[step] = next_done
             if "global_state" in next_info:
-                # current_game_states = torch.Tensor(next_info["global_state"][::num_agents_per_game]).to(device)
-                raw_obs_tensor = torch.Tensor(next_info["raw_obs"]).to(device)
                 current_game_states = next_obs.view(num_games, -1)
 
-                # current_game_states = raw_obs_tensor.view(num_games, -1)
-
-                landmark_dist = raw_obs_tensor.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
+                # Slice directly from the padded next_obs!
+                landmark_dist = next_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
                 landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
                 occupied = (torch.norm(landmark_dist, dim=-1) < strict_occupancy_radius).any(dim=1).float()
                 states[step] = torch.cat([current_game_states, occupied], dim=-1)
@@ -776,62 +726,88 @@ if __name__ == "__main__":
             if len(step_data) == 5:
                 next_obs, reward, terminations, truncations, next_info = step_data
                 done = terminations
+
+                resets = np.logical_or(terminations, truncations)
             else:
                 next_obs, reward, done, next_info = step_data
 
+                resets = done
+
             if args.reward_cheat:
-                agent_radius = 0.15
-                collision_penalty = 0.5
+                # CAST TO TENSOR FIRST
+                true_next_obs = next_obs.clone()
+                if "final_obs" in next_info:
+                    for agent_idx, final_obs in enumerate(next_info["final_obs"]):
+                        if final_obs is not None:
+                            true_next_obs[agent_idx] = torch.Tensor(final_obs).to(device)
+
+                # 2. Slice the true landmarks out of the padded tensor
+                true_landmark_dist = true_next_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
+                true_landmark_dist = true_landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
+                dist_for_reward = torch.norm(true_landmark_dist, dim=-1)
+
+                assigned_dist = torch.gather(dist_for_reward, 2, current_assignments.unsqueeze(-1)).squeeze(-1)
                 
-                next_obs_tensor = torch.Tensor(next_info["raw_obs"]).to(device)
-                new_landmark_dist = next_obs_tensor.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
-                new_landmark_dist = new_landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
+                # --- 2. LOCALIZED REWARD ALGORITHMS ---
+                individual_pull = -1.0 * assigned_dist
                 
-                # Shape: [num_games, num_agents, num_landmarks]
-                dist = torch.norm(new_landmark_dist, dim=-1)
+                landmarks_end = 4 + 2 * args.num_landmarks
+                other_pos = true_next_obs.view(num_games, num_agents_per_game, -1)[:, :, landmarks_end:landmarks_end + 2 * (args.num_landmarks - 1)]
+                other_pos = other_pos.view(num_games, num_agents_per_game, args.num_landmarks - 1, 2)
+                other_dist = torch.norm(other_pos, dim=-1)
                 
-                # --- 1. EPISODIC STATIC ASSIGNMENT ---
-                # Check which games just reset (or are at step 0)
-                game_dones = torch.Tensor(done).to(device).view(num_games, num_agents_per_game)[:, 0].bool()
-                needs_assignment = needs_assignment | game_dones
+                collisions = (other_dist < 0.3).float().sum(dim=-1)
+                individual_collision_penalty = -0.25 * collisions
+                success_bonus = (assigned_dist < 0.1).float() * 1.0
                 
-                # If any game reset, recalculate its optimal shortest-path routing
+                rewards[step] = individual_pull.view(-1) + individual_collision_penalty.view(-1) + success_bonus.view(-1)
+
+                # --- 3. ASSIGNMENT ROUTING FOR NEXT EPISODE ---
+                game_resets = torch.Tensor(resets).to(device).view(num_games, num_agents_per_game)[:, 0].bool()
+                needs_assignment = needs_assignment | game_resets
+                
                 if needs_assignment.any():
-                    dist_clone = dist.clone()
+                    reset_landmark_dist = true_next_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
+                    reset_landmark_dist = reset_landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
+                    dist_for_new_episode = torch.norm(reset_landmark_dist, dim=-1)
+
+                    dist_cpu = dist_for_new_episode.cpu().numpy()
                     
-                    # Only calculate for games that need it
                     for g in range(num_games):
                         if needs_assignment[g]:
-                            for _ in range(args.num_landmarks):
-                                flat_dist = dist_clone[g].view(-1)
-                                min_val, min_idx = flat_dist.min(dim=0)
-                                
-                                agent_idx = min_idx // args.num_landmarks
-                                landmark_idx = min_idx % args.num_landmarks
-                                
-                                current_assignments[g, agent_idx] = landmark_idx
-                                
-                                dist_clone[g, agent_idx, :] = float('inf')
-                                dist_clone[g, :, landmark_idx] = float('inf')
+                            row_ind, col_ind = scipy.optimize.linear_sum_assignment(dist_cpu[g])
+                            current_assignments[g] = torch.tensor(col_ind, device=device)
                                 
                     needs_assignment.fill_(False)
-                
-                # Extract the distance to the frozen, optimally assigned target
-                assigned_dist = torch.gather(dist, 2, current_assignments.unsqueeze(-1)).squeeze(-1)
-                
-                # --- 2. PROCEDURAL SQUARE ROOT CALCULUS ---
-                # Calculate the mathematical tipping point for the dead-center snap
-                min_snap_multiplier = collision_penalty / np.sqrt(agent_radius)
-                
-                # Apply a safety factor (> 1.0) to guarantee the snap overpowers engine physics
-                snap_factor = 1.5 
-                procedural_multiplier = min_snap_multiplier * snap_factor
-                
-                # R = -M * sqrt(d)
-                individual_pull = -procedural_multiplier * torch.sqrt(assigned_dist + 1e-8)
-                
-                # Combine with native environment reward
-                rewards[step] = torch.tensor(reward).to(device).view(-1) + individual_pull.view(-1)
+
+                # --- 4. THE FIX: VECTORIZED OBSERVABILITY INJECTION ---
+                # We physically re-order the landmarks so the Hungarian target is always FIRST,
+                # but we do it using massive parallel tensor operations instead of slow Python loops.
+
+                obs_reshaped = next_obs.clone().view(num_games, num_agents_per_game, -1)
+                landmarks_segment = obs_reshaped[:, :, 4:4+2*args.num_landmarks].view(num_games, num_agents_per_game, args.num_landmarks, 2)
+
+                # 1. Create a base index array of shape [num_games, num_agents_per_game, num_landmarks]
+                # e.g., [0, 1, 2, 3] for every agent
+                base_indices = torch.arange(args.num_landmarks, device=device).expand(num_games, num_agents_per_game, -1).clone()
+
+                # 2. Perform the swap logically on the indices
+                # Put the assigned target index into the 0th slot
+                base_indices[:, :, 0] = current_assignments
+
+                # Put 0 into the target's original slot using advanced grid indexing
+                base_indices[g_idx, a_idx, current_assignments] = 0
+
+                # 3. Expand the indices to cover the (X, Y) coordinate dimensions
+                # Shape becomes: [num_games, num_agents_per_game, num_landmarks, 2]
+                gather_indices = base_indices.unsqueeze(-1).expand(-1, -1, -1, 2)
+
+                # 4. Fetch the swapped coordinates in one instantaneous GPU operation!
+                swapped_landmarks = torch.gather(landmarks_segment, dim=2, index=gather_indices)
+
+                # 5. Overwrite the observation block and flatten
+                obs_reshaped[:, :, 4:4+2*args.num_landmarks] = swapped_landmarks.view(num_games, num_agents_per_game, -1)
+                next_obs = obs_reshaped.view(actual_num_envs, -1)
             else:
                 # normalized_step_rewards = reward_norm(reward, done)
                 rewards[step] = torch.tensor(reward).to(device).view(-1)
@@ -860,22 +836,26 @@ if __name__ == "__main__":
 
         # bootstrap value if not done
         with torch.no_grad():
-            if "global_state" in next_info:
-                # True global state for MPE
-                # final_state = torch.Tensor(next_info["global_state"][::num_agents_per_game]).to(device)
-                raw_obs_tensor = torch.Tensor(next_info["raw_obs"]).to(device)
-                # final_state = raw_obs_tensor.view(num_games, -1)
-                final_state = next_obs.view(num_games, -1)
+            # 1. Create a proxy observation that patches in the true final frames
+            bootstrap_obs = next_obs.clone() 
+            if "final_obs" in next_info:
+                for agent_idx, final_obs in enumerate(next_info["final_obs"]):
+                    if final_obs is not None:
+                        bootstrap_obs[agent_idx] = torch.Tensor(final_obs).to(device)
 
-                landmark_dist = raw_obs_tensor.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
+            if "global_state" in next_info:
+                final_state = bootstrap_obs.view(num_games, -1)
+
+                # Slice directly from the patched bootstrap_obs
+                landmark_dist = bootstrap_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
                 landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
                 occupied = (torch.norm(landmark_dist, dim=-1) < strict_occupancy_radius).any(dim=1).float()
                 final_state = torch.cat([final_state, occupied], dim=-1)
             else:
-                # Fallback for Atari: Proxy state from observations
-                final_state = next_obs.view(num_games, -1)
+                final_state = bootstrap_obs.view(num_games, -1)
 
-            next_value = agent.get_value(next_obs, centralized_state=final_state, denormalize=True).flatten()
+            # 3. Calculate next_value using the correct, patched observation
+            next_value = agent.get_value(bootstrap_obs, centralized_state=final_state, denormalize=True).flatten()
     
             # Standard GAE to get returns
             temp_advantages = torch.zeros_like(rewards).to(device)
@@ -898,17 +878,21 @@ if __name__ == "__main__":
             # 2. UPDATE STATS NOW (Before SGD)1
             # This aligns the normalizers with the data we just collected
             agent.critic.update(b_returns.view(-1, agent.num_agents))
-            # agent.obs_normalizer.update(b_obs)
+
+            agent.obs_normalizer.update(b_obs)
+            continuous_b_states = b_states[:, :-args.num_landmarks]
+            agent.state_normalizer.update(continuous_b_states)
 
             # 3. Second Pass: RE-CALCULATE Values and Advantages with NEW stats
             # This is the crucial step you were missing. 
             # It ensures 'values' and 'returns' are in the same normalized space for SGD.
-            new_values = torch.zeros_like(values)
-            for t in range(args.num_steps):
-                # get_value now uses the updated normalization buffers
-                new_values[t] = agent.get_value(obs[t], centralized_state=states[t], denormalize=True).flatten()
+            new_values = agent.get_value(
+                obs.view(-1, agent.obs_dim), 
+                centralized_state=states.view(-1, state_dim), 
+                denormalize=True
+            ).view(args.num_steps, actual_num_envs)
             
-            new_next_value = agent.get_value(next_obs, centralized_state=final_state, denormalize=True).flatten()
+            new_next_value = agent.get_value(bootstrap_obs, centralized_state=final_state, denormalize=True).flatten()
             
             # Final GAE calculation for the actual SGD update
             advantages = torch.zeros_like(rewards).to(device)
@@ -1027,9 +1011,6 @@ if __name__ == "__main__":
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
                     break
-                
-        continuous_b_states = b_states[:, :-args.num_landmarks]
-        agent.state_normalizer.update(continuous_b_states)
 
         if update % 500 == 0:
                 gc.collect()

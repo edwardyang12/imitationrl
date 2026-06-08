@@ -4,9 +4,9 @@ import importlib
 import os
 import random
 import time
+import scipy
 from distutils.util import strtobool
 import gc
-import scipy
 
 import gymnasium as gym
 import numpy as np
@@ -34,7 +34,7 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="cleanRL_ma_il",
+    parser.add_argument("--wandb-project-name", type=str, default="cleanRL_ma",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
@@ -122,6 +122,39 @@ class ObservationNormalizer(nn.Module):
     def normalize(self, x):
         return (x - self.running_mean) / torch.sqrt(self.running_var + 1e-8)
 
+class ValueNormalizer(nn.Module):
+    def __init__(self, num_agents, epsilon=1e-5):
+        super().__init__()
+        # Initialize as 1D tensors for broadcasting
+        self.register_buffer("running_mean", torch.zeros(num_agents))
+        self.register_buffer("running_var", torch.ones(num_agents))
+        self.epsilon = epsilon
+
+    def update(self, x):
+        num_agents = self.running_mean.shape[0]
+        # Reshape flattened batch to [N, num_agents]
+        x_reshaped = x.view(-1, num_agents)
+        batch_mean = x_reshaped.mean(dim=0)
+        batch_var = x_reshaped.var(dim=0)
+        
+        self.running_mean = 0.99 * self.running_mean + 0.01 * batch_mean
+        self.running_var = 0.99 * self.running_var + 0.01 * batch_var
+
+    def normalize(self, x):
+        num_agents = self.running_mean.shape[0]
+        # Reshape to [N, num_agents] to allow broadcasting across rows
+        original_shape = x.shape
+        x_reshaped = x.view(-1, num_agents)
+        normalized = (x_reshaped - self.running_mean) / torch.sqrt(self.running_var + self.epsilon)
+        return normalized.view(original_shape)
+
+    def denormalize(self, x):
+        num_agents = self.running_mean.shape[0]
+        original_shape = x.shape
+        x_reshaped = x.view(-1, num_agents)
+        denormalized = x_reshaped * torch.sqrt(self.running_var + self.epsilon) + self.running_mean
+        return denormalized.view(original_shape)
+
 class PopArt(nn.Module):
     def __init__(self, input_dim, output_dim, beta=0.99):
         super().__init__()
@@ -187,19 +220,18 @@ class Agent(nn.Module):
         self.state_normalizer = ObservationNormalizer(self.continuous_state_dim)
         # self.state_normalizer = ObservationNormalizer(state_dim)
 
-        # Shared Actor
+        # HOMOGENOUS ACTORS
         self.actor = nn.Sequential(
-            layer_init(nn.Linear(self.obs_dim, 512)),
-            nn.LayerNorm(512), nn.ReLU(),
-            layer_init(nn.Linear(512, 512)),
-            nn.LayerNorm(512), nn.ReLU(),
-            layer_init(nn.Linear(512, 256)),
-            nn.LayerNorm(256), nn.ReLU(),
-            layer_init(nn.Linear(256, 256)),
-            nn.ReLU(),
-            layer_init(nn.Linear(256, envs.single_action_space.n), std=0.01)
-        )
-
+                layer_init(nn.Linear(self.obs_dim, 512)),
+                nn.LayerNorm(512), nn.ReLU(),
+                layer_init(nn.Linear(512, 512)),
+                nn.LayerNorm(512), nn.ReLU(),
+                layer_init(nn.Linear(512, 256)),
+                nn.LayerNorm(256), nn.ReLU(),
+                layer_init(nn.Linear(256, 256)),
+                nn.ReLU(),
+                layer_init(nn.Linear(256, envs.single_action_space.n), std=0.01)
+            ) 
         # SHARED CENTRALIZED CRITIC: One brain to judge the whole team
         concatenated_obs_dim = self.num_agents * self.obs_dim
         self.critic_projection = nn.Linear(concatenated_obs_dim, state_dim) if concatenated_obs_dim != state_dim else nn.Identity()
@@ -237,38 +269,23 @@ class Agent(nn.Module):
             all_agent_values = self.critic.denormalize(all_agent_values)
         return all_agent_values.view(-1, 1)
 
-    # Shared Actor
     def get_action_and_value(self, x, action=None, centralized_state=None, denormalize=False):
         x_norm = self.obs_normalizer.normalize(x)
         batch_size = x.shape[0]
         
         # Reshape to [NumGames, NumAgents, ObsDim]
         obs_reshaped = x_norm.view(-1, self.num_agents, self.obs_dim)
-        
-        # VECTORIZED FORWARD PASS: Process all agents simultaneously
-        logits = self.actor(obs_reshaped) 
+
+        logits_list = self.actor(obs_reshaped)
         
         # Flatten back to [BatchSize, NumActions]
-        combined_logits = logits.view(batch_size, -1)
+        combined_logits = logits_list.view(batch_size, -1)
         probs = Categorical(logits=combined_logits)
         
         if action is None:
             action = probs.sample()
             
         return action, probs.log_prob(action), probs.entropy(), self.get_value(x, centralized_state, denormalize)
-    
-    def load_bc_weights(self, bc_model_path="student_bc_best.pt"):
-        bc_state_dict = torch.load(bc_model_path)
-        actor_state_dict = {}
-        
-        # Strip the "network." prefix to align the dictionaries
-        for key, value in bc_state_dict.items():
-            if key.startswith("network."):
-                new_key = key.replace("network.", "")
-                actor_state_dict[new_key] = value
-                
-        self.actor.load_state_dict(actor_state_dict)
-        print(f"\n[ORACLE] Successfully injected BC weights from {bc_model_path}!")
 
 class StateWrapper(BaseParallelWrapper):
     def __init__(self, env):
@@ -439,7 +456,7 @@ def build_environments(args, run_name, base_seed, current_local_ratio=0.5, updat
     if args.capture_video:
         envs = gym.wrappers.vector.RecordVideo(
             envs, 
-            f"videos_il/{run_name}", 
+            f"videos_mlp/{run_name}", 
             episode_trigger=lambda x: x % 2000 == 0,
             name_prefix=f"rl-video-update_{update_step}"
         )
@@ -526,12 +543,10 @@ if __name__ == "__main__":
     states = torch.zeros((args.num_steps, num_games, state_dim)).to(device)
 
     agent = Agent(envs, num_agents_per_game, state_dim=state_dim).to(device)
-   
-    agent.load_bc_weights("expert_data/student_bc_best_8.pt")
-
-    # behavorial clone optimizer
+    # agent = Agent(envs).to(device)
+    # optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
     optimizer = optim.Adam([
-            {'params': list(agent.actor.parameters()), 'lr': 5e-5}, 
+            {'params': list(agent.actor.parameters()), 'lr': 3e-4}, 
             {'params': list(agent.critic_encoder.parameters()) + 
                     list(agent.critic.parameters()) + 
                     list(agent.critic_projection.parameters()), 'lr': 1e-3} 
@@ -550,24 +565,17 @@ if __name__ == "__main__":
     needs_assignment = torch.ones(num_games, dtype=torch.bool).to(device)
 
     for update in range(1, num_updates + 1):
+    
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
             for i, param_group in enumerate(optimizer.param_groups):
                 # We fetch the initial_lr we set in the Adam constructor
                 # If we didn't store it, we can use the current group's base
-                if i == 0: # ACTOR
-                    if update <= 50:
-                        # PHASE 1: CRITIC WARMUP
-                        # Freeze the Actor completely so the Critic can map the Value 
-                        # of the expert BC weights without destroying them.
-                        param_group["lr"] = 0.0
-                    else:
-                        # PHASE 2: GENTLE FINE-TUNING
-                        # Unfreeze with the conservative learning rate
-                        initial_lr = 5e-5 
-                        param_group["lr"] = max(5e-6, frac * initial_lr)
-                else: # CRITIC
+                if i == 0:
+                    initial_lr = 3e-4 
+                    param_group["lr"] = max(5e-5, frac * initial_lr)
+                else:
                     initial_lr = 1e-3
                     param_group["lr"] = max(1e-4, frac * initial_lr)
                 
@@ -612,6 +620,7 @@ if __name__ == "__main__":
             # Re-sync the global state tracking
             if "global_state" in next_info:
                 current_game_states = next_obs.view(num_games, -1)
+
             needs_assignment.fill_(True)
             print("--- PHOENIX REBOOT COMPLETE ---")
 
@@ -651,7 +660,6 @@ if __name__ == "__main__":
                 resets = np.logical_or(terminations, truncations)
             else:
                 next_obs, reward, done, next_info = step_data
-
                 resets = done
 
             if args.reward_cheat:
@@ -732,8 +740,8 @@ if __name__ == "__main__":
                 obs_reshaped[:, :, 4:4+2*args.num_landmarks] = swapped_landmarks.view(num_games, num_agents_per_game, -1)
                 next_obs = obs_reshaped.view(actual_num_envs, -1)
             else:
-                # normalized_step_rewards = reward_norm(reward, done)
                 rewards[step] = torch.tensor(reward).to(device).view(-1)
+            
             next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
 
             # LOGGING TEAM DATA
@@ -759,7 +767,8 @@ if __name__ == "__main__":
 
         # bootstrap value if not done
         with torch.no_grad():
-
+            
+            # 1. CREATE BOOTSTRAP_OBS FIRST
             bootstrap_obs = next_obs.clone() 
             if "final_obs" in next_info:
                 for agent_idx, final_obs in enumerate(next_info["final_obs"]):
@@ -767,9 +776,8 @@ if __name__ == "__main__":
                         # Direct 1-to-1 assignment for the specific agent
                         bootstrap_obs[agent_idx] = torch.Tensor(final_obs).to(device)
 
+            # 2. BUILD FINAL STATE FROM BOOTSTRAP_OBS (Not next_obs!)
             if "global_state" in next_info:
-                # True global state for MPE
-                # final_state = torch.Tensor(next_info["global_state"][::num_agents_per_game]).to(device)
                 final_state = bootstrap_obs.view(num_games, -1)
                 landmark_dist = bootstrap_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
                 landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
@@ -779,6 +787,7 @@ if __name__ == "__main__":
                 # Fallback for Atari: Proxy state from observations
                 final_state = bootstrap_obs.view(num_games, -1)
 
+            # 3. FIRST PASS (Uses the true final physics)
             next_value = agent.get_value(bootstrap_obs, centralized_state=final_state, denormalize=True).flatten()
     
             # Standard GAE to get returns
@@ -794,28 +803,25 @@ if __name__ == "__main__":
                 delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
                 temp_advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
             
-            # This is our optimization target
             b_returns = (temp_advantages + values).reshape(-1)
             b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
             b_states = states.reshape((-1, state_dim))
 
-            # 2. UPDATE STATS NOW (Before SGD)1
-            # This aligns the normalizers with the data we just collected
+            # 4. UPDATE STATS NOW (Using uncorrupted b_returns)
             agent.critic.update(b_returns.view(-1, agent.num_agents))
 
             agent.obs_normalizer.update(b_obs)
             continuous_b_states = b_states[:, :-args.num_landmarks]
             agent.state_normalizer.update(continuous_b_states)
 
-            # 3. Second Pass: RE-CALCULATE Values and Advantages with NEW stats
-            # This is the crucial step you were missing. 
-            # It ensures 'values' and 'returns' are in the same normalized space for SGD.
+            # 5. SECOND PASS
             new_values = agent.get_value(
                 obs.view(-1, agent.obs_dim), 
                 centralized_state=states.view(-1, state_dim), 
                 denormalize=True
             ).view(args.num_steps, actual_num_envs)
             
+            # Re-calculate next_value with updated stats (Reusing our correct arrays)
             new_next_value = agent.get_value(bootstrap_obs, centralized_state=final_state, denormalize=True).flatten()
             
             # Final GAE calculation for the actual SGD update

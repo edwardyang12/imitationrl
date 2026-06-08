@@ -631,6 +631,8 @@ if __name__ == "__main__":
             needs_assignment.fill_(True)
             print("--- PHOENIX REBOOT COMPLETE ---")
 
+        g_idx = torch.arange(num_games, device=device).view(-1, 1)
+        a_idx = torch.arange(num_agents_per_game, device=device).view(1, -1)
         for step in range(0, args.num_steps):
             global_step += actual_num_envs
             obs[step] = next_obs
@@ -716,24 +718,34 @@ if __name__ == "__main__":
                                 
                     needs_assignment.fill_(False)
 
-                # --- 4. THE FIX: OBSERVABILITY INJECTION ---
-                # We physically re-order the landmarks in the agent's observation so the Hungarian target is always FIRST.
+                # --- 4. THE FIX: VECTORIZED OBSERVABILITY INJECTION ---
+                # We physically re-order the landmarks so the Hungarian target is always FIRST,
+                # but we do it using massive parallel tensor operations instead of slow Python loops.
+
                 obs_reshaped = next_obs_tensor.clone().view(num_games, num_agents_per_game, -1)
                 landmarks_segment = obs_reshaped[:, :, 4:4+2*args.num_landmarks].view(num_games, num_agents_per_game, args.num_landmarks, 2)
-                
-                for g in range(num_games):
-                    for a in range(num_agents_per_game):
-                        target_idx = current_assignments[g, a].item()
-                        if target_idx != 0:
-                            # Swap target coordinates with index 0
-                            temp = landmarks_segment[g, a, 0].clone()
-                            landmarks_segment[g, a, 0] = landmarks_segment[g, a, target_idx]
-                            landmarks_segment[g, a, target_idx] = temp
-                            
-                obs_reshaped[:, :, 4:4+2*args.num_landmarks] = landmarks_segment.view(num_games, num_agents_per_game, -1)
-                
-                # Overwrite next_obs with the injected GPS coordinates before the next PPO step!
-                next_obs = obs_reshaped.view(actual_num_envs, -1).to(device)
+
+                # 1. Create a base index array of shape [num_games, num_agents_per_game, num_landmarks]
+                # e.g., [0, 1, 2, 3] for every agent
+                base_indices = torch.arange(args.num_landmarks, device=device).expand(num_games, num_agents_per_game, -1).clone()
+
+                # 2. Perform the swap logically on the indices
+                # Put the assigned target index into the 0th slot
+                base_indices[:, :, 0] = current_assignments
+
+                # Put 0 into the target's original slot using advanced grid indexing
+                base_indices[g_idx, a_idx, current_assignments] = 0
+
+                # 3. Expand the indices to cover the (X, Y) coordinate dimensions
+                # Shape becomes: [num_games, num_agents_per_game, num_landmarks, 2]
+                gather_indices = base_indices.unsqueeze(-1).expand(-1, -1, -1, 2)
+
+                # 4. Fetch the swapped coordinates in one instantaneous GPU operation!
+                swapped_landmarks = torch.gather(landmarks_segment, dim=2, index=gather_indices)
+
+                # 5. Overwrite the observation block and flatten
+                obs_reshaped[:, :, 4:4+2*args.num_landmarks] = swapped_landmarks.view(num_games, num_agents_per_game, -1)
+                next_obs = obs_reshaped.view(actual_num_envs, -1)
             else:
                 rewards[step] = torch.tensor(reward).to(device).view(-1)
             
