@@ -17,6 +17,7 @@ import torch.optim as optim
 # from torch.distributions.categorical import Categorical
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
+from vmas.scenarios.navigation import Scenario as BaseNavigation
 
 def parse_args():
     # fmt: off
@@ -39,7 +40,7 @@ def parse_args():
         help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # Algorithm specific arguments
-    parser.add_argument("--env-id", type=str, default="simple_spread",
+    parser.add_argument("--env-id", type=str, default="navigation",
         help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=100000000,
         help="total timesteps of the experiments")
@@ -87,6 +88,22 @@ def parse_args():
     # fmt: on
     return args
 
+class NavigationCleanObs(BaseNavigation):
+    def observation(self, agent):
+        # 1. Base kinematics
+        obs = [agent.state.pos, agent.state.vel]
+        
+        # 2. Assigned Goal ONLY (Removes the distractors)
+        obs.append(agent.state.pos - agent.goal.state.pos)
+            
+        # 3. Relative Teammates (Required for collision avoidance)
+        for a in self.world.agents:
+            if a != agent:
+                # Provide both position and velocity differences for trajectory prediction
+                obs.append(a.state.pos - agent.state.pos)
+                obs.append(a.state.vel - agent.state.vel) 
+                
+        return torch.cat(obs, dim=-1)
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
@@ -169,9 +186,7 @@ class Agent(nn.Module):
 
         self.agent_id_embedding = nn.Embedding(num_agents, 10) # this 10 can be changed later
 
-        self.continuous_state_dim = state_dim - self.num_agents
-        self.state_normalizer = ObservationNormalizer(self.continuous_state_dim)
-        # self.state_normalizer = ObservationNormalizer(state_dim)
+        self.state_normalizer = ObservationNormalizer(state_dim)
 
         # SHARED ACTOR: One brain for all agents
         self.actor = nn.Sequential(
@@ -218,14 +233,8 @@ class Agent(nn.Module):
             proxy_state = x_norm.view(num_games, -1)
             centralized_state = self.critic_projection(proxy_state)
         else:
-            continuous_part = centralized_state[..., :-self.num_agents]
-            binary_part = centralized_state[..., -self.num_agents:]
+            centralized_state = self.state_normalizer.normalize(centralized_state)
             
-            # 2. Normalize only the continuous data
-            norm_continuous = self.state_normalizer.normalize(continuous_part)
-            
-            # 3. Stitch them back together for the Critic network
-            centralized_state = torch.cat([norm_continuous, binary_part], dim=-1)
         all_agent_values = self.critic(self.critic_encoder(centralized_state)) 
         if denormalize:
             all_agent_values = self.critic.denormalize(all_agent_values)
@@ -268,13 +277,13 @@ class VMASVectorizedEnv:
         self.update_step = update_step
         
         self.env = vmas.make_env(
-            scenario=args.env_id,
+            scenario= NavigationCleanObs() if args.env_id == "navigation" else args.env_id,
             num_envs=self.num_games,
             device=self.device,
             continuous_actions=True,
             n_agents=self.num_agents,
-            n_targets=args.num_landmarks, 
-            use_lidar=False, 
+            collisions=True,
+            observe_all_goals=False,
             seed=seed,
             dict_spaces=False
         )
@@ -417,8 +426,6 @@ if __name__ == "__main__":
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    strict_occupancy_radius = 0.2
-
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
     # np.random.seed(args.seed)
@@ -454,7 +461,7 @@ if __name__ == "__main__":
     if "global_state" in next_info:
         # Use the actual shape of the global state provided by your wrappers
         # state_dim = next_info["global_state"].shape[-1]
-        state_dim = (num_agents_per_game * np.array(envs.single_observation_space.shape).prod()) + args.num_landmarks
+        state_dim = num_agents_per_game * np.array(envs.single_observation_space.shape).prod()
 
         state0 = next_info["global_state"][0]
         state1 = next_info["global_state"][num_agents_per_game] if len(next_info["global_state"]) > 1 else None
@@ -553,20 +560,8 @@ if __name__ == "__main__":
             global_step += actual_num_envs
             obs[step] = next_obs
             dones[step] = next_done
-            if "global_state" in next_info:
-                # current_game_states = torch.Tensor(next_info["global_state"][::num_agents_per_game]).to(device)
-                current_game_states = next_obs.view(num_games, -1)
-                teammate_features = 2 * (num_agents_per_game - 1)
-                landmark_start_idx = 4
-                
-                landmark_dist = next_obs.view(num_games, num_agents_per_game, -1)[:, :, landmark_start_idx : landmark_start_idx + 2*args.num_landmarks]
-                landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
-                occupied = (torch.norm(landmark_dist, dim=-1) < strict_occupancy_radius).any(dim=1).float()
-                states[step] = torch.cat([current_game_states, occupied], dim=-1)
-            else:
-                # Fallback for Atari: Reshape current observations as the "God-view"
-                current_game_states = next_obs.view(num_games, -1)
-                states[step] = current_game_states
+            current_game_states = next_obs.view(num_games, -1)
+            states[step] = current_game_states
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
@@ -685,17 +680,6 @@ if __name__ == "__main__":
 
                 # 2. Build the Final State correctly
                 final_state = boot_obs.view(num_games, -1)
-                
-                # 3. FIX: Calculate distances strictly from the RAW OBS!
-                raw_obs_tensor = boot_raw_obs
-                teammate_features = 2 * (num_agents_per_game - 1)
-                landmark_start_idx = 4
-                
-                landmark_dist = raw_obs_tensor.view(num_games, num_agents_per_game, -1)[:, :, landmark_start_idx : landmark_start_idx + 2*args.num_landmarks]
-                landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
-                
-                occupied = (torch.norm(landmark_dist, dim=-1) < strict_occupancy_radius).any(dim=1).float()
-                final_state = torch.cat([final_state, occupied], dim=-1)
             else:
                 # Fallback for Atari
                 if "final_observation" in next_info:
@@ -730,8 +714,7 @@ if __name__ == "__main__":
             agent.critic.update(b_returns.view(-1, agent.num_agents))
 
             agent.obs_normalizer.update(b_obs)
-            continuous_b_states = b_states[:, :-args.num_landmarks]
-            agent.state_normalizer.update(continuous_b_states)
+            agent.state_normalizer.update(b_states)
 
             # 3. Second Pass: RE-CALCULATE Values and Advantages with NEW stats
             # This is the crucial step you were missing. 

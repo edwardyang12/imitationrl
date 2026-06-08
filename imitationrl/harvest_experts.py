@@ -6,6 +6,7 @@ import os
 import gc
 import gymnasium as gym
 from torch.distributions.categorical import Categorical
+import scipy
 
 # Import your environment builder and Agent class from your main script
 from ppo_pettingzoo_ma_atari_mappo import build_environments, Agent, parse_args
@@ -37,7 +38,8 @@ def harvest_dataset(N, num_trajectories=500000, chunk_size=100000):
     # 2. Load Oracle
     state_dim = (num_agents_per_game * np.array(envs.single_observation_space.shape).prod()) + args.num_landmarks
     oracle = Agent(envs, num_agents_per_game, state_dim).to(device)
-    oracle.load_state_dict(torch.load(f"models/simple_spread_v3__ppo_pettingzoo_ma_atari_mappo__1__1777972083/1139_model.pth")) # Ensure path points to your saved model
+    oracle.load_state_dict(torch.load(f"models/simple_spread_v3__ppo_pettingzoo_ma_atari_mappo__1__1780824132/1068_model.pth",
+                                      map_location=device), strict=True) # Ensure path points to your saved model
     oracle.eval() # Lock batchnorm/dropout
 
     expert_obs = []
@@ -46,39 +48,63 @@ def harvest_dataset(N, num_trajectories=500000, chunk_size=100000):
 
     next_obs = torch.Tensor(envs.reset(seed=args.seed)[0]).to(device)
     
+    # --- FIX INITIALIZATION: Set up tracking for the Oracle ---
+    current_assignments = torch.arange(args.num_landmarks).unsqueeze(0).repeat(num_games, 1).to(device)
+    needs_assignment = torch.ones(num_games, dtype=torch.bool).to(device)
+
+    # Perform initial assignment for the first step
+    dist_cpu = torch.norm(
+        next_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks].view(num_games, num_agents_per_game, args.num_landmarks, 2), 
+        dim=-1
+    ).cpu().numpy()
+    
+    for g in range(num_games):
+        row_ind, col_ind = scipy.optimize.linear_sum_assignment(dist_cpu[g])
+        current_assignments[g] = torch.tensor(col_ind, device=device)
+    needs_assignment.fill_(False)
+    # ---------------------------------------------------------
+    
     print(f"Harvesting {num_trajectories} steps for N={N} in chunks of {chunk_size}...")
     os.makedirs("expert_data", exist_ok=True)
 
     with torch.no_grad():
         for step in tqdm(range(num_trajectories)):
             
-            # --- FIX 1: THE PRECISION ALIGNMENT ---
-            # We must pass the exact normalized matrix the Oracle was trained on
-            normalized_obs = oracle.obs_normalizer.normalize(next_obs)
+            # --- THE FIX: PERMUTE OBSERVATIONS FOR THE ORACLE ---
+            oracle_obs = next_obs.clone()
+            obs_resh_temp = oracle_obs.view(num_games, num_agents_per_game, -1)
+            landmarks_segment = obs_resh_temp[:, :, 4:4+2*args.num_landmarks].view(num_games, num_agents_per_game, args.num_landmarks, 2)
+
+            base_indices = torch.arange(args.num_landmarks, device=device).expand(num_games, num_agents_per_game, -1).clone()
+            base_indices[:, :, 0] = current_assignments
+            
+            g_idx = torch.arange(num_games, device=device).view(-1, 1)
+            a_idx = torch.arange(num_agents_per_game, device=device).view(1, -1)
+            base_indices[g_idx, a_idx, current_assignments] = 0
+
+            gather_indices = base_indices.unsqueeze(-1).expand(-1, -1, -1, 2)
+            swapped_landmarks = torch.gather(landmarks_segment, dim=2, index=gather_indices)
+
+            obs_resh_temp[:, :, 4:4+2*args.num_landmarks] = swapped_landmarks.view(num_games, num_agents_per_game, -1)
+            oracle_obs = obs_resh_temp.view(-1, oracle.obs_dim)
+            # ----------------------------------------------------
+            
+            # 1. Use the permuted observation for the Oracle forward pass
+            normalized_obs = oracle.obs_normalizer.normalize(oracle_obs)
             obs_reshaped = normalized_obs.view(-1, num_agents_per_game, oracle.obs_dim)
             
             actions_list = []
             for i in range(num_agents_per_game):
                 logits = oracle.actors[i](obs_reshaped[:, i, :])
                 
-                # PURE EXPLOITATION: No categorical sampling
-                # deterministic_action = torch.argmax(logits, dim=-1) 
-                # actions_list.append(deterministic_action)
-
-                # --- FIX 2: TEMPERATURE-SCALED JITTER ---
-                # A fully converged N=5 policy has such extreme logits that sample() 
-                # practically acts like argmax. We divide by a temperature to slightly 
-                # soften the distribution, guaranteeing the micro-jitter needed to break deadlocks.
                 temperature = 1.25 
                 probs = Categorical(logits=logits / temperature)
                 sampled_action = probs.sample() 
-                
                 actions_list.append(sampled_action)
             
             action = torch.stack(actions_list, dim=1).view(-1)
             
-            # Save the RAW (unnormalized) observations so the student network 
-            # learns to master the native environment.
+            # 2. Save the UNPERMUTED state to the dataset
             expert_obs.append(next_obs.cpu().numpy())
             expert_actions.append(action.cpu().numpy())
 
@@ -92,15 +118,31 @@ def harvest_dataset(N, num_trajectories=500000, chunk_size=100000):
                     pickle.dump(dataset, f)
                 print(f"\n[Memory Check] Saved {save_path}. Clearing RAM...")
                 
-                # Nuke the lists from RAM and force garbage collection
                 expert_obs.clear()
                 expert_actions.clear()
                 gc.collect()
-                
                 chunk_idx += 1
             
+            # 3. Step the environment and trigger reassignments on reset
             step_data = envs.step(action.cpu().numpy())
             next_obs = torch.Tensor(step_data[0] if len(step_data) == 5 else step_data[0]).to(device)
+
+            resets = np.logical_or(step_data[2], step_data[3]) if len(step_data) == 5 else step_data[2]
+            game_resets = torch.Tensor(resets).to(device).view(num_games, num_agents_per_game)[:, 0].bool()
+            needs_assignment = needs_assignment | game_resets
+            
+            if needs_assignment.any():
+                dist_cpu = torch.norm(
+                    next_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks].view(num_games, num_agents_per_game, args.num_landmarks, 2), 
+                    dim=-1
+                ).cpu().numpy()
+                
+                for g in range(num_games):
+                    if needs_assignment[g]:
+                        row_ind, col_ind = scipy.optimize.linear_sum_assignment(dist_cpu[g])
+                        current_assignments[g] = torch.tensor(col_ind, device=device)
+                        
+                needs_assignment.fill_(False)
 
     # 3. Save to disk
     if len(expert_obs) > 0:
@@ -117,5 +159,5 @@ def harvest_dataset(N, num_trajectories=500000, chunk_size=100000):
 
 if __name__ == "__main__":
     # Ensure you update the model path inside the function before running
-    for N in [6]:
+    for N in [4]:
         harvest_dataset(N, num_trajectories=500000, chunk_size=200000)

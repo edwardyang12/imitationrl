@@ -5,11 +5,10 @@ import os
 from tqdm import tqdm
 
 def convert_pkl_to_npy(n_values):
-    os.makedirs("expert_data_mmap", exist_ok=True)
-    
+   
     for N in n_values:
         print(f"Converting N={N} data...")
-        file_pattern = f"D:/Experiment/Python/cleanrl/expert_data/expert_N{N}*.pkl"
+        file_pattern = f"D:/Edward/imitationrl/expert_data/expert_N{N}*.pkl"
         part_files = glob.glob(file_pattern)
         
         if not part_files:
@@ -30,10 +29,10 @@ def convert_pkl_to_npy(n_values):
         stacked_actions = np.concatenate(all_actions).astype(np.int64)
         
         # Save as .npy formats
-        np.save(f"D:/Experiment/Python/cleanrl/expert_data/obs_N{N}.npy", stacked_obs)
-        np.save(f"D:/Experiment/Python/cleanrl/expert_data/actions_N{N}.npy", stacked_actions)
+        np.save(f"D:/Edward/imitationrl/expert_data/obs_N{N}.npy", stacked_obs)
+        np.save(f"D:/Edward/imitationrl/expert_dataactions_N{N}.npy", stacked_actions)
         
         print(f"  Saved N={N}: Obs shape {stacked_obs.shape}, Actions shape {stacked_actions.shape}")
 
 if __name__ == "__main__":
-    convert_pkl_to_npy(n_values=[3, 4, 5, 6, 7, 8])
+    convert_pkl_to_npy(n_values=[3])

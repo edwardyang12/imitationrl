@@ -23,8 +23,8 @@ class VectorizedBatchDataset(Dataset):
         
         print("Calculating Vectorized Dataset Dimensions...")
         for N in n_values:
-            obs_path = f"D:/Experiment/Python/cleanrl/expert_data/obs_N{N}.npy"
-            act_path = f"D:/Experiment/Python/cleanrl/expert_data/actions_N{N}.npy"
+            obs_path = f"D:/Edward/imitationrl/expert_data/obs_N{N}.npy"
+            act_path = f"D:/Edward/imitationrl/expert_data/actions_N{N}.npy"
             
             if not os.path.exists(obs_path) or not os.path.exists(act_path):
                 continue
