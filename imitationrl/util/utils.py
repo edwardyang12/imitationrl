@@ -30,7 +30,7 @@ def convert_pkl_to_npy(n_values):
         
         # Save as .npy formats
         np.save(f"D:/Edward/imitationrl/expert_data/obs_N{N}.npy", stacked_obs)
-        np.save(f"D:/Edward/imitationrl/expert_dataactions_N{N}.npy", stacked_actions)
+        np.save(f"D:/Edward/imitationrl/expert_data/actions_N{N}.npy", stacked_actions)
         
         print(f"  Saved N={N}: Obs shape {stacked_obs.shape}, Actions shape {stacked_actions.shape}")
 

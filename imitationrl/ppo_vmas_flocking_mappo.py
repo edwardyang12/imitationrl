@@ -1,25 +1,23 @@
 # docs and experiment results can be found at https://docs.cleanrl.dev/rl-algorithms/ppo/#ppo_pettingzoo_ma_ataripy
 import argparse
-import importlib
 import os
 import random
 import time
+import math
+import vmas 
+import imageio
 from distutils.util import strtobool
 import gc
-import scipy
 
 import gymnasium as gym
 import numpy as np
-import cv2
-import supersuit as ss
-from supersuit.vector import ConcatVecEnv
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.distributions.categorical import Categorical
+# from torch.distributions.categorical import Categorical
+from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
-
-from pettingzoo.utils.wrappers import BaseParallelWrapper
+from vmas.scenarios.flocking import Scenario as BaseFlocking
 
 def parse_args():
     # fmt: off
@@ -34,7 +32,7 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="cleanRL_ma_il",
+    parser.add_argument("--wandb-project-name", type=str, default="vmas",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
@@ -42,27 +40,27 @@ def parse_args():
         help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # Algorithm specific arguments
-    parser.add_argument("--env-id", type=str, default="pong_v3",
+    parser.add_argument("--env-id", type=str, default="flocking",
         help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=70000000,
+    parser.add_argument("--total-timesteps", type=int, default=100000000,
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=7e-4,
         help="the learning rate of the optimizer")
-    parser.add_argument("--num-envs", type=int, default=32,
+    parser.add_argument("--num-envs", type=int, default=2048,
         help="the number of parallel game environments")
-    parser.add_argument("--num-steps", type=int, default=2048,
+    parser.add_argument("--num-steps", type=int, default=256,
         help="the number of steps to run in each environment per policy rollout")
     parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggle learning rate annealing for policy and value networks")
-    parser.add_argument("--anneal-ent", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
+    parser.add_argument("--anneal-ent", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=False,
         help="Toggle learning rate annealing for policy and value networks")
     parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
     parser.add_argument("--gae-lambda", type=float, default=0.95,
         help="the lambda for the general advantage estimation")
-    parser.add_argument("--num-minibatches", type=int, default=8,
+    parser.add_argument("--num-minibatches", type=int, default=256,
         help="the number of mini-batches")
-    parser.add_argument("--update-epochs", type=int, default=10,
+    parser.add_argument("--update-epochs", type=int, default=5,
         help="the K epochs to update the policy")
     parser.add_argument("--norm-adv", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggles advantages normalization")
@@ -70,7 +68,7 @@ def parse_args():
         help="the surrogate clipping coefficient")
     parser.add_argument("--clip-vloss", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggles whether or not to use a clipped loss for the value function, as per the paper.")
-    parser.add_argument("--ent-coef", type=float, default=0.03,
+    parser.add_argument("--ent-coef", type=float, default=0.01,
         help="coefficient of the entropy")
     parser.add_argument("--vf-coef", type=float, default=0.5,
         help="coefficient of the value function")
@@ -80,7 +78,7 @@ def parse_args():
         help="the target KL divergence threshold")
     parser.add_argument("--num-landmarks", type=int, default=3,
         help="number of agents and landmarks")
-    parser.add_argument("--max-cycles", type=int, default=70,
+    parser.add_argument("--max-cycles", type=int, default=250,
         help="length of environment run")
     parser.add_argument("--reward-cheat", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will have extra reward cheats")
@@ -90,6 +88,27 @@ def parse_args():
     # fmt: on
     return args
 
+class FlockingCleanObs(BaseFlocking):
+    def observation(self, agent):
+        # 1. Base kinematics
+        obs = [agent.state.pos, agent.state.vel]
+        
+        # 2. Target Tracking (Direction fixed: Pointing FROM agent TO target)
+        obs.append(self._target.state.pos - agent.state.pos)
+            
+        # 3. Strict Index-Preserved Teammates
+        # We iterate over ALL agents so the array structure never shifts.
+        # When a == agent, the relative pos/vel becomes [0, 0], which the network ignores.
+        for a in self.world.agents:
+            obs.append(a.state.pos - agent.state.pos)
+            obs.append(a.state.vel - agent.state.vel) 
+                
+        # 4. Relative Obstacles
+        for landmark in self.world.landmarks:
+            if landmark != self._target:
+                obs.append(landmark.state.pos - agent.state.pos)
+                
+        return torch.cat(obs, dim=-1)
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
@@ -160,45 +179,40 @@ class PopArt(nn.Module):
     def normalize(self, x):
         return (x - self.mean) / torch.sqrt(self.std**2 + 1e-8)
 
-class RewardNormalizer:
-    def __init__(self, num_envs, gamma=0.99):
-        self.returns = np.zeros(num_envs)
-        self.gamma = gamma
-        self.running_std = 1.0
-
-    def __call__(self, rewards, dones):
-        # Track discounted returns to estimate reward scale
-        self.returns = self.returns * self.gamma + rewards
-        self.running_std = 0.99 * self.running_std + 0.01 * np.std(self.returns)
-        # Reset returns for finished episodes
-        self.returns[dones > 0] = 0
-        return rewards / (self.running_std + 1e-8)
-
 class Agent(nn.Module):
-    def __init__(self, envs, num_agents, state_dim):
+    def __init__(self, single_action_space, single_obs_shape, num_agents, state_dim):
         super().__init__()
         self.num_agents = num_agents
-        obs_shape = envs.single_observation_space.shape
-        self.obs_dim = np.array(obs_shape).prod()
+
+        self.obs_dim = np.array(single_obs_shape).prod()
+        self.action_dim = np.prod(single_action_space.shape)
         # self.value_normalizer = ValueNormalizer(num_agents)
         self.obs_normalizer = ObservationNormalizer(self.obs_dim)
 
-        self.continuous_state_dim = state_dim - self.num_agents
-        self.state_normalizer = ObservationNormalizer(self.continuous_state_dim)
-        # self.state_normalizer = ObservationNormalizer(state_dim)
+        self.agent_id_embedding = nn.Embedding(num_agents, 10) # this 10 can be changed later
 
-        # Shared Actor
+        self.state_normalizer = ObservationNormalizer(state_dim)
+
+        # SHARED ACTOR: One brain for all agents
         self.actor = nn.Sequential(
-            layer_init(nn.Linear(self.obs_dim, 512)),
-            nn.LayerNorm(512), nn.ReLU(),
-            layer_init(nn.Linear(512, 512)),
+            layer_init(nn.Linear(self.obs_dim + 10, 1024)),
+            nn.LayerNorm(1024), nn.ReLU(),
+            layer_init(nn.Linear(1024, 512)),
             nn.LayerNorm(512), nn.ReLU(),
             layer_init(nn.Linear(512, 256)),
             nn.LayerNorm(256), nn.ReLU(),
             layer_init(nn.Linear(256, 256)),
             nn.ReLU(),
-            layer_init(nn.Linear(256, envs.single_action_space.n), std=0.01)
         )
+
+        # The Mean Head (Restored Tanh for instant braking)
+        self.actor_mean = nn.Sequential(
+            layer_init(nn.Linear(256, self.action_dim), std=0.01),
+            nn.Tanh() 
+        )
+
+        # The Variance Head (Starts with a bias of -0.5 to match your original initialization)
+        self.actor_logstd = nn.Parameter(torch.zeros(1, self.action_dim))
 
         # SHARED CENTRALIZED CRITIC: One brain to judge the whole team
         concatenated_obs_dim = self.num_agents * self.obs_dim
@@ -224,233 +238,176 @@ class Agent(nn.Module):
             proxy_state = x_norm.view(num_games, -1)
             centralized_state = self.critic_projection(proxy_state)
         else:
-            continuous_part = centralized_state[..., :-self.num_agents]
-            binary_part = centralized_state[..., -self.num_agents:]
+            centralized_state = self.state_normalizer.normalize(centralized_state)
             
-            # 2. Normalize only the continuous data
-            norm_continuous = self.state_normalizer.normalize(continuous_part)
-            
-            # 3. Stitch them back together for the Critic network
-            centralized_state = torch.cat([norm_continuous, binary_part], dim=-1)
         all_agent_values = self.critic(self.critic_encoder(centralized_state)) 
         if denormalize:
             all_agent_values = self.critic.denormalize(all_agent_values)
         return all_agent_values.view(-1, 1)
 
-    # Shared Actor
     def get_action_and_value(self, x, action=None, centralized_state=None, denormalize=False):
         x_norm = self.obs_normalizer.normalize(x)
-        batch_size = x.shape[0]
+        batch_size = x.shape[0] 
         
-        # Reshape to [NumGames, NumAgents, ObsDim]
-        obs_reshaped = x_norm.view(-1, self.num_agents, self.obs_dim)
+        agent_ids = torch.arange(self.num_agents).to(x.device).repeat(batch_size // self.num_agents)
+        embedded_ids = self.agent_id_embedding(agent_ids)
+        actor_input = torch.cat([x_norm, embedded_ids], dim=-1)
         
-        # VECTORIZED FORWARD PASS: Process all agents simultaneously
-        logits = self.actor(obs_reshaped) 
+        # Extract features
+        actor_features = self.actor(actor_input)
         
-        # Flatten back to [BatchSize, NumActions]
-        combined_logits = logits.view(batch_size, -1)
-        probs = Categorical(logits=combined_logits)
+        # Branch into Mean and LogStd
+        action_means = self.actor_mean(actor_features)
+        action_logstds = self.actor_logstd.expand_as(action_means)
+        
+        # Loosely bound the logstd to prevent NaN explosions, allowing near-zero variance
+        safe_logstds = torch.clamp(action_logstds, min=-5.0, max=2.0)
+        action_stds = safe_logstds.exp()
+        
+        probs = Normal(action_means, action_stds)
         
         if action is None:
             action = probs.sample()
             
-        return action, probs.log_prob(action), probs.entropy(), self.get_value(x, centralized_state, denormalize)
-    
-    def load_bc_weights(self, bc_model_path="student_bc_best.pt"):
-        bc_state_dict = torch.load(bc_model_path)
-        actor_state_dict = {}
-        
-        # Strip the "network." prefix to align the dictionaries
-        for key, value in bc_state_dict.items():
-            if key.startswith("network."):
-                new_key = key.replace("network.", "")
-                actor_state_dict[new_key] = value
-                
-        self.actor.load_state_dict(actor_state_dict)
-        print(f"\n[ORACLE] Successfully injected BC weights from {bc_model_path}!")
+        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.get_value(x, centralized_state, denormalize)
 
-class StateWrapper(BaseParallelWrapper):
-    def __init__(self, env):
-        super().__init__(env)
-        # Calculate and store state_space so it persists after vectorization
-        self.state_space = gym.spaces.Box(
-            low=-np.inf, 
-            high=np.inf, 
-            shape=self.env.unwrapped.state().shape
+class VMASVectorizedEnv:
+    def __init__(self, args, seed, run_name, update_step=0):
+        self.args = args
+        self.device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+        self.num_agents = args.num_landmarks
+        self.num_games = args.num_envs // self.num_agents
+        self.num_envs = self.num_games * self.num_agents
+        self.run_name = run_name
+        self.update_step = update_step
+        
+        self.env = vmas.make_env(
+            scenario= FlockingCleanObs() if args.env_id == "flocking" else args.env_id,
+            num_envs=self.num_games,
+            device=self.device,
+            continuous_actions=True,
+            n_agents=self.num_agents,
+            collisions=True,
+            observe_all_goals=False,
+            seed=seed,
+            dict_spaces=False
         )
+        
+        vmas_obs_dim = self.env.observation_space[0].shape[0]
+        self.single_action_space = self.env.action_space[0]
+        
+        target_dim = vmas_obs_dim + self.num_agents
+        self.single_observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(target_dim,))
+        
+        self.episode_returns = torch.zeros(self.num_envs, device=self.device)
+        
+        self.step_count = 0
+        self.episode_count = 0
+        self.record_this_episode = self.args.capture_video
+        self.video_frames = []
+
+    def _apply_stack_and_indicator(self, stacked_vmas_obs):
+        indicators = torch.eye(self.num_agents, device=self.device).unsqueeze(0).expand(self.num_games, -1, -1)
+        final_obs = torch.cat([stacked_vmas_obs, indicators], dim=-1)
+        return final_obs.reshape(self.num_envs, -1)
+
+    def reset(self, seed=None):
+        if seed is not None:
+            self.env.seed(seed)
+            
+        vmas_obs = self.env.reset()
+        self.episode_returns.zero_()
+        self.step_count = 0
+        
+        stacked_obs = torch.stack(vmas_obs, dim=1)
+        final_obs = self._apply_stack_and_indicator(stacked_obs)
+            
+        info = {
+            "raw_obs": stacked_obs.reshape(self.num_envs, -1),
+            "global_state": final_obs 
+        }
+        return final_obs, info
 
     def step(self, actions):
-        obs, rews, terms, truncs, infos = self.env.step(actions)
-        state = self.env.unwrapped.state()
-        for agent in self.agents:
-            infos[agent]["global_state"] = state
-        return obs, rews, terms, truncs, infos
-
-    def reset(self, seed=None, options=None):
-        obs, infos = self.env.reset(seed=seed, options=options)
-        state = self.env.unwrapped.state()
-        for agent in self.agents:
-            infos[agent]["global_state"] = state
-        return obs, infos
-
-# 1. Base Environment Factory
-def make_env(args, env_id, seed, current_local_ratio=0.5):
-    def thunk():
-        if "simple_spread" in env_id:
-            from mpe2 import simple_spread_v3
-            env = simple_spread_v3.parallel_env(N=args.num_landmarks, max_cycles=args.max_cycles, 
-                                                local_ratio=current_local_ratio, dynamic_rescaling=True, render_mode="rgb_array")
-            env = StateWrapper(env)
-        else:
-            env = importlib.import_module(f"pettingzoo.atari.{env_id}").parallel_env(render_mode="rgb_array")
-            env = ss.max_observation_v0(env, 2)
-            env = ss.frame_skip_v0(env, 4)
-            env = ss.color_reduction_v0(env, mode="B")
-            env = ss.resize_v1(env, x_size=84, y_size=84)
-            env = ss.clip_reward_v0(env, lower_bound=-1, upper_bound=1)
-            env = ss.frame_stack_v1(env, 4) ### IMPORTANT ONLY FOR ATARI GAMES
-        env = ss.agent_indicator_v0(env, type_only=False)
+        actions_reshaped = actions.view(self.num_games, self.num_agents, -1)
         
-        # SuperSuit natively converts (Agents, Obs) -> (Batch, Obs)
-        env = ss.pettingzoo_env_to_vec_env_v1(env)
-        return env
-    return thunk
-
-# 4. SURGICAL WRAPPER: Inherits from VectorEnv to safely bypass Gymnasium type-checks
-class DictInfoWrapper(gym.vector.VectorEnv):
-    def __init__(self, env):
-        self.env = env
-        self.num_envs = env.num_envs
-        self.observation_space = env.observation_space
-        self.action_space = env.action_space
-        self.render_mode = "rgb_array"
-        self.metadata = {"render_modes": ["rgb_array"], "render_fps": 5}
-        self._is_vector_env = True
-        self.target_video_size = None
-
-    def step(self, action):
-        obs, rew, term, trunc, info = self.env.step(action)
-        if isinstance(info, list):
-            global_state_list = [i.get("global_state") for i in info]
-            # Safely extract true final observations if they exist
-            final_obs_list = [i.get("final_observation", None) for i in info]
-            info = {
-                "global_state": np.array(global_state_list), 
-                "final_obs": final_obs_list, # PRESERVE THIS
-                "agents": info
-            }
-        return obs, rew, term, trunc, info
+        # Pass continuous force vectors directly to VMAS
+        vmas_actions = [actions_reshaped[:, i, :] for i in range(self.num_agents)]
         
-    def reset(self, seed=None, options=None):
-        # If a seed is provided, we must manually stagger it for the sub-environments
-        # Because ConcatVecEnv usually passes the same seed to all workers
-        if seed is not None:
-            # We access the internal list of environments in ConcatVecEnv
-            # And call reset on each with a unique staggered seed
-            obs_list = []
-            info_list = []
-            for i, sub_env in enumerate(self.env.vec_envs):
-                o, f = sub_env.reset(seed=seed + i*1000, options=options)
-                obs_list.append(o)
-                info_list.append(f)
-            
-            # Combine observations and infos manually to match VectorEnv format
-            obs = np.concatenate(obs_list)
-            info = [item for sublist in info_list for item in (sublist if isinstance(sublist, list) else [sublist])]
-        else:
-            # If no seed, fall back to default reset
-            obs, info = self.env.reset(options=options)
-            
-        if isinstance(info, list):
-            global_state_list = [i.get("global_state") for i in info]
-            info = {"global_state": np.array(global_state_list), "agents": info}
-        return obs, info
+        vmas_obs, vmas_rews, _, vmas_info = self.env.step(vmas_actions)
+        self.step_count += 1
         
-    def render(self):
-        # 1. Safely attempt to get raw frames
-        try:
-            game_frames = [sub_env.render() for sub_env in self.env.vec_envs]
-        except Exception:
-            game_frames = [None for _ in self.env.vec_envs]
-        
-        processed_frames = []
-        for f in game_frames:
-            valid_frame = False
-            
-            # FIX: Hardcode a safe maximum resolution. 
-            # 256x256 in a 6x6 grid = 1536x1536 video (Well below the 4096px H.264 limit)
-            if self.target_video_size is None:
-                self.target_video_size = (256, 256)
+        rewards = torch.stack(vmas_rews, dim=1).reshape(-1)
+        self.episode_returns += rewards
 
-            if f is not None:
-                try:
-                    img = np.array(f, dtype=np.uint8, copy=True)
-                    
-                    # Handle dimensionality safely
-                    if len(img.shape) >= 2:
-                        if len(img.shape) == 2:
-                            img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-                        elif len(img.shape) >= 3:
-                            img = img[:, :, :3]
-                            if img.shape[2] == 1:
-                                img = cv2.cvtColor(img, cv2.COLOR_GRAY2RGB)
-                            elif img.shape[2] == 2:
-                                pad = np.zeros((img.shape[0], img.shape[1], 1), dtype=np.uint8)
-                                img = np.concatenate([img, pad], axis=-1)
-                        
-                        # Guaranteed resize down to safe resolution
-                        if (img.shape[1], img.shape[0]) != self.target_video_size:
-                            img = cv2.resize(img, self.target_video_size, interpolation=cv2.INTER_LINEAR)
-                        
-                        # Force contiguous memory and explicitly check the byte count
-                        img = np.ascontiguousarray(img[:, :, :3], dtype=np.uint8)
-                        expected_bytes = self.target_video_size[0] * self.target_video_size[1] * 3
-                        
-                        if len(img.tobytes()) == expected_bytes:
-                            processed_frames.append(img)
-                            valid_frame = True
-                except Exception:
-                    pass 
+        if self.record_this_episode:
+            frames = []
+            num_to_render = min(9, self.num_games)
+            for i in range(num_to_render):
+                frame = self.env.render(mode="rgb_array", env_index=i, agent_index_focus=None)
+                if isinstance(frame, list): frame = frame[0]
+                frames.append(frame)
+
+            n = len(frames)
+            cols = math.ceil(math.sqrt(n))
+            rows = math.ceil(n / cols)
+            H, W, C = frames[0].shape
+            blank = np.zeros((H, W, C), dtype=np.uint8)
             
-            # Impervious Fallback
-            if not valid_frame:
-                blank = np.zeros((self.target_video_size[1], self.target_video_size[0], 3), dtype=np.uint8)
-                processed_frames.append(blank)
+            while len(frames) < rows * cols:
+                frames.append(blank)
                 
-        num_agents_per_game = self.num_envs // len(self.env.vec_envs)
-        return [f for f in processed_frames for _ in range(num_agents_per_game)]
+            grid = np.vstack([np.hstack(frames[i*cols:(i+1)*cols]) for i in range(rows)])
+            self.video_frames.append(grid)
+
+        stacked_obs = torch.stack(vmas_obs, dim=1)
+        final_obs = self._apply_stack_and_indicator(stacked_obs)
         
-    def close(self): 
-        return self.env.close()
+        is_done = self.step_count >= self.args.max_cycles
+        dones = torch.full((self.num_envs,), is_done, device=self.device, dtype=torch.float32)
+        
+        info = {
+            "raw_obs": stacked_obs.reshape(self.num_envs, -1),
+            "global_state": final_obs.clone()
+        }
+        
+        if is_done:
+            self.episode_count += 1
+            
+            info["terminal_raw_obs"] = info["raw_obs"].clone()
+            info["terminal_global_state"] = info["global_state"].clone()
+            
+            if self.record_this_episode and self.video_frames:
+                os.makedirs(f"videos/{self.run_name}", exist_ok=True)
+                file_path = f"videos/{self.run_name}/rl-video-update_{self.update_step}-ep_{self.episode_count}.mp4"
+                imageio.mimsave(file_path, self.video_frames, fps=15)
+                self.video_frames = []
+            
+            if self.args.capture_video and self.episode_count % 100 == 0:
+                self.record_this_episode = True
+            else:
+                self.record_this_episode = False
 
-def build_environments(args, run_name, base_seed, current_local_ratio=0.5, update_step=0):
-    temp_env = make_env(args, args.env_id, base_seed, current_local_ratio)()
-    num_agents_per_game = temp_env.num_envs
-    num_games = args.num_envs // num_agents_per_game
+            # Surface the completed returns before wiping them
+            info["episode"] = {
+                "r": self.episode_returns.clone(),
+                "l": torch.full((self.num_envs,), self.step_count, device=self.device)
+            }
 
-    env_list = [make_env(args, args.env_id, base_seed + i, current_local_ratio) for i in range(num_games)]
-    envs = ConcatVecEnv(env_list)
-    envs = DictInfoWrapper(envs)
+            vmas_obs = self.env.reset()
+            self.episode_returns.zero_()
+            self.step_count = 0
+            
+            stacked_obs = torch.stack(vmas_obs, dim=1)
+            final_obs = self._apply_stack_and_indicator(stacked_obs)
+            
+            info["raw_obs"] = stacked_obs.reshape(self.num_envs, -1)
+            info["global_state"] = final_obs.clone()
+                
+        return final_obs, rewards, dones, info
 
-    envs.is_vector_env = True
-    
-    envs = gym.wrappers.vector.RecordEpisodeStatistics(envs)
-    if args.capture_video:
-        envs = gym.wrappers.vector.RecordVideo(
-            envs, 
-            f"videos_il/{run_name}", 
-            episode_trigger=lambda x: x % 2000 == 0,
-            name_prefix=f"rl-video-update_{update_step}"
-        )
-
-    # Set Final CleanRL attributes
-    envs.single_action_space = temp_env.action_space
-    envs.single_observation_space = temp_env.observation_space
-    temp_env.close()
-    
-    envs.is_vector_env = True
-    return envs, num_agents_per_game, num_games
+    def close(self):
+        pass
 
 if __name__ == "__main__":
 
@@ -474,8 +431,6 @@ if __name__ == "__main__":
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    strict_occupancy_radius = 0.2
-
     # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
     # np.random.seed(args.seed)
@@ -486,10 +441,11 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
 
-    envs, num_agents_per_game, num_games = build_environments(args, run_name, args.seed, current_ratio, update_step=0)
+    envs = VMASVectorizedEnv(args, args.seed, run_name, update_step=0)
+    print("VMAS Observation Space:", envs.env.observation_space)
     actual_num_envs = envs.num_envs
-
-    # reward_norm = RewardNormalizer(actual_num_envs, args.gamma)
+    num_agents_per_game = envs.num_agents
+    num_games = envs.num_games
 
     args.batch_size = int(actual_num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -500,22 +456,22 @@ if __name__ == "__main__":
     start_time = time.time()
     reset_data = envs.reset(seed=args.seed)
     if isinstance(reset_data, tuple):
-        next_obs = torch.Tensor(reset_data[0]).to(device)
+        next_obs = reset_data[0].clone().to(device)
         next_info = reset_data[1]
     else:
-        next_obs = torch.Tensor(reset_data).to(device)
+        next_obs = reset_data.clone().to(device)
         next_info = {}
     next_done = torch.zeros(actual_num_envs).to(device)
 
     if "global_state" in next_info:
         # Use the actual shape of the global state provided by your wrappers
         # state_dim = next_info["global_state"].shape[-1]
-        state_dim = (num_agents_per_game * np.array(envs.single_observation_space.shape).prod()) + args.num_landmarks
+        state_dim = num_agents_per_game * np.array(envs.single_observation_space.shape).prod()
 
         state0 = next_info["global_state"][0]
         state1 = next_info["global_state"][num_agents_per_game] if len(next_info["global_state"]) > 1 else None
         if state1 is not None:
-            diff = np.abs(state0 - state1).sum()
+            diff = torch.abs(state0 - state1).sum().item()
             print(f"DEBUG: Environmental Divergence Score: {diff}")
             if diff == 0:
                 print("WARNING: Environments are still synchronized!")
@@ -525,13 +481,13 @@ if __name__ == "__main__":
 
     states = torch.zeros((args.num_steps, num_games, state_dim)).to(device)
 
-    agent = Agent(envs, num_agents_per_game, state_dim=state_dim).to(device)
-   
-    agent.load_bc_weights("expert_data/student_bc_best_3.pt")
-
-    # behavorial clone optimizer
+    agent = Agent(envs.single_action_space, envs.single_observation_space.shape, num_agents_per_game, state_dim=state_dim).to(device)
     optimizer = optim.Adam([
-            {'params': list(agent.actor.parameters()), 'lr': 5e-5}, 
+            {'params': list(agent.actor.parameters()) + 
+                       list(agent.actor_mean.parameters()) + 
+                       [agent.actor_logstd] + 
+                       list(agent.agent_id_embedding.parameters()), 'lr': 3e-4}, 
+            
             {'params': list(agent.critic_encoder.parameters()) + 
                     list(agent.critic.parameters()) + 
                     list(agent.critic_projection.parameters()), 'lr': 1e-3} 
@@ -546,28 +502,19 @@ if __name__ == "__main__":
     values = torch.zeros((args.num_steps, actual_num_envs)).to(device)
     ent_coef_now = 0
 
-    current_assignments = torch.arange(args.num_landmarks).unsqueeze(0).repeat(num_games, 1).to(device)
-    needs_assignment = torch.ones(num_games, dtype=torch.bool).to(device)
-
     for update in range(1, num_updates + 1):
+        current_assignments = torch.arange(args.num_landmarks).unsqueeze(0).repeat(num_games, 1).to(device)
+        needs_assignment = torch.ones(num_games, dtype=torch.bool).to(device)
         # Annealing the rate if instructed to do so.
         if args.anneal_lr:
             frac = 1.0 - (update - 1.0) / num_updates
             for i, param_group in enumerate(optimizer.param_groups):
                 # We fetch the initial_lr we set in the Adam constructor
                 # If we didn't store it, we can use the current group's base
-                if i == 0: # ACTOR
-                    if update <= 50:
-                        # PHASE 1: CRITIC WARMUP
-                        # Freeze the Actor completely so the Critic can map the Value 
-                        # of the expert BC weights without destroying them.
-                        param_group["lr"] = 0.0
-                    else:
-                        # PHASE 2: GENTLE FINE-TUNING
-                        # Unfreeze with the conservative learning rate
-                        initial_lr = 5e-5 
-                        param_group["lr"] = max(5e-6, frac * initial_lr)
-                else: # CRITIC
+                if i == 0:
+                    initial_lr = 3e-4 
+                    param_group["lr"] = max(5e-5, frac * initial_lr)
+                else:
                     initial_lr = 1e-3
                     param_group["lr"] = max(1e-4, frac * initial_lr)
                 
@@ -597,41 +544,29 @@ if __name__ == "__main__":
 
             # Rebuild with a staggered seed so we don't repeat the exact same scenarios
             new_seed = args.seed + update 
-            envs, _, _ = build_environments(args, run_name, new_seed, current_ratio, update_step=update)
+            envs = VMASVectorizedEnv(args, new_seed, run_name, update_step=update)
             
             # Re-initialize the starting observations for PPO
             reset_data = envs.reset(seed=new_seed)
             if isinstance(reset_data, tuple):
-                next_obs = torch.Tensor(reset_data[0]).to(device)
+                next_obs = reset_data[0].clone().to(device)
                 next_info = reset_data[1]
             else:
-                next_obs = torch.Tensor(reset_data).to(device)
+                next_obs = reset_data.clone().to(device)
                 next_info = {}
             next_done = torch.zeros(actual_num_envs).to(device)
             
             # Re-sync the global state tracking
             if "global_state" in next_info:
                 current_game_states = next_obs.view(num_games, -1)
-            needs_assignment.fill_(True)
             print("--- PHOENIX REBOOT COMPLETE ---")
 
-        g_idx = torch.arange(num_games, device=device).view(-1, 1)
-        a_idx = torch.arange(num_agents_per_game, device=device).view(1, -1)
         for step in range(0, args.num_steps):
             global_step += actual_num_envs
             obs[step] = next_obs
             dones[step] = next_done
-            if "global_state" in next_info:
-                # current_game_states = torch.Tensor(next_info["global_state"][::num_agents_per_game]).to(device)
-                current_game_states = next_obs.view(num_games, -1)
-                landmark_dist = next_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
-                landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
-                occupied = (torch.norm(landmark_dist, dim=-1) < strict_occupancy_radius).any(dim=1).float()
-                states[step] = torch.cat([current_game_states, occupied], dim=-1)
-            else:
-                # Fallback for Atari: Reshape current observations as the "God-view"
-                current_game_states = next_obs.view(num_games, -1)
-                states[step] = current_game_states
+            current_game_states = next_obs.view(num_games, -1)
+            states[step] = current_game_states
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
@@ -640,8 +575,10 @@ if __name__ == "__main__":
             actions[step] = action
             logprobs[step] = logprob
 
+            clipped_action = torch.clamp(action, -1.0, 1.0)
+
             # TRY NOT TO MODIFY: execute the game and log data.
-            step_data = envs.step(action.cpu().numpy())
+            step_data = envs.step(clipped_action)
     
             # Gymnasium step returns (obs, reward, terminations, truncations, infos)
             if len(step_data) == 5:
@@ -651,135 +588,113 @@ if __name__ == "__main__":
                 resets = np.logical_or(terminations, truncations)
             else:
                 next_obs, reward, done, next_info = step_data
-
                 resets = done
 
             if args.reward_cheat:
-                # CAST TO TENSOR FIRST
-                next_obs_tensor = torch.Tensor(next_obs).to(device)
-
-                # --- 1. REWARD CALCULATION FOR CURRENT STEP ---
-                true_next_obs = next_obs_tensor.clone()
-                if "final_obs" in next_info:
-                    for agent_idx, final_obs in enumerate(next_info["final_obs"]):
-                        if final_obs is not None:
-                            true_next_obs[agent_idx] = torch.Tensor(final_obs).to(device)
-
-                true_landmark_dist = true_next_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
-                true_landmark_dist = true_landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
-                dist_for_reward = torch.norm(true_landmark_dist, dim=-1)
-
-                assigned_dist = torch.gather(dist_for_reward, 2, current_assignments.unsqueeze(-1)).squeeze(-1)
+                agent_radius = 0.15
+                collision_penalty = 0.5
                 
-                # --- 2. LOCALIZED REWARD ALGORITHMS ---
-                individual_pull = -1.0 * assigned_dist
-                
-                landmarks_end = 4 + 2 * args.num_landmarks
-                other_pos = true_next_obs.view(num_games, num_agents_per_game, -1)[:, :, landmarks_end:landmarks_end + 2 * (args.num_landmarks - 1)]
-                other_pos = other_pos.view(num_games, num_agents_per_game, args.num_landmarks - 1, 2)
-                other_dist = torch.norm(other_pos, dim=-1)
-                
-                collisions = (other_dist < 0.3).float().sum(dim=-1)
-                individual_collision_penalty = -0.25 * collisions
-                success_bonus = (assigned_dist < 0.1).float() * 1.0
-                
-                rewards[step] = individual_pull.view(-1) + individual_collision_penalty.view(-1) + success_bonus.view(-1)
+                cheat_raw_obs = next_info["raw_obs"].clone()
+                if "final_info" in next_info:
+                    for i, fin_info in enumerate(next_info["final_info"]):
+                        if fin_info is not None and "raw_obs" in fin_info:
+                            cheat_raw_obs[i] = fin_info["raw_obs"].clone()
 
-                # --- 3. ASSIGNMENT ROUTING FOR NEXT EPISODE ---
+                raw_obs_tensor = torch.Tensor(cheat_raw_obs).to(device)
+                new_landmark_dist = raw_obs_tensor.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
+                new_landmark_dist = new_landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
+                
+                # Shape: [num_games, num_agents, num_landmarks]
+                dist = torch.norm(new_landmark_dist, dim=-1)
+                
+                # --- 1. EPISODIC STATIC ASSIGNMENT ---
+                # Check which games just reset (or are at step 0)
                 game_resets = torch.Tensor(resets).to(device).view(num_games, num_agents_per_game)[:, 0].bool()
                 needs_assignment = needs_assignment | game_resets
                 
+                # If any game reset, recalculate its optimal shortest-path routing
                 if needs_assignment.any():
-                    reset_landmark_dist = next_obs_tensor.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
-                    reset_landmark_dist = reset_landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
-                    dist_for_new_episode = torch.norm(reset_landmark_dist, dim=-1)
-
-                    dist_cpu = dist_for_new_episode.cpu().numpy()
+                    dist_clone = dist.clone()
                     
+                    # Only calculate for games that need it
                     for g in range(num_games):
                         if needs_assignment[g]:
-                            row_ind, col_ind = scipy.optimize.linear_sum_assignment(dist_cpu[g])
-                            current_assignments[g] = torch.tensor(col_ind, device=device)
+                            for _ in range(args.num_landmarks):
+                                flat_dist = dist_clone[g].view(-1)
+                                min_val, min_idx = flat_dist.min(dim=0)
+                                
+                                agent_idx = min_idx // args.num_landmarks
+                                landmark_idx = min_idx % args.num_landmarks
+                                
+                                current_assignments[g, agent_idx] = landmark_idx
+                                
+                                dist_clone[g, agent_idx, :] = float('inf')
+                                dist_clone[g, :, landmark_idx] = float('inf')
                                 
                     needs_assignment.fill_(False)
-
-                # --- 4. THE FIX: VECTORIZED OBSERVABILITY INJECTION ---
-                # We physically re-order the landmarks so the Hungarian target is always FIRST,
-                # but we do it using massive parallel tensor operations instead of slow Python loops.
-
-                obs_reshaped = next_obs_tensor.clone().view(num_games, num_agents_per_game, -1)
-                landmarks_segment = obs_reshaped[:, :, 4:4+2*args.num_landmarks].view(num_games, num_agents_per_game, args.num_landmarks, 2)
-
-                # 1. Create a base index array of shape [num_games, num_agents_per_game, num_landmarks]
-                # e.g., [0, 1, 2, 3] for every agent
-                base_indices = torch.arange(args.num_landmarks, device=device).expand(num_games, num_agents_per_game, -1).clone()
-
-                # 2. Perform the swap logically on the indices
-                # Put the assigned target index into the 0th slot
-                base_indices[:, :, 0] = current_assignments
-
-                # Put 0 into the target's original slot using advanced grid indexing
-                base_indices[g_idx, a_idx, current_assignments] = 0
-
-                # 3. Expand the indices to cover the (X, Y) coordinate dimensions
-                # Shape becomes: [num_games, num_agents_per_game, num_landmarks, 2]
-                gather_indices = base_indices.unsqueeze(-1).expand(-1, -1, -1, 2)
-
-                # 4. Fetch the swapped coordinates in one instantaneous GPU operation!
-                swapped_landmarks = torch.gather(landmarks_segment, dim=2, index=gather_indices)
-
-                # 5. Overwrite the observation block and flatten
-                obs_reshaped[:, :, 4:4+2*args.num_landmarks] = swapped_landmarks.view(num_games, num_agents_per_game, -1)
-                next_obs = obs_reshaped.view(actual_num_envs, -1)
+                
+                # Extract the distance to the frozen, optimally assigned target
+                assigned_dist = torch.gather(dist, 2, current_assignments.unsqueeze(-1)).squeeze(-1)
+                
+                # --- 2. PROCEDURAL SQUARE ROOT CALCULUS ---
+                # Calculate the mathematical tipping point for the dead-center snap
+                min_snap_multiplier = collision_penalty / np.sqrt(agent_radius)
+                
+                # Apply a safety factor (> 1.0) to guarantee the snap overpowers engine physics
+                snap_factor = 1.5 
+                procedural_multiplier = min_snap_multiplier * snap_factor
+                
+                # R = -M * sqrt(d)
+                individual_pull = -procedural_multiplier * torch.sqrt(assigned_dist + 1e-8)
+                
+                # Combine with native environment reward
+                rewards[step] = torch.tensor(reward).to(device).view(-1) + individual_pull.view(-1)
             else:
                 # normalized_step_rewards = reward_norm(reward, done)
-                rewards[step] = torch.tensor(reward).to(device).view(-1)
-            next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(done).to(device)
+                rewards[step] = reward.clone().to(device).view(-1)
+            next_obs, next_done = next_obs.clone().to(device), done.clone().to(device)
 
             # LOGGING TEAM DATA
-            if "final_info" in next_info:
-                # Standard Gymnasium / SyncVectorEnv format
-                for item in next_info["final_info"]:
-                    if item is not None and "episode" in item:
-                        r = item["episode"]["r"]
-                        print(f"global_step={global_step}, episodic_return={r}")
-                        writer.add_scalar("charts/team_episodic_return", item["episode"]["r"], global_step)
-                        writer.add_scalar("charts/team_episodic_length", item["episode"]["l"], global_step)
-                        break 
-            elif "_episode" in next_info:
-                # gym.wrappers.vector.RecordEpisodeStatistics format
-                for i, done in enumerate(next_info["_episode"]):
-                    if done:
-                        r = next_info["episode"]["r"][i]
-                        print(f"global_step={global_step}, episodic_return={r}")
-                        # Extract the return from the arrays
-                        writer.add_scalar("charts/team_episodic_return", next_info["episode"]["r"][i], global_step)
-                        writer.add_scalar("charts/team_episodic_length", next_info["episode"]["l"][i], global_step)
-                        break # Break after first item since all agents in one game share the reward
-
+            if done.any() and "episode" in next_info:
+                done_bool = done.bool()
+                # Grab the first agent's index for each completed game to avoid duplicate logs
+                done_games = done_bool.view(num_games, num_agents_per_game)[:, 0]
+                
+                if done_games.any():
+                    avg_return = next_info["episode"]["r"].view(num_games, num_agents_per_game)[done_games, 0].mean().item()
+                    avg_length = next_info["episode"]["l"].view(num_games, num_agents_per_game)[done_games, 0].float().mean().item()
+                    
+                    print(f"global_step={global_step}, episodic_return={avg_return}")
+                    writer.add_scalar("charts/team_episodic_return", avg_return, global_step)
+                    writer.add_scalar("charts/team_episodic_length", avg_length, global_step)
         # bootstrap value if not done
         with torch.no_grad():
-
-            bootstrap_obs = next_obs.clone() 
-            if "final_obs" in next_info:
-                for agent_idx, final_obs in enumerate(next_info["final_obs"]):
-                    if final_obs is not None:
-                        # Direct 1-to-1 assignment for the specific agent
-                        bootstrap_obs[agent_idx] = torch.Tensor(final_obs).to(device)
-
+            boot_obs = next_obs.clone()
+            
             if "global_state" in next_info:
-                # True global state for MPE
-                # final_state = torch.Tensor(next_info["global_state"][::num_agents_per_game]).to(device)
-                final_state = bootstrap_obs.view(num_games, -1)
-                landmark_dist = bootstrap_obs.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
-                landmark_dist = landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
-                occupied = (torch.norm(landmark_dist, dim=-1) < strict_occupancy_radius).any(dim=1).float()
-                final_state = torch.cat([final_state, occupied], dim=-1)
-            else:
-                # Fallback for Atari: Proxy state from observations
-                final_state = bootstrap_obs.view(num_games, -1)
+                # 1. Create a separate tracker for the Raw MPE physics
+                boot_raw_obs = next_info["raw_obs"].clone()
+                
+                # --- TELEPORTATION FIX ---
+                # A. Inject Final Graph Obs
+                if "terminal_global_state" in next_info:
+                    boot_obs = next_info["terminal_global_state"].clone()
+                
+                if "terminal_raw_obs" in next_info:
+                    boot_raw_obs = next_info["terminal_raw_obs"].clone()
 
-            next_value = agent.get_value(bootstrap_obs, centralized_state=final_state, denormalize=True).flatten()
+                # 2. Build the Final State correctly
+                final_state = boot_obs.view(num_games, -1)
+            else:
+                # Fallback for Atari
+                if "final_observation" in next_info:
+                    for idx, final_obs in enumerate(next_info["final_observation"]):
+                        if final_obs is not None:
+                            boot_obs[idx] = torch.Tensor(final_obs).to(device)
+                final_state = boot_obs.view(num_games, -1)
+
+            # First Pass
+            next_value = agent.get_value(boot_obs, centralized_state=final_state, denormalize=True).flatten()
     
             # Standard GAE to get returns
             temp_advantages = torch.zeros_like(rewards).to(device)
@@ -804,8 +719,7 @@ if __name__ == "__main__":
             agent.critic.update(b_returns.view(-1, agent.num_agents))
 
             agent.obs_normalizer.update(b_obs)
-            continuous_b_states = b_states[:, :-args.num_landmarks]
-            agent.state_normalizer.update(continuous_b_states)
+            agent.state_normalizer.update(b_states)
 
             # 3. Second Pass: RE-CALCULATE Values and Advantages with NEW stats
             # This is the crucial step you were missing. 
@@ -816,7 +730,7 @@ if __name__ == "__main__":
                 denormalize=True
             ).view(args.num_steps, actual_num_envs)
             
-            new_next_value = agent.get_value(bootstrap_obs, centralized_state=final_state, denormalize=True).flatten()
+            new_next_value = agent.get_value(boot_obs, centralized_state=final_state, denormalize=True).flatten()
             
             # Final GAE calculation for the actual SGD update
             advantages = torch.zeros_like(rewards).to(device)
@@ -865,7 +779,7 @@ if __name__ == "__main__":
 
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(
                     b_obs[mb_inds], 
-                    b_actions.long()[mb_inds],
+                    b_actions[mb_inds], 
                     centralized_state=mb_states_for_critic
                 )
                 logratio = newlogprob - b_logprobs[mb_inds]
@@ -935,7 +849,6 @@ if __name__ == "__main__":
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
                     break
-
         if update % 500 == 0:
                 gc.collect()
 
@@ -954,7 +867,6 @@ if __name__ == "__main__":
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
-        writer.add_scalar("charts/local_ratio", current_ratio, global_step)
         writer.add_scalar("charts/ent_coef_now", ent_coef_now, global_step)
 
         if update % 100 == 0 or update == num_updates:

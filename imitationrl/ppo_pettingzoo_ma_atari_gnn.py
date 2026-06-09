@@ -968,13 +968,36 @@ if __name__ == "__main__":
             agent.obs_normalizer.update(b_obs)
 
             # 3. Second Pass: RE-CALCULATE Values and Advantages with NEW stats
-            # This is the crucial step you were missing. 
             # It ensures 'values' and 'returns' are in the same normalized space for SGD.
-            new_values = agent.get_value(
-                obs.view(-1, obs.shape[-1]), # FIX: Dynamically flatten based on tensor shape
-                centralized_state=states.view(-1, state_dim), 
-                denormalize=True
-            ).view(args.num_steps, actual_num_envs)
+
+            ### NOT CHUNKED FASTER VERSION
+            # new_values = agent.get_value(
+            #     obs.view(-1, obs.shape[-1]), # FIX: Dynamically flatten based on tensor shape
+            #     centralized_state=states.view(-1, state_dim), 
+            #     denormalize=True
+            # ).view(args.num_steps, actual_num_envs)
+
+
+            ### CHUNKED DUE TO CUDA MEMORY
+            b_obs_flat = obs.view(-1, obs.shape[-1])
+            b_states_flat = states.view(-1, state_dim)
+            new_values_flat = torch.zeros(b_obs_flat.shape[0], device=device)
+            
+            chunk_size = args.minibatch_size
+            for i in range(0, b_obs_flat.shape[0], chunk_size):
+                end_idx = min(i + chunk_size, b_obs_flat.shape[0])
+                
+                # Scale the state slicing down to the game level
+                state_start = i // agent.num_agents
+                state_end = end_idx // agent.num_agents
+                
+                new_values_flat[i:end_idx] = agent.get_value(
+                    b_obs_flat[i:end_idx], 
+                    centralized_state=b_states_flat[state_start:state_end], 
+                    denormalize=True
+                ).flatten()
+                
+            new_values = new_values_flat.view(args.num_steps, actual_num_envs)
             
             new_next_value = agent.get_value(boot_obs, centralized_state=final_state, denormalize=True).flatten()
             
