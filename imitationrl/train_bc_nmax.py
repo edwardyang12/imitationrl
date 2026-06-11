@@ -16,7 +16,7 @@ class VectorizedBatchDataset(Dataset):
     def __init__(self, n_values, n_max=10, batch_size=32768):
         self.n_max = n_max
         self.batch_size = batch_size
-        self.target_obs_dim = (4 * 6 * n_max) + n_max
+        self.target_obs_dim = (5 * n_max) + 2
         
         self.batches = []
         self.worker_mmaps = {}
@@ -67,44 +67,37 @@ class VectorizedBatchDataset(Dataset):
         # 1. VECTORIZED UNPACKING
         frames_part = raw_obs_batch[:, :-N] 
         indicator_part = raw_obs_batch[:, -N:]
-        frames = frames_part.reshape(B, 4, 6 * N)
+        frames = frames_part 
         
-        # 2. ISOLATE ENTITIES
-        self_data = frames[:, :, 0:4] # (B, 4, 4)
-        landmarks = frames[:, :, 4 : 4+2*N].reshape(B, 4, N, 2)
+        self_data = frames[:, 0:4] # (B, 4)
+        landmarks = frames[:, 4 : 4+2*N].reshape(B, N, 2)
         
         other_pos_start = 4 + 2*N
-        other_pos = frames[:, :, other_pos_start : other_pos_start + 2*(N-1)].reshape(B, 4, N-1, 2)
-        
-        other_vel_start = other_pos_start + 2*(N-1)
-        other_vel = frames[:, :, other_vel_start : 6*N].reshape(B, 4, N-1, 2)
+        other_pos = frames[:, other_pos_start : other_pos_start + 2*(N-1)].reshape(B, N-1, 2)
+    
         
         # 3. ROW-WISE UNIQUE PERMUTATIONS
         # np.argsort on random matrices generates unique random choices per row instantly
         landmark_slots = np.argsort(np.random.rand(B, self.n_max), axis=1)[:, :N]
         agent_slots = np.argsort(np.random.rand(B, self.n_max - 1), axis=1)[:, :N - 1]
         
-        # 4. PRE-ALLOCATE ZERO-PADDED DESTINATIONS
-        dest_landmarks = np.zeros((B, 4, self.n_max, 2), dtype=np.float32)
-        dest_other_pos = np.zeros((B, 4, self.n_max - 1, 2), dtype=np.float32)
-        dest_other_vel = np.zeros((B, 4, self.n_max - 1, 2), dtype=np.float32)
+        # 4. PRE-ALLOCATE ZERO-PADDED DESTINATIONS (Removed 4th dimension)
+        dest_landmarks = np.zeros((B, self.n_max, 2), dtype=np.float32)
+        dest_other_pos = np.zeros((B, self.n_max - 1, 2), dtype=np.float32)
         
         # 5. ADVANCED INDEXING ASSIGNMENT
-        b_idx = np.arange(B)[:, None, None]
-        f_idx = np.arange(4)[None, :, None]
+        b_idx = np.arange(B)[:, None]
         
-        dest_landmarks[b_idx, f_idx, landmark_slots[:, None, :]] = landmarks
-        dest_other_pos[b_idx, f_idx, agent_slots[:, None, :]] = other_pos
-        dest_other_vel[b_idx, f_idx, agent_slots[:, None, :]] = other_vel
+        dest_landmarks[b_idx, landmark_slots] = landmarks
+        dest_other_pos[b_idx, agent_slots] = other_pos
         
         # 6. FLATTEN AND RECOMBINE FRAMES
-        dest_landmarks_flat = dest_landmarks.reshape(B, 4, self.n_max * 2)
-        dest_other_pos_flat = dest_other_pos.reshape(B, 4, (self.n_max - 1) * 2)
-        dest_other_vel_flat = dest_other_vel.reshape(B, 4, (self.n_max - 1) * 2)
+        dest_landmarks_flat = dest_landmarks.reshape(B, self.n_max * 2)
+        dest_other_pos_flat = dest_other_pos.reshape(B, (self.n_max - 1) * 2)
         
         padded_frames = np.concatenate([
-            self_data, dest_landmarks_flat, dest_other_pos_flat, dest_other_vel_flat
-        ], axis=2) 
+            self_data, dest_landmarks_flat, dest_other_pos_flat
+        ], axis=1) 
         
         # 7. ROW-WISE INDICATOR PERMUTATION
         original_agent_idx = np.argmax(indicator_part, axis=1)
@@ -116,8 +109,8 @@ class VectorizedBatchDataset(Dataset):
         padded_indicator[np.arange(B), new_agent_idx] = 1.0
         
         # 8. FINAL STITCH AND INTRA-BATCH SHUFFLE
-        padded_frames_flat = padded_frames.reshape(B, 4 * 6 * self.n_max)
-        final_obs = np.concatenate([padded_frames_flat, padded_indicator], axis=1)
+        # FIX: padded_frames is already flat, no need to reshape again
+        final_obs = np.concatenate([padded_frames, padded_indicator], axis=1)
         
         shuffle_idx = np.random.permutation(B)
         final_obs = final_obs[shuffle_idx]
@@ -146,9 +139,9 @@ class StudentActor(nn.Module):
 def train_behavioral_cloning():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    n_max = 6
-    batch_size = 32768
-    n_values_to_train = [3, 4]
+    n_max = 7
+    batch_size = 65536
+    n_values_to_train = [7]
     
     # Initialize the Vectorized Dataset
     full_dataset = VectorizedBatchDataset(n_values=n_values_to_train, n_max=n_max, batch_size=batch_size)

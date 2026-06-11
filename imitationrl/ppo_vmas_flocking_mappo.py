@@ -110,6 +110,39 @@ class FlockingCleanObs(BaseFlocking):
                 
         return torch.cat(obs, dim=-1)
 
+    # def reward(self, agent):
+    #     # 1. Get the base flocking reward (cohesion, alignment, target tracking)
+    #     base_reward = super().reward(agent)
+        
+    #     obstacle_penalty = torch.zeros_like(base_reward)
+        
+    #     # 2. Calculate continuous vectorized penalties for obstacles
+    #     for landmark in self.world.landmarks:
+    #         if landmark != self._target:
+    #             dist = torch.linalg.vector_norm(agent.state.pos - landmark.state.pos, dim=-1)
+    #             collision_dist = agent.shape.radius + landmark.shape.radius
+                
+    #             # --- CONTINUOUS SHAPING ---
+    #             # Create a "danger zone" slightly larger than the collision radius
+    #             margin = 0.15
+    #             danger_zone = collision_dist + margin
+                
+    #             # If inside the danger zone, calculate a smooth penalty that increases as they get closer.
+    #             # Max soft penalty is -0.05 right at the collision boundary.
+    #             soft_penalty = torch.where(
+    #                 dist < danger_zone, 
+    #                 -0.05 * ((danger_zone - dist) / margin), 
+    #                 0.0
+    #             )
+                
+    #             # Apply a smaller hard penalty (-0.05 instead of -1.0) for actual physical intersection
+    #             hard_penalty = torch.where(dist < collision_dist, -0.05, 0.0)
+                
+    #             obstacle_penalty += (soft_penalty + hard_penalty)
+                
+    #     # 3. Combine and return
+    #     return base_reward + obstacle_penalty
+
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
@@ -287,8 +320,6 @@ class VMASVectorizedEnv:
             device=self.device,
             continuous_actions=True,
             n_agents=self.num_agents,
-            collisions=True,
-            observe_all_goals=False,
             seed=seed,
             dict_spaces=False
         )
@@ -383,7 +414,7 @@ class VMASVectorizedEnv:
                 imageio.mimsave(file_path, self.video_frames, fps=15)
                 self.video_frames = []
             
-            if self.args.capture_video and self.episode_count % 100 == 0:
+            if self.args.capture_video and self.episode_count % 50 == 0:
                 self.record_this_episode = True
             else:
                 self.record_this_episode = False

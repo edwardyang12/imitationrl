@@ -7,6 +7,7 @@ import numpy as np
 import os
 from tqdm import tqdm
 import random
+from torch_geometric.nn import radius_graph
 
 def seed_worker(worker_id):
     worker_seed = torch.initial_seed() % 2**32
@@ -14,77 +15,90 @@ def seed_worker(worker_id):
     random.seed(worker_seed)
 
 class MultiHeadGATBackbone(nn.Module):
-    def __init__(self, n_max, feature_dim=7, hidden_dim=64, out_dim=128, heads=4):
+    def __init__(self, n_max, feature_dim=8, hidden_dim=64, out_dim=128, heads=4):
         super().__init__()
         self.n_max = n_max
         self.feature_dim = feature_dim
         
-        # GAT Layer 1: feature_dim -> hidden_dim * heads
-        self.gat1 = GATConv(feature_dim, hidden_dim, heads=heads, concat=True)
-        # GAT Layer 2: hidden_dim * heads -> hidden_dim * heads
-        self.gat2 = GATConv(hidden_dim * heads, hidden_dim, heads=heads, concat=True)
-        # GAT Layer 3 (Final): hidden_dim * heads -> out_dim (Averaged)
-        self.gat3 = GATConv(hidden_dim * heads, out_dim, heads=heads, concat=False)
+        self.gat1 = GATConv(feature_dim, hidden_dim, heads=heads, concat=True, edge_dim=1)
+        self.gat2 = GATConv(hidden_dim * heads, hidden_dim, heads=heads, concat=True, edge_dim=1)
+        self.gat3 = GATConv(hidden_dim * heads, out_dim, heads=heads, concat=False, edge_dim=1)
         
+        # ADD: Linear projection to match dimensions for the first skip connection
+        self.skip_proj = nn.Linear(feature_dim, hidden_dim * heads)
         self.elu = nn.ELU()
 
+        self.register_buffer('static_edge_index', None)
+
     def _build_dynamic_graph(self, x_flat):
-        """
-        Converts the flat CleanRL tensor into a dynamic, dummy-free PyG Graph.
-        """
         B = x_flat.shape[0]
         device = x_flat.device
         
-        # Reshape to [Batch, N_max, Feature_Dim]
-        x_padded = x_flat.view(B, self.n_max, self.feature_dim)
+        # Keep nodes padded so they perfectly align with the static_edge_index
+        x_nodes = x_flat.view(B * self.n_max, self.feature_dim)
         
-        # 1. Mask out dummy nodes (Feature index 6 is the active flag)
-        active_mask = x_padded[:, :, 6] > 0.5
+        if self.static_edge_index is None or self.static_edge_index.shape[1] != (B * self.n_max * (self.n_max - 1)):
+            adj = torch.ones(self.n_max, self.n_max) - torch.eye(self.n_max)
+            single_edge_index = adj.nonzero(as_tuple=False).t().contiguous().to(device)
+            
+            batch_offsets = torch.arange(B, device=device) * self.n_max
+            batch_offsets = batch_offsets.view(-1, 1).repeat(1, single_edge_index.shape[1])
+            self.static_edge_index = (single_edge_index.unsqueeze(0) + batch_offsets.unsqueeze(1)).view(2, -1)
+            
+        edge_index = self.static_edge_index
         
-        # 2. Extract strictly valid node features
-        valid_x = x_padded[active_mask] # Shape: [Total_Valid_Nodes_in_Batch, 7]
+        # Physics Extraction perfectly aligns because x_nodes includes padding
+        row, col = edge_index
+        diff = x_nodes[row, :2] - x_nodes[col, :2]
+        distances = torch.sqrt((diff ** 2).sum(dim=-1, keepdim=True) + 1e-8)
         
-        # 3. Create PyG Batch Indexing
-        batch_indices = torch.arange(B, device=device).view(-1, 1).expand(B, self.n_max)
-        valid_batch = batch_indices[active_mask] # Shape: [Total_Valid_Nodes_in_Batch]
+        # Calculate the mask, but don't apply it yet
+        active_mask = x_nodes[:, 6] > 0.5
         
-        # 4. Generate Fully Connected Edge Index per graph inside the batch
-        # Create a boolean adjacency matrix matching nodes in the same batch item
-        adj_mask = valid_batch.unsqueeze(1) == valid_batch.unsqueeze(0)
-        edge_index = adj_mask.nonzero(as_tuple=False).t().contiguous()
-        
-        return valid_x, edge_index, valid_batch
+        return x_nodes, edge_index, distances, active_mask
 
     def forward(self, x_flat):
-        valid_x, edge_index, valid_batch = self._build_dynamic_graph(x_flat)
+        x_nodes, edge_index, edge_attr, active_mask = self._build_dynamic_graph(x_flat)
         
-        # Message Passing
-        h = self.gat1(valid_x, edge_index)
-        h = self.elu(h)
-        h = self.gat2(h, edge_index)
-        h = self.elu(h)
-        node_embeddings = self.gat3(h, edge_index) # [Total_Valid_Nodes, out_dim]
+        res = self.skip_proj(x_nodes)
         
-        return valid_x, node_embeddings, valid_batch
+        h = self.gat1(x_nodes, edge_index, edge_attr=edge_attr)
+        h = self.elu(h) + res 
+        
+        h2 = self.gat2(h, edge_index, edge_attr=edge_attr)
+        h2 = self.elu(h2) + h 
+        
+        node_embeddings = self.gat3(h2, edge_index, edge_attr=edge_attr) 
+        
+        # Strip out the padded ghost nodes BEFORE sending to the Actor MLP
+        valid_x = x_nodes[active_mask]
+        valid_embeddings = node_embeddings[active_mask]
+        
+        return valid_x, valid_embeddings
 
 class VectorizedBatchDataset(Dataset):
-    def __init__(self, n_values, n_max=10, batch_size=32768):
-        self.n_max = n_max
+    def __init__(self, n_values, max_n=4, batch_size=32768):
         self.batch_size = batch_size
-        self.target_obs_dim = (4 * 6 * n_max) + n_max
+        
+        # Define the structural capacity of the Graph
+        self.max_landmarks = max_n
+        self.max_other_agents = max_n - 1
+        self.total_nodes = 1 + self.max_landmarks + self.max_other_agents # Equals 2 * max_n
+        
+        # Flattened dimension for the DataLoader (e.g., 8 nodes * 8 features = 64)
+        self.target_obs_dim = self.total_nodes * 8 
         
         self.batches = []
         self.worker_mmaps = {}
         
-        print("Calculating Vectorized Dataset Dimensions...")
+        print(f"Graph Capacity: {self.total_nodes} Total Nodes (1 Ego, {self.max_landmarks} LMs, {self.max_other_agents} Others)")
         for N in n_values:
-            obs_path = f"D:/Experiment/Python/cleanrl/expert_data/obs_N{N}.npy"
-            act_path = f"D:/Experiment/Python/cleanrl/expert_data/actions_N{N}.npy"
+            obs_path = f"D:/Edward/imitationrl/expert_data/obs_N{N}.npy"
+            act_path = f"D:/Edward/imitationrl/expert_data/actions_N{N}.npy"
             
             if not os.path.exists(obs_path) or not os.path.exists(act_path):
                 continue
                 
-            # Calculate how many full batches fit in this N file
             temp_act = np.load(act_path, mmap_mode='r')
             num_batches = len(temp_act) // self.batch_size
             
@@ -98,7 +112,6 @@ class VectorizedBatchDataset(Dataset):
             print(f"  Mapped N={N}: {num_batches} full batches.")
             
     def __len__(self):
-        # Length is now the number of BATCHES, not individual samples
         return len(self.batches)
         
     def __getitem__(self, idx):
@@ -119,71 +132,57 @@ class VectorizedBatchDataset(Dataset):
         
         B = raw_obs_batch.shape[0]
         
-        # 1. VECTORIZED UNPACKING
-        frames_part = raw_obs_batch[:, :-N] 
-        indicator_part = raw_obs_batch[:, -N:]
-        frames = frames_part.reshape(B, 4, 6 * N)
-        
-        # 2. ISOLATE ENTITIES
-        self_data = frames[:, :, 0:4] # (B, 4, 4)
-        landmarks = frames[:, :, 4 : 4+2*N].reshape(B, 4, N, 2)
-        
+        # 1. VECTORIZED UNPACKING 
+        frames = raw_obs_batch[:, :-N] 
+        self_data = frames[:, 0:4] # (B, 4)
+        landmarks = frames[:, 4 : 4+2*N].reshape(B, N, 2)
         other_pos_start = 4 + 2*N
-        other_pos = frames[:, :, other_pos_start : other_pos_start + 2*(N-1)].reshape(B, 4, N-1, 2)
+        other_pos = frames[:, other_pos_start : other_pos_start + 2*(N-1)].reshape(B, N-1, 2)
         
-        other_vel_start = other_pos_start + 2*(N-1)
-        other_vel = frames[:, :, other_vel_start : 6*N].reshape(B, 4, N-1, 2)
+        # 2. DYNAMIC BATCH TAGS (1 for Ego, N-1 for Other Agents)
+        tags = np.random.rand(B, N)
         
-        # 3. ROW-WISE UNIQUE PERMUTATIONS
-        # np.argsort on random matrices generates unique random choices per row instantly
-        landmark_slots = np.argsort(np.random.rand(B, self.n_max), axis=1)[:, :N]
-        agent_slots = np.argsort(np.random.rand(B, self.n_max - 1), axis=1)[:, :N - 1]
+        # 3. PRE-ALLOCATE ZERO-PADDED GRAPH
+        dest_nodes = np.zeros((B, self.total_nodes, 8), dtype=np.float32)
+        b_idx = np.arange(B)[:, None]
         
-        # 4. PRE-ALLOCATE ZERO-PADDED DESTINATIONS
-        dest_landmarks = np.zeros((B, 4, self.n_max, 2), dtype=np.float32)
-        dest_other_pos = np.zeros((B, 4, self.n_max - 1, 2), dtype=np.float32)
-        dest_other_vel = np.zeros((B, 4, self.n_max - 1, 2), dtype=np.float32)
+        # --- Node 0: Ego Agent ---
+        dest_nodes[:, 0, 0:4] = self_data
+        dest_nodes[:, 0, 4] = 1.0  # is_self
+        dest_nodes[:, 0, 6] = 1.0  # is_active
+        dest_nodes[:, 0, 7] = tags[:, 0]
         
-        # 5. ADVANCED INDEXING ASSIGNMENT
-        b_idx = np.arange(B)[:, None, None]
-        f_idx = np.arange(4)[None, :, None]
+        # --- Nodes 1 to Max Landmarks: Shuffled Active Landmarks ---
+        # Pick N random slots out of max_landmarks
+        lm_slots = np.argsort(np.random.rand(B, self.max_landmarks), axis=1)[:, :N]
+        lm_slots += 1 # Shift index to start after Ego
         
-        dest_landmarks[b_idx, f_idx, landmark_slots[:, None, :]] = landmarks
-        dest_other_pos[b_idx, f_idx, agent_slots[:, None, :]] = other_pos
-        dest_other_vel[b_idx, f_idx, agent_slots[:, None, :]] = other_vel
+        dest_nodes[b_idx, lm_slots, 0:2] = landmarks
+        dest_nodes[b_idx, lm_slots, 5] = 1.0  # is_landmark
+        dest_nodes[b_idx, lm_slots, 6] = 1.0  # is_active
         
-        # 6. FLATTEN AND RECOMBINE FRAMES
-        dest_landmarks_flat = dest_landmarks.reshape(B, 4, self.n_max * 2)
-        dest_other_pos_flat = dest_other_pos.reshape(B, 4, (self.n_max - 1) * 2)
-        dest_other_vel_flat = dest_other_vel.reshape(B, 4, (self.n_max - 1) * 2)
+        # --- Remaining Nodes: Shuffled Active Other Agents ---
+        # Pick N-1 random slots out of max_other_agents
+        oa_slots = np.argsort(np.random.rand(B, self.max_other_agents), axis=1)[:, :N-1]
+        oa_slots += (1 + self.max_landmarks) # Shift index to start after Landmarks
         
-        padded_frames = np.concatenate([
-            self_data, dest_landmarks_flat, dest_other_pos_flat, dest_other_vel_flat
-        ], axis=2) 
+        dest_nodes[b_idx, oa_slots, 0:2] = other_pos
+        dest_nodes[b_idx, oa_slots, 6] = 1.0  # is_active
+        dest_nodes[b_idx, oa_slots, 7] = tags[:, 1:]
         
-        # 7. ROW-WISE INDICATOR PERMUTATION
-        original_agent_idx = np.argmax(indicator_part, axis=1)
-        available_id_slots = np.argsort(np.random.rand(B, self.n_max), axis=1)[:, :N]
-        
-        new_agent_idx = available_id_slots[np.arange(B), original_agent_idx]
-        
-        padded_indicator = np.zeros((B, self.n_max), dtype=np.float32)
-        padded_indicator[np.arange(B), new_agent_idx] = 1.0
-        
-        # 8. FINAL STITCH AND INTRA-BATCH SHUFFLE
-        padded_frames_flat = padded_frames.reshape(B, 4 * 6 * self.n_max)
-        final_obs = np.concatenate([padded_frames_flat, padded_indicator], axis=1)
+        # 4. FLATTEN AND SHUFFLE BATCH
+        final_obs = dest_nodes.reshape(B, self.total_nodes * 8)
         
         shuffle_idx = np.random.permutation(B)
         final_obs = final_obs[shuffle_idx]
         action_batch = action_batch[shuffle_idx]
         
-        return torch.Tensor(final_obs), torch.tensor(action_batch, dtype=torch.long)
+        return torch.from_numpy(final_obs).float(), torch.tensor(action_batch, dtype=torch.long)
 
 class StudentGraphActor(nn.Module):
     def __init__(self, n_max, num_actions):
         super().__init__()
-        self.backbone = MultiHeadGATBackbone(n_max=n_max, feature_dim=7)
+        self.backbone = MultiHeadGATBackbone(n_max=n_max, feature_dim=8)
         gat_out_dim = 128
         
         self.actor_mlp = nn.Sequential(
@@ -195,24 +194,26 @@ class StudentGraphActor(nn.Module):
         )
         
     def forward(self, x_flat):
-        valid_x, node_embeddings, _ = self.backbone(x_flat)
+        valid_x, valid_embeddings = self.backbone(x_flat)
         
-        # Boolean Masking to isolate only the agents taking actions
+        # Isolate only the specific agent taking actions
         agent_mask = valid_x[:, 4] > 0.5
-        agent_embeddings = node_embeddings[agent_mask]
+        agent_embeddings = valid_embeddings[agent_mask]
         
         logits = self.actor_mlp(agent_embeddings)
         return logits
 
 def train_behavioral_cloning():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    scaler = torch.cuda.amp.GradScaler()
     
-    n_max = 6
-    batch_size = 32768
-    n_values_to_train = [3, 4]
+    n_max = 7
+    batch_size = 8192
+    n_values_to_train = [7]
     
     # Initialize the Vectorized Dataset
-    full_dataset = VectorizedBatchDataset(n_values=n_values_to_train, n_max=n_max, batch_size=batch_size)
+    full_dataset = VectorizedBatchDataset(n_values=n_values_to_train, max_n=n_max, batch_size=batch_size)
     
     # Split the BATCHES, not the individual items
     total_batches = len(full_dataset)
@@ -225,13 +226,14 @@ def train_behavioral_cloning():
     print(f"Dataset Split: {train_batches} Train Batches | {val_batches} Validation Batches")
     
     # Setting batch_size=None tells the DataLoader that the Dataset is already outputting full batches
-    train_loader = DataLoader(train_dataset, batch_size=None, shuffle=True, num_workers=4, pin_memory=True, worker_init_fn=seed_worker)
-    val_loader = DataLoader(val_dataset, batch_size=None, shuffle=False, num_workers=4, pin_memory=True, worker_init_fn=seed_worker)
+    train_loader = DataLoader(train_dataset, batch_size=None, shuffle=True, num_workers=0, pin_memory=True, worker_init_fn=seed_worker)
+    val_loader = DataLoader(val_dataset, batch_size=None, shuffle=False, num_workers=0, pin_memory=True, worker_init_fn=seed_worker)
     
-    obs_dim = full_dataset.target_obs_dim 
-    num_actions = 5 
+    num_actions = 5
     
-    student = StudentActor(obs_dim, num_actions).to(device)
+    total_nodes = full_dataset.total_nodes
+    
+    student = StudentGraphActor(total_nodes, num_actions).to(device)
     optimizer = optim.Adam(student.parameters(), lr=1e-3)
     criterion = nn.CrossEntropyLoss()
     
@@ -248,11 +250,14 @@ def train_behavioral_cloning():
             batch_obs, batch_actions = batch_obs.to(device), batch_actions.to(device)
             
             optimizer.zero_grad()
-            logits = student(batch_obs)
-            
-            loss = criterion(logits, batch_actions)
-            loss.backward()
-            optimizer.step()
+
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                logits = student(batch_obs)
+                loss = criterion(logits, batch_actions)
+
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
             
             train_loss += loss.item()
             predictions = torch.argmax(logits, dim=-1)
@@ -269,8 +274,9 @@ def train_behavioral_cloning():
             for batch_obs, batch_actions in val_loader:
                 batch_obs, batch_actions = batch_obs.to(device), batch_actions.to(device)
                 
-                logits = student(batch_obs)
-                loss = criterion(logits, batch_actions)
+                with torch.autocast(device_type='cuda', dtype=torch.float16):
+                    logits = student(batch_obs)
+                    loss = criterion(logits, batch_actions)
                 
                 val_loss += loss.item()
                 predictions = torch.argmax(logits, dim=-1)
@@ -284,7 +290,7 @@ def train_behavioral_cloning():
         
         if val_accuracy > best_val_accuracy:
             best_val_accuracy = val_accuracy
-            torch.save(student.state_dict(), f"student_bc_best_nmax{n_max}.pt")
+            torch.save(student.state_dict(), f"gnn_student_bc_best_nmax{n_max}.pt")
             print(f"  -> New best model saved! (Val Acc: {best_val_accuracy:.2f}%)")
 
 if __name__ == "__main__":

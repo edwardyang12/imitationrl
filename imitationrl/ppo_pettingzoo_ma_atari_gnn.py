@@ -276,6 +276,7 @@ class GraphObservationWrapper(BaseParallelWrapper):
         oa_pos_end = oa_pos_start + 2 * (N - 1)
         oa_rel_pos = raw_obs[oa_pos_start:oa_pos_end].reshape(N - 1, 2)
         
+        # velocity doesn't exist for simple spread so it is all zeros for now
         oa_vel_start = oa_pos_end
         oa_vel_end = oa_vel_start + 2 * (N - 1)
         oa_vel = raw_obs[oa_vel_start:oa_vel_end].reshape(N - 1, 2)

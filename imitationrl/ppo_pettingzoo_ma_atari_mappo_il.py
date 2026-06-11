@@ -527,7 +527,7 @@ if __name__ == "__main__":
 
     agent = Agent(envs, num_agents_per_game, state_dim=state_dim).to(device)
    
-    agent.load_bc_weights("expert_data/student_bc_best_3.pt")
+    agent.load_bc_weights("student_bc_best.pt")
 
     # behavorial clone optimizer
     optimizer = optim.Adam([
