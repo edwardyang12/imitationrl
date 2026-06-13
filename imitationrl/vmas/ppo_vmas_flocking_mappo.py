@@ -960,8 +960,6 @@ if __name__ == "__main__":
             stacked_obs = torch.stack(vmas_obs, dim=1)
             next_obs = torch.cat([stacked_obs, indicators], dim=-1).reshape(num_agents_per_game, -1).to(device)
 
-    # 5. Clean up and save
-    eval_env.close()
     
     os.makedirs(f"videos/{run_name}", exist_ok=True)
     video_path = f"videos/{run_name}/FINAL_LONG_EVAL_{eval_max_cycles}_cycles.mp4"
