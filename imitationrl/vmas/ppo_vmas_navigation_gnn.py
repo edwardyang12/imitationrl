@@ -14,7 +14,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch_geometric.nn import GATConv, global_mean_pool, GATv2Conv
+from torch_geometric.nn import GATConv, global_mean_pool, GATv2Conv, global_max_pool
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 from vmas.scenarios.navigation import Scenario as BaseNavigation
@@ -159,44 +159,54 @@ class MultiHeadGATBackbone(nn.Module):
         self.n_max = n_max
         self.feature_dim = feature_dim
         
-        self.gat1 = GATConv(feature_dim, hidden_dim, heads=heads, concat=True, edge_dim=1)
-        self.gat2 = GATConv(hidden_dim * heads, hidden_dim, heads=heads, concat=True, edge_dim=1)
-        self.gat3 = GATConv(hidden_dim * heads, out_dim, heads=heads, concat=False, edge_dim=1)
+        # Edge dim is now 3: [delta_x, delta_y, distance]
+        self.gat1 = GATConv(feature_dim, hidden_dim, heads=heads, concat=True, edge_dim=3)
+        self.gat2 = GATConv(hidden_dim * heads, hidden_dim, heads=heads, concat=True, edge_dim=3)
+        self.gat3 = GATConv(hidden_dim * heads, out_dim, heads=heads, concat=False, edge_dim=3)
         
-        # ADD: Linear projection to match dimensions for the first skip connection
         self.skip_proj = nn.Linear(feature_dim, hidden_dim * heads)
         self.elu = nn.ELU()
 
-    def _build_dynamic_graph(self, x_flat):
+    def _build_fc_dynamic_graph(self, x_flat):
         B = x_flat.shape[0]
         device = x_flat.device
         
         x_padded = x_flat.view(B, self.n_max, self.feature_dim)
-        active_mask = x_padded[:, :, 6] > 0.5
+        active_mask = x_padded[:, :, 6] > 0.5  # Assuming index 6 is the active flag
         valid_x = x_padded[active_mask] 
         
         batch_indices = torch.arange(B, device=device).view(-1, 1).expand(B, self.n_max)
         valid_batch = batch_indices[active_mask] 
         
-        edge_index = radius_graph(valid_x[:, :2], r=1.0, batch=valid_batch, loop=False)
+        # 1. Create Fully Connected Edge Index per environment
+        # Broadcast comparison to find nodes belonging to the same batch
+        is_same_batch = valid_batch.unsqueeze(1) == valid_batch.unsqueeze(0)
         
-        # --- NEW PHYSICS EXTRACTION ---
+        # Optional: Remove self-loops (GAT usually handles them, but good for clean relative math)
+        is_same_batch.fill_diagonal_(False)
+        edge_index = is_same_batch.nonzero(as_tuple=False).t().contiguous()
+        
+        # 2. Extract Relative Edge Attributes [delta_x, delta_y, distance]
         row, col = edge_index
-        # valid_x[:, :2] holds the exact [rel_x, rel_y] for every node.
-        # We calculate the Euclidean distance between the connected pairs.
-        diff = valid_x[row, :2] - valid_x[col, :2]
-        # Add 1e-8 inside the square root to prevent NaN gradients during perfect collisions
-        distances = torch.sqrt((diff ** 2).sum(dim=-1, keepdim=True) + 1e-8)
         
-        return valid_x, edge_index, distances, valid_batch
+        # Assuming valid_x[:, :2] holds the actual positions during graph construction
+        # NOTE: If valid_x[:, :2] is already a relative vector to the ego, 
+        # you must reconstruct the absolute positions temporarily just to build the graph, 
+        # or structure your VMAS wrapper to pass raw positions in just for edge calculation.
+        
+        rel_pos = valid_x[row, :2] - valid_x[col, :2]
+        distances = torch.sqrt((rel_pos ** 2).sum(dim=-1, keepdim=True) + 1e-8)
+        
+        # Edge attributes: [dx, dy, distance]
+        edge_attr = torch.cat([rel_pos, distances], dim=-1)
+        
+        return valid_x, edge_index, edge_attr, valid_batch
 
     def forward(self, x_flat):
-        # Unpack the distances as edge_attr
-        valid_x, edge_index, edge_attr, valid_batch = self._build_dynamic_graph(x_flat)
+        valid_x, edge_index, edge_attr, valid_batch = self._build_fc_dynamic_graph(x_flat)
         
         res = self.skip_proj(valid_x)
         
-        # Feed the physics directly into the dynamic attention heads
         h = self.gat1(valid_x, edge_index, edge_attr=edge_attr)
         h = self.elu(h) + res 
         
@@ -274,34 +284,44 @@ class GraphAgent(nn.Module):
         self.actor_logstd = nn.Parameter(torch.zeros(1, self.action_dim))
         
         # FIX: Critic only sees the invariant graph (128) + density scalar (1)
-        critic_in_dim = gat_out_dim + 1
+        critic_in_dim = (gat_out_dim * 3) + 1
         self.critic_mlp = nn.Sequential(
             layer_init(nn.Linear(critic_in_dim, 256)),
             nn.LayerNorm(256), nn.ReLU(),
             layer_init(nn.Linear(256, 128)),
             nn.LayerNorm(128), nn.ReLU(),
         )
-        self.critic_popart = PopArt(128, self.num_agents)
+        self.critic_popart = PopArt(128, 1)
         self.obs_normalizer = GraphObservationNormalizer(n_max=n_max, feature_dim=8, continuous_dim=4)
 
     def get_value(self, x_flat, denormalize=False):
         x_norm = self.obs_normalizer.normalize(x_flat)
-        _, node_embeddings, valid_batch = self.backbone(x_norm)
+        valid_x, node_embeddings, valid_batch = self.backbone(x_norm)
         
-        pooled_graph = global_mean_pool(node_embeddings, valid_batch)
-        pooled_graph = pooled_graph.view(-1, self.num_agents, pooled_graph.shape[-1]).mean(dim=1)
+        # 1. Global Context (Poolings)
+        pooled_mean = global_mean_pool(node_embeddings, valid_batch)
+        pooled_max = global_max_pool(node_embeddings, valid_batch)
 
-        # Calculate network density (Mass)
-        active_counts = torch.bincount(valid_batch, minlength=x_flat.shape[0])
-        density_scalar_per_agent = (active_counts.float() / self.n_max).view(-1, 1)
-        density_scalar = density_scalar_per_agent.view(-1, self.num_agents, 1).mean(dim=1)
+        # 2. Local Ego Context
+        agent_mask = valid_x[:, 4] > 0.5 # Assuming index 4 is 'is_self' or 'is_agent'
+        ego_embeddings = node_embeddings[agent_mask]
         
-        # Critic Input
-        critic_input = torch.cat([pooled_graph, density_scalar], dim=-1)
+        # 3. Network Density
+        active_counts = torch.bincount(valid_batch, minlength=x_flat.shape[0])
+        density_scalar_expanded = (active_counts.float() / self.n_max).view(-1, 1)
+
+        # 4. Concatenate for Ego-Aware God-View
+        critic_input = torch.cat([
+            pooled_mean, 
+            pooled_max, 
+            ego_embeddings, 
+            density_scalar_expanded
+        ], dim=-1)
         
         values = self.critic_popart(self.critic_mlp(critic_input))
         if denormalize:
             values = self.critic_popart.denormalize(values)
+            
         return values.view(-1, 1)
 
     def get_action_and_value(self, x_flat, action=None, denormalize=False):
@@ -325,14 +345,18 @@ class GraphAgent(nn.Module):
         if action is None:
             action = probs.sample()
             
-        pooled_graph = global_mean_pool(node_embeddings, valid_batch)
-        pooled_graph = pooled_graph.view(-1, self.num_agents, pooled_graph.shape[-1]).mean(dim=1)
+        pooled_mean = global_mean_pool(node_embeddings, valid_batch)
+        pooled_max = global_max_pool(node_embeddings, valid_batch)
 
         active_counts = torch.bincount(valid_batch, minlength=x_flat.shape[0])
-        density_scalar_per_agent = (active_counts.float() / self.n_max).view(-1, 1)
-        density_scalar = density_scalar_per_agent.view(-1, self.num_agents, 1).mean(dim=1)
+        density_scalar_expanded = (active_counts.float() / self.n_max).view(-1, 1)
         
-        critic_input = torch.cat([pooled_graph, density_scalar], dim=-1)
+        critic_input = torch.cat([
+            pooled_mean, 
+            pooled_max, 
+            agent_embeddings, 
+            density_scalar_expanded
+        ], dim=-1)
         
         values = self.critic_popart(self.critic_mlp(critic_input))
         if denormalize:
@@ -433,7 +457,27 @@ class VMASVectorizedEnv:
         rewards = torch.stack(vmas_rews, dim=1).reshape(-1)
         self.episode_returns += rewards
 
-        # ... (Keep your video recording code here) ...
+        # --- RESTORED VIDEO LOGIC ---
+        if self.record_this_episode:
+            frames = []
+            num_to_render = min(9, self.num_games)
+            for i in range(num_to_render):
+                frame = self.env.render(mode="rgb_array", env_index=i, agent_index_focus=None)
+                if isinstance(frame, list): frame = frame[0]
+                frames.append(frame)
+
+            n = len(frames)
+            cols = math.ceil(math.sqrt(n))
+            rows = math.ceil(n / cols)
+            H, W, C = frames[0].shape
+            blank = np.zeros((H, W, C), dtype=np.uint8)
+            
+            while len(frames) < rows * cols:
+                frames.append(blank)
+                
+            grid = np.vstack([np.hstack(frames[i*cols:(i+1)*cols]) for i in range(rows)])
+            self.video_frames.append(grid)
+        # ----------------------------
 
         stacked_obs = torch.stack(vmas_obs, dim=1)
         final_obs = self._apply_graph_formatting(stacked_obs)
@@ -447,7 +491,18 @@ class VMASVectorizedEnv:
             self.episode_count += 1
             info["terminal_raw_obs"] = info["raw_obs"].clone()
             
-            # ... (Keep your video save code here) ...
+            # --- RESTORED VIDEO SAVE LOGIC ---
+            if self.record_this_episode and self.video_frames:
+                os.makedirs(f"videos/{self.run_name}", exist_ok=True)
+                file_path = f"videos/{self.run_name}/rl-video-update_{self.update_step}-ep_{self.episode_count}.mp4"
+                imageio.mimsave(file_path, self.video_frames, fps=15)
+                self.video_frames = []
+            
+            if self.args.capture_video and self.episode_count % 100 == 0:
+                self.record_this_episode = True
+            else:
+                self.record_this_episode = False
+            # ---------------------------------
 
             info["episode"] = {
                 "r": self.episode_returns.clone(),
@@ -537,7 +592,7 @@ if __name__ == "__main__":
         # Fallback for Atari or environments without a God-view state
         state_dim = num_agents_per_game * np.array(envs.single_observation_space.shape).prod()
 
-    max_eval_agents = 10
+    max_eval_agents = 3
     
     # n_max = max_eval_agents + max_eval_landmarks
     n_max = max_eval_agents * 2
@@ -778,7 +833,7 @@ if __name__ == "__main__":
 
             # 2. UPDATE STATS NOW (Before SGD)1
             # This aligns the normalizers with the data we just collected
-            agent.critic_popart.update(b_returns.view(-1, agent.num_agents))
+            agent.critic_popart.update(b_returns.view(-1, 1))
 
             agent.obs_normalizer.update(b_obs)
 
@@ -863,12 +918,8 @@ if __name__ == "__main__":
                 newvalue = newvalue.view(-1)
 
                 # Reshape to align with PopArt agent-specific stats
-                mb_returns_reshaped = b_returns[mb_inds].view(-1, agent.num_agents)
-                mb_values_reshaped = b_values[mb_inds].view(-1, agent.num_agents)
-                
-                # Normalize targets correctly using the per-agent ID statistics
-                normalized_returns = agent.critic_popart.normalize(mb_returns_reshaped).reshape(-1)
-                normalized_values = agent.critic_popart.normalize(mb_values_reshaped).reshape(-1)
+                normalized_returns = agent.critic_popart.normalize(b_returns[mb_inds].view(-1, 1)).reshape(-1)
+                normalized_values = agent.critic_popart.normalize(b_values[mb_inds].view(-1, 1)).reshape(-1)
 
                 # Standard individual value loss
                 v_loss_unclipped = (newvalue - normalized_returns) ** 2

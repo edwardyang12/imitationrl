@@ -35,4 +35,4 @@ def convert_pkl_to_npy(n_values):
         print(f"  Saved N={N}: Obs shape {stacked_obs.shape}, Actions shape {stacked_actions.shape}")
 
 if __name__ == "__main__":
-    convert_pkl_to_npy(n_values=[6])
+    convert_pkl_to_npy(n_values=[9])

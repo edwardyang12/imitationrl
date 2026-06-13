@@ -38,7 +38,7 @@ def harvest_dataset(N, num_trajectories=500000, chunk_size=100000):
     # 2. Load Oracle
     state_dim = (num_agents_per_game * np.array(envs.single_observation_space.shape).prod()) + args.num_landmarks
     oracle = Agent(envs, num_agents_per_game, state_dim).to(device)
-    oracle.load_state_dict(torch.load(f"models/simple_spread_v3__ppo_pettingzoo_ma_atari_mappo__1__1780798242/1139_model.pth",
+    oracle.load_state_dict(torch.load(f"models/simple_spread_v3__ppo_pettingzoo_ma_atari_mappo__1__1780740016/1265_model.pth",
                                       map_location=device), strict=True) # Ensure path points to your saved model
     oracle.eval() # Lock batchnorm/dropout
 
@@ -159,5 +159,5 @@ def harvest_dataset(N, num_trajectories=500000, chunk_size=100000):
 
 if __name__ == "__main__":
     # Ensure you update the model path inside the function before running
-    for N in [5]:
+    for N in [9]:
         harvest_dataset(N, num_trajectories=500000, chunk_size=200000)
