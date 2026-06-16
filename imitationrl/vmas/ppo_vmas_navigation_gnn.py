@@ -262,7 +262,7 @@ class GraphAgent(nn.Module):
         self.n_max = n_max
         self.action_dim = np.prod(envs.single_action_space.shape)
         
-        self.backbone = MultiHeadGATBackbone(n_max=n_max, feature_dim=8)
+        self.backbone = MultiHeadGATBackbone(n_max=n_max, feature_dim=9)
         gat_out_dim = 128
         
         self.actor_mlp = nn.Sequential(
@@ -281,7 +281,7 @@ class GraphAgent(nn.Module):
         )
 
         # The Variance Head
-        self.actor_logstd = nn.Parameter(torch.zeros(1, self.action_dim))
+        self.actor_logstd = nn.Parameter(torch.full((1, self.action_dim), -0.5))
         
         # FIX: Critic only sees the invariant graph (128) + density scalar (1)
         critic_in_dim = (gat_out_dim * 3) + 1
@@ -292,7 +292,7 @@ class GraphAgent(nn.Module):
             nn.LayerNorm(128), nn.ReLU(),
         )
         self.critic_popart = PopArt(128, 1)
-        self.obs_normalizer = GraphObservationNormalizer(n_max=n_max, feature_dim=8, continuous_dim=4)
+        self.obs_normalizer = GraphObservationNormalizer(n_max=n_max, feature_dim=9, continuous_dim=4)
 
     def get_value(self, x_flat, denormalize=False):
         x_norm = self.obs_normalizer.normalize(x_flat)
@@ -388,7 +388,7 @@ class VMASVectorizedEnv:
         
         self.single_action_space = self.env.action_space[0]
         self.n_max = self.num_agents * 2
-        self.feature_dim = 8
+        self.feature_dim = 9
         
         target_dim = self.n_max * self.feature_dim
         self.single_observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(target_dim,))
@@ -403,31 +403,48 @@ class VMASVectorizedEnv:
         B = self.num_games
         N = self.num_agents
         
-        # [rel_x, rel_y, vel_x, vel_y, is_self, is_landmark, is_active, RANDOM_TAG]
+        # We need N agents + N goals = 2N nodes
+        # Make sure self.n_max in VMASVectorizedEnv.__init__ is set to args.num_landmarks * 2
         graph = torch.zeros((B, N, self.n_max, self.feature_dim), device=self.device)
 
-        # 0. Ego Node
-        graph[:, :, 0, 0:2] = 0.0 # Ego is always center
-        graph[:, :, 0, 2:4] = stacked_vmas_obs[:, :, 2:4] # Ego Velocity
-        graph[:, :, 0, 4] = 1.0 # is_self
-        graph[:, :, 0, 6] = 1.0 # is_active
-        graph[:, :, 0, 7] = self.episode_tags
-
-        # 1. Goal Node (Invert vector to get Goal relative to Ego)
-        graph[:, :, 1, 0:2] = -stacked_vmas_obs[:, :, 4:6]
-        graph[:, :, 1, 5] = 1.0 # is_landmark
-        graph[:, :, 1, 6] = 1.0 # is_active
-
-        # 2. Teammate Nodes
-        teammate_rel_pos = stacked_vmas_obs[:, :, 6:].view(B, N, N-1, 2)
-        graph[:, :, 2:N+1, 0:2] = teammate_rel_pos
-        graph[:, :, 2:N+1, 6] = 1.0 # is_active
+        # 1. Extract raw absolute positions and velocities
+        abs_pos = stacked_vmas_obs[:, :, 0:2] # Shape: (B, N, 2)
+        vel = stacked_vmas_obs[:, :, 2:4]     # Shape: (B, N, 2)
+        ego_to_goal = stacked_vmas_obs[:, :, 4:6] # Shape: (B, N, 2)
         
-        # Fetch tags for the teammates (excluding Ego)
-        expanded_tags = self.episode_tags.unsqueeze(1).expand(B, N, N)
-        mask = ~torch.eye(N, dtype=torch.bool, device=self.device).unsqueeze(0).expand(B, -1, -1)
-        teammate_tags = expanded_tags[mask].view(B, N, N-1)
-        graph[:, :, 2:N+1, 7] = teammate_tags
+        # 2. Reconstruct absolute positions of ALL goals
+        # Since ego_to_goal is (Agent Pos - Goal Pos), Goal Pos = Agent Pos - ego_to_goal
+        goal_abs = abs_pos - ego_to_goal 
+
+        # 3. Create broadcastable tensors centered around each Ego agent
+        ego_pos = abs_pos.unsqueeze(2) # Shape: (B, N, 1, 2)
+        
+        all_agents_rel_pos = abs_pos.unsqueeze(1) - ego_pos # Shape: (B, N, N, 2)
+        all_goals_rel_pos = goal_abs.unsqueeze(1) - ego_pos # Shape: (B, N, N, 2)
+        
+        all_agents_vel = vel.unsqueeze(1).expand(B, N, N, 2)
+        all_tags = self.episode_tags.unsqueeze(1).expand(B, N, N)
+        
+        is_self_matrix = torch.eye(N, device=self.device).view(1, N, N)
+
+        # --- AGENT NODES (Indices 0 to N-1) ---
+        graph[:, :, 0:N, 0:2] = all_agents_rel_pos
+        graph[:, :, 0:N, 2:4] = all_agents_vel * is_self_matrix.unsqueeze(-1)
+        graph[:, :, 0:N, 4] = is_self_matrix 
+        graph[:, :, 0:N, 6] = 1.0 
+        graph[:, :, 0:N, 7] = all_tags 
+        graph[:, :, 0:N, 8] = 0.0 # Agents are not goals
+
+        # --- GOAL NODES (Indices N to 2N-1) ---
+        graph[:, :, N:2*N, 0:2] = all_goals_rel_pos
+        graph[:, :, N:2*N, 2:4] = 0.0 
+        graph[:, :, N:2*N, 5] = 1.0 
+        graph[:, :, N:2*N, 6] = 1.0 
+        graph[:, :, N:2*N, 7] = all_tags 
+        
+        # NEW: The deterministic routing anchor. 
+        # Goal i belongs strictly to Ego i.
+        graph[:, :, N:2*N, 8] = is_self_matrix 
 
         return graph.reshape(self.num_envs, -1)
 
@@ -592,7 +609,7 @@ if __name__ == "__main__":
         # Fallback for Atari or environments without a God-view state
         state_dim = num_agents_per_game * np.array(envs.single_observation_space.shape).prod()
 
-    max_eval_agents = 3
+    max_eval_agents = envs.num_agents
     
     # n_max = max_eval_agents + max_eval_landmarks
     n_max = max_eval_agents * 2
@@ -840,12 +857,22 @@ if __name__ == "__main__":
             # 3. Second Pass: RE-CALCULATE Values and Advantages with NEW stats
             # This is the crucial step you were missing. 
             # It ensures 'values' and 'returns' are in the same normalized space for SGD.
-            new_values = agent.get_value(
-                obs.view(-1, obs.shape[-1]),  # <- Use obs.shape[-1] instead of agent.obs_dim
-                denormalize=True
-            ).view(args.num_steps, actual_num_envs)
+            # new_values = agent.get_value(
+            #     obs.view(-1, obs.shape[-1]),  # <- Use obs.shape[-1] instead of agent.obs_dim
+            #     denormalize=True
+            # ).view(args.num_steps, actual_num_envs)
+
+            b_obs_flat = obs.view(-1, obs.shape[-1])
+            new_values_flat = torch.zeros(b_obs_flat.shape[0], device=device)
             
-            new_next_value = agent.get_value(boot_obs,  denormalize=True).flatten()
+            # Process the massive batch in safe chunks to protect GAT memory
+            chunk_size = args.batch_size // args.num_minibatches 
+            for start in range(0, b_obs_flat.shape[0], chunk_size):
+                end = start + chunk_size
+                new_values_flat[start:end] = agent.get_value(b_obs_flat[start:end], denormalize=True).flatten()
+                
+            new_values = new_values_flat.view(args.num_steps, actual_num_envs)
+            new_next_value = agent.get_value(boot_obs, denormalize=True).flatten()
             
             # Final GAE calculation for the actual SGD update
             advantages = torch.zeros_like(rewards).to(device)
