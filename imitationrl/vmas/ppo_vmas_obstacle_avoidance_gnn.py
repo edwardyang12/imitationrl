@@ -20,6 +20,8 @@ from torch.utils.tensorboard import SummaryWriter
 from vmas.scenarios.navigation import Scenario as BaseNavigation
 from torch_geometric.nn import radius_graph
 from torch_geometric.nn import GCNConv
+from vmas.simulator.core import Sphere, Landmark
+from vmas.scenarios.navigation import Scenario as BaseNavigation
 
 def parse_args():
     # fmt: off
@@ -56,7 +58,7 @@ def parse_args():
         help="Toggle learning rate annealing for policy and value networks")
     parser.add_argument("--anneal-ent", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=False,
         help="Toggle learning rate annealing for policy and value networks")
-    parser.add_argument("--gamma", type=float, default=0.995,
+    parser.add_argument("--gamma", type=float, default=0.99,
         help="the discount factor gamma")
     parser.add_argument("--gae-lambda", type=float, default=0.95,
         help="the lambda for the general advantage estimation")
@@ -91,19 +93,101 @@ def parse_args():
     # fmt: on
     return args
 
-class NavigationCleanObs(BaseNavigation):
-    def observation(self, agent):
-        # 1. Base kinematics (Ego Agent)
-        obs = [agent.state.pos, agent.state.vel]
+class ObstacleAvoidanceScenario(BaseScenario):
+    def make_world(self, batch_dim: int, device: torch.device, **kwargs):
+        self.random = kwargs.get("random", False)
+        self.n_agents = kwargs.get("n_agents", 5) # Default to your args.num_landmarks
+        self.n_obstacles = 1
+        self.desired_distance = 0.15
+        self.min_collision_distance_reward = 1.0
+
+        world = World(batch_dim, device)
+
+        # 1. Single Shared Goal
+        self.goal = Landmark(name="goal", collide=False, color=Color.BLACK)
+        world.add_landmark(self.goal)
+
+        # 2. Obstacles
+        self.obstacles = []
+        for i in range(self.n_obstacles):
+            obstacle = Landmark(name=f"obstacle_{i}", collide=True, color=Color.RED)
+            self.obstacles.append(obstacle)
+            world.add_landmark(obstacle)
         
-        # 2. Assigned Goal ONLY (Removes the distractors)
-        obs.append(agent.state.pos - agent.goal.state.pos)
+        # 3. Agents
+        for i in range(self.n_agents):
+            agent = Agent(name=f"agent{i}", collide=True, color=Color.GREEN)
+            agent.goal = self.goal # Assign the shared goal
+            world.add_agent(agent)
+
+        return world
+    
+    def generate_grid(self, center: torch.Tensor, num_points: int, distance: float):
+        x_center, y_center = center[0].item(), center[1].item()
+        num_cols = math.ceil(math.sqrt(num_points))
+        num_rows = math.ceil(num_points / num_cols)
+
+        grid = []
+        for i in range(num_rows):
+            for j in range(num_cols):
+                x = x_center + (j - (num_cols - 1) / 2) * distance
+                y = y_center + (i - (num_rows - 1) / 2) * distance
+                grid.append([x, y])
+                if len(grid) >= num_points:
+                    break
+            if len(grid) >= num_points:
+                break
+        
+        # Ensure the generated grid is on the correct GPU device
+        return torch.tensor(grid, device=center.device)
+
+    def reset_world_at(self, env_index: int = None):
+        # Match their exact hardcoded positions
+        self.goal.set_pos(torch.tensor([-0.8, 0.8], device=self.world.device), batch_index=env_index)
+        self.obstacles[0].set_pos(torch.tensor([-0.1, 0.1], device=self.world.device), batch_index=env_index)
+
+        delta = torch.normal(mean=0.0, std=0.1, size=(2,), device=self.world.device) if self.random else torch.tensor([0.0, 0.0], device=self.world.device)
+        central_position = torch.tensor([0.6, -0.6], device=self.world.device) + delta
+
+        all_agents_positions = self.generate_grid(central_position, self.n_agents, self.desired_distance)
+
+        for i, agent in enumerate(self.world.agents):
+            agent.set_pos(all_agents_positions[i], batch_index=env_index)
+
+    def reward(self, agent: Agent):
+        return self.distance_to_goal_reward(agent) + 2.5 * self.obstacle_avoidance_reward(agent)
+    
+    def distance_to_goal_reward(self, agent: Agent):
+        agent.distance_to_goal = torch.linalg.vector_norm(
+            agent.state.pos - agent.goal.state.pos,
+            dim=-1,
+        )
+        return -agent.distance_to_goal
+
+    def obstacle_avoidance_reward(self, agent: Agent):
+        obs_rew = torch.zeros(self.world.batch_dim, device=self.world.device)
+        # Vectorized equivalent of their target logic
+        for i in range(1, self.n_obstacles + 1):
+            obstacle = self.world.landmarks[i]
+            dist = self.world.get_distance(agent, obstacle)
             
-        # 3. Relative Teammates (Position ONLY, respecting original info bounds)
+            # Apply penalty only to environments where distance <= 1.0
+            penalty_mask = dist <= self.min_collision_distance_reward
+            obs_rew[penalty_mask] -= (self.min_collision_distance_reward - dist[penalty_mask])
+            
+        return obs_rew
+
+    def observation(self, agent: Agent):
+        # Outputs standard relative vectors so your GNN formatting continues to work
+        obs = [agent.state.pos, agent.state.vel, agent.state.pos - agent.goal.state.pos]
+        
         for a in self.world.agents:
             if a != agent:
                 obs.append(a.state.pos - agent.state.pos)
                 
+        for o in self.obstacles:
+            obs.append(o.state.pos - agent.state.pos)
+            
         return torch.cat(obs, dim=-1)
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -131,12 +215,8 @@ class GraphObservationNormalizer(nn.Module):
         valid_x = x_reshaped[active_mask] 
         continuous_x = valid_x[:, :self.continuous_dim] 
         
-        # FIX: Clamp extreme outliers so runaway agents don't destroy the variance.
-        # A distance of 10.0 is well beyond the 5x5 arena, making it a safe cutoff.
-        clamped_x = torch.clamp(continuous_x, min=-10.0, max=10.0)
-        
-        # RMS Update: Variance around zero using the CLAMPED values
-        batch_var = (clamped_x ** 2).mean(dim=0)
+        # RMS Update: Variance around zero
+        batch_var = (continuous_x ** 2).mean(dim=0)
         batch_count = continuous_x.shape[0]
 
         delta_var = batch_var - self.running_var
@@ -441,25 +521,27 @@ class VMASVectorizedEnv:
         self.update_step = update_step
         
         self.env = vmas.make_env(
-            scenario=NavigationCleanObs() if args.env_id == "navigation" else args.env_id,
+            scenario=ObstacleAvoidanceScenario() if args.env_id == "avoidance" else args.env_id,
             num_envs=self.num_games,
             device=self.device,
             continuous_actions=True,
-            n_agents=self.num_agents,
+            n_agents=args.num_landmarks,
             collisions=True,
             observe_all_goals=False,
             seed=seed,
             dict_spaces=False,
-            world_spawning_x=2.5,
-            world_spawning_y=2.5,
-            enforce_bounds=True
+            world_spawning_x=2,
+            world_spawning_y=2
         )
         
         self.single_action_space = self.env.action_space[0]
         self.n_max = args.n_max
         self.feature_dim = 9
         
-        target_dim = self.n_max * self.feature_dim * 2
+        # K Agents + 1 Goal + K Obstacles = (K * 2) + 1
+        num_graph_nodes = (self.n_max * 2) + 1 
+        target_dim = num_graph_nodes * self.feature_dim 
+        
         self.single_observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(target_dim,))
         
         self.episode_returns = torch.zeros(self.num_envs, device=self.device)
@@ -471,75 +553,89 @@ class VMASVectorizedEnv:
     def _apply_graph_formatting(self, stacked_vmas_obs):
         B = self.num_games
         N = self.num_agents
-        K = self.args.n_max # The fixed number of agents (and landmarks) to observe
+        K = self.args.n_max 
         
-        # 1. Extract raw absolute positions and velocities
-        abs_pos = stacked_vmas_obs[:, :, 0:2] # (B, N, 2)
-        vel = stacked_vmas_obs[:, :, 2:4]     # (B, N, 2)
-        ego_to_goal = stacked_vmas_obs[:, :, 4:6] # (B, N, 2)
+        # 1. Dynamically determine the number of obstacles
+        # Raw obs = 2(pos) + 2(vel) + 2(goal) + (N-1)*2(agents) + O*2(obstacles)
+        # Total = 4 + 2N + 2O
+        obs_dim = stacked_vmas_obs.shape[-1]
+        num_obstacles = (obs_dim - (2 * N) - 4) // 2
         
-        # 2. Reconstruct absolute positions of ALL goals
-        goal_abs = abs_pos - ego_to_goal 
+        # 2. Extract specific segments
+        abs_pos = stacked_vmas_obs[:, :, 0:2] 
+        vel = stacked_vmas_obs[:, :, 2:4]     
+        raw_ego_to_goal = stacked_vmas_obs[:, :, 4:6] 
         
-        # 3. Calculate Relative Positions independently
-        ego_pos = abs_pos.unsqueeze(2) # (B, N, 1, 2)
-        rel_agents = abs_pos.unsqueeze(1) - ego_pos # (B, N, N, 2)
-        rel_goals = goal_abs.unsqueeze(1) - ego_pos # (B, N, N, 2)
+        # 3. Agents: Relative Positions & KNN
+        ego_pos = abs_pos.unsqueeze(2) 
+        rel_agents = abs_pos.unsqueeze(1) - ego_pos 
+        dist_agents = torch.norm(rel_agents, dim=-1) 
         
-        # 4. Calculate Distances
-        dist_agents = torch.norm(rel_agents, dim=-1) # (B, N, N)
-        dist_goals = torch.norm(rel_goals, dim=-1) # (B, N, N)
-        
-        # 5. The "Ego & Target" Override
-        # Force Ego and Target Landmark distances to -infinity so they are always selected
+        # Ensure ego is always index 0 by setting distance to -infinity
         batch_idx = torch.arange(B, device=self.device).view(B, 1).expand(B, N)
         ego_idx = torch.arange(N, device=self.device).view(1, N).expand(B, N)
-        
         dist_agents[batch_idx, ego_idx, ego_idx] = -1e9
-        dist_goals[batch_idx, ego_idx, ego_idx] = -1e9 # Ego's goal matches its index
         
-        # 6. Execute Independent K-Nearest Neighbors
-        actual_k = min(K, N) # Prevent crash if env N is smaller than K
-        _, topk_agents_idx = torch.topk(dist_agents, k=actual_k, dim=-1, largest=False) # (B, N, K)
-        _, topk_goals_idx = torch.topk(dist_goals, k=actual_k, dim=-1, largest=False) # (B, N, K)
+        actual_k_agents = min(K, N)
+        _, topk_agents_idx = torch.topk(dist_agents, k=actual_k_agents, dim=-1, largest=False) 
         
-        # 7. Build the Dense Feature Matrices for ALL N entities
-        is_self_matrix = torch.eye(N, device=self.device).view(1, N, N)
-        
+        # 4. Obstacles: Relative Positions & KNN
+        if num_obstacles > 0:
+            rel_obstacles = stacked_vmas_obs[:, :, -2 * num_obstacles:].view(B, N, num_obstacles, 2)
+            dist_obstacles = torch.norm(rel_obstacles, dim=-1)
+            actual_k_obs = min(K, num_obstacles)
+            _, topk_obstacles_idx = torch.topk(dist_obstacles, k=actual_k_obs, dim=-1, largest=False)
+        else:
+            actual_k_obs = 0
+            rel_obstacles = torch.zeros((B, N, 0, 2), device=self.device)
+            topk_obstacles_idx = torch.zeros((B, N, 0), dtype=torch.long, device=self.device)
+
+        # 5. Build Matrices
         # --- Agents Matrix ---
         graph_agents = torch.zeros((B, N, N, self.feature_dim), device=self.device)
         graph_agents[..., 0:2] = rel_agents
-        graph_agents[..., 4] = is_self_matrix # is_self
-        graph_agents[..., 6] = 1.0 # is_active
+        graph_agents[..., 4] = torch.eye(N, device=self.device).view(1, N, N) # is_self flag
+        graph_agents[..., 6] = 1.0 # active
         graph_agents[..., 7] = self.episode_tags.unsqueeze(1).expand(B, N, N)
-        graph_agents[..., 8] = 0.0 # is_my_goal
         
-        # --- Goals Matrix ---
-        graph_goals = torch.zeros((B, N, N, self.feature_dim), device=self.device)
-        graph_goals[..., 0:2] = rel_goals
-        graph_goals[..., 5] = 1.0 # is_landmark
-        graph_goals[..., 6] = 1.0 # is_active
-        graph_goals[..., 7] = self.episode_tags.unsqueeze(1).expand(B, N, N)
-        graph_goals[..., 8] = is_self_matrix # is_my_goal
-
-        # 8. Gather Features
         exp_agents_idx = topk_agents_idx.unsqueeze(-1).expand(-1, -1, -1, self.feature_dim)
         gathered_agents = torch.gather(graph_agents, dim=2, index=exp_agents_idx)
+        gathered_agents[:, :, 0, 2:4] = vel # Inject velocity specifically into Ego node
         
-        exp_goals_idx = topk_goals_idx.unsqueeze(-1).expand(-1, -1, -1, self.feature_dim)
-        gathered_goals = torch.gather(graph_goals, dim=2, index=exp_goals_idx)
+        # Pad if there are fewer agents than the context window size
+        if actual_k_agents < K:
+            padding = torch.zeros((B, N, K - actual_k_agents, self.feature_dim), device=self.device)
+            gathered_agents = torch.cat([gathered_agents, padding], dim=2)
+
+        # --- Goal Matrix (Exactly 1 Node) ---
+        # Note: raw_ego_to_goal from VMAS is (pos - goal_pos). 
+        # We invert it to (goal_pos - pos) so the network sees "Vector FROM Ego TO Target".
+        gathered_goal = torch.zeros((B, N, 1, self.feature_dim), device=self.device)
+        gathered_goal[..., 0:2] = -raw_ego_to_goal.unsqueeze(2)
+        gathered_goal[..., 5] = 1.0 # is_goal flag
+        gathered_goal[..., 6] = 1.0 # active
+        gathered_goal[..., 7] = self.episode_tags.unsqueeze(1).expand(B, N, 1)
         
-        # 9. Apply Velocity strictly to Ego
-        # Because Ego's distance is -1e9, topk guarantees it is sorted to index 0 of the gathered agents
-        gathered_agents[:, :, 0, 2:4] = vel 
-        
-        # 10. Combine into 2*K nodes
-        graph = torch.cat([gathered_agents, gathered_goals], dim=2) # Shape: (B, N, 2K, 9)
-        
-        # 11. Zero-Padding if env size N < K
-        if actual_k < K:
-            padding = torch.zeros((B, N, 2 * (K - actual_k), self.feature_dim), device=self.device)
-            graph = torch.cat([graph, padding], dim=2)
+        # --- Obstacles Matrix ---
+        graph_obstacles = torch.zeros((B, N, num_obstacles, self.feature_dim), device=self.device)
+        graph_obstacles[..., 0:2] = rel_obstacles
+        graph_obstacles[..., 5] = -1.0 # is_obstacle flag (using -1.0 to distinguish from goals)
+        graph_obstacles[..., 6] = 1.0  
+        graph_obstacles[..., 7] = self.episode_tags.unsqueeze(1).expand(B, N, num_obstacles)
+
+        if num_obstacles > 0:
+            exp_obs_idx = topk_obstacles_idx.unsqueeze(-1).expand(-1, -1, -1, self.feature_dim)
+            gathered_obstacles = torch.gather(graph_obstacles, dim=2, index=exp_obs_idx)
+        else:
+            gathered_obstacles = torch.zeros((B, N, 0, self.feature_dim), device=self.device)
+            
+        if actual_k_obs < K:
+            obs_padding = torch.zeros((B, N, K - actual_k_obs, self.feature_dim), device=self.device)
+            gathered_obstacles = torch.cat([gathered_obstacles, obs_padding], dim=2)
+            
+        # 6. Combine into final graph
+        # Total Nodes = K (Agents) + 1 (Goal) + K (Obstacles)
+        graph = torch.cat([gathered_agents, gathered_goal, gathered_obstacles], dim=2) 
             
         return graph.reshape(self.num_envs, -1)
 
