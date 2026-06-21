@@ -112,15 +112,14 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 class GraphObservationNormalizer(nn.Module):
-    def __init__(self, n_max, feature_dim=7, continuous_dim=4, epsilon=1e-5):
+    def __init__(self, n_max, feature_dim=9, continuous_dim=4, epsilon=1e-5):
         super().__init__()
         self.n_max = n_max
         self.feature_dim = feature_dim
         self.continuous_dim = continuous_dim
         
-        # Track ONLY variance. Relative coordinates must always remain centered at 0.0
-        shape = (continuous_dim,)
-        self.register_buffer("running_var", torch.ones(shape))
+        # Track 4 floats, but we will strictly keep X=Y and VX=VY isotropic
+        self.register_buffer("running_var", torch.ones(continuous_dim))
         self.count = epsilon
 
     def update(self, x_flat):
@@ -128,16 +127,21 @@ class GraphObservationNormalizer(nn.Module):
         x_reshaped = x_flat.view(B, self.n_max, self.feature_dim)
         
         active_mask = x_reshaped[:, :, 6] > 0.5 
-        valid_x = x_reshaped[active_mask] 
-        continuous_x = valid_x[:, :self.continuous_dim] 
         
-        # FIX: Clamp extreme outliers so runaway agents don't destroy the variance.
-        # A distance of 10.0 is well beyond the 5x5 arena, making it a safe cutoff.
-        clamped_x = torch.clamp(continuous_x, min=-10.0, max=10.0)
+        # 1. SPATIAL ISOTROPIC VARIANCE (Pool X and Y together)
+        valid_pos = x_reshaped[active_mask][:, :2]
+        clamped_pos = torch.clamp(valid_pos, min=-5.0, max=5.0)
+        pos_var_scalar = (clamped_pos ** 2).mean() 
         
-        # RMS Update: Variance around zero using the CLAMPED values
-        batch_var = (clamped_x ** 2).mean(dim=0)
-        batch_count = continuous_x.shape[0]
+        # 2. VELOCITY ISOTROPIC VARIANCE (Strictly isolate the Ego node: index 4 == 1.0)
+        ego_mask = (x_reshaped[:, :, 4] > 0.5) & active_mask
+        valid_vel = x_reshaped[ego_mask][:, 2:4]
+        clamped_vel = torch.clamp(valid_vel, min=-5.0, max=5.0)
+        vel_var_scalar = (clamped_vel ** 2).mean()
+
+        # Reconstruct an isotropic variance buffer: [σ_p^2, σ_p^2, σ_v^2, σ_v^2]
+        batch_var = torch.stack([pos_var_scalar, pos_var_scalar, vel_var_scalar, vel_var_scalar])
+        batch_count = valid_pos.shape[0]
 
         delta_var = batch_var - self.running_var
         self.running_var = self.running_var + delta_var * (batch_count / (self.count + batch_count))
@@ -151,7 +155,7 @@ class GraphObservationNormalizer(nn.Module):
         valid_x = x_reshaped[active_mask] 
         valid_continuous = valid_x[:, :self.continuous_dim]
         
-        # FIX: Only scale by std. Do NOT subtract a mean. Ego stays exactly at 0.0!
+        # Safe isotropic scale
         normalized_continuous = valid_continuous / torch.sqrt(self.running_var + 1e-8)
         
         valid_x[:, :self.continuous_dim] = normalized_continuous
@@ -325,10 +329,10 @@ class GraphAgent(nn.Module):
         self.action_dim = np.prod(envs.single_action_space.shape)
         
         # GAT
-        # self.backbone = MultiHeadGATBackbone(n_max=n_max, feature_dim=9)
+        self.backbone = MultiHeadGATBackbone(n_max=n_max, feature_dim=9)
 
         # GCN 
-        self.backbone = SimpleGCNBackbone(n_max=n_max, feature_dim=9)
+        # self.backbone = SimpleGCNBackbone(n_max=n_max, feature_dim=9)
         gat_out_dim = 128
         
         self.actor_mlp = nn.Sequential(
@@ -337,7 +341,7 @@ class GraphAgent(nn.Module):
             layer_init(nn.Linear(128, 64)),
             nn.LayerNorm(64), nn.ReLU(),
             layer_init(nn.Linear(64,64)),
-            nn.ReLU(),
+            nn.ELU(),
         )
 
         # The Mean Head (Restored Tanh for instant braking)
@@ -1083,7 +1087,7 @@ if __name__ == "__main__":
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
         writer.add_scalar("charts/ent_coef_now", ent_coef_now, global_step)
 
-        if update % 100 == 0 or update == num_updates:
+        if update % 75 == 0 or update == num_updates:
             save_dir = f"models/{run_name}"
             os.makedirs(save_dir, exist_ok=True)
             torch.save(agent.state_dict(), f"{save_dir}/{update}_model.pth")
