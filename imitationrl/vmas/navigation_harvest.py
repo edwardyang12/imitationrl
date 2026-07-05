@@ -110,7 +110,8 @@ def harvest_vmas_dataset():
             deterministic_action = oracle.actor_mean(actor_features)
             
             # Clip actions to valid physical simulation limits [-1, 1]
-            clipped_action = torch.clamp(deterministic_action, -1.0, 1.0)
+            noise = torch.randn_like(deterministic_action) * 0.025
+            clipped_action = torch.clamp(deterministic_action + noise, -1.0, 1.0)
 
             # --- RENDER FRAME IF RECORDING ---
             if is_recording:

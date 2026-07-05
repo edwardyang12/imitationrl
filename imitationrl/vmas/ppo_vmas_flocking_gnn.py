@@ -17,7 +17,7 @@ import torch.optim as optim
 from torch_geometric.nn import GATConv, global_mean_pool, global_max_pool, MessagePassing
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
-from vmas.scenarios.navigation import Scenario as BaseNavigation
+from vmas.scenarios.flocking import Scenario as BaseFlocking
 from torch_geometric.nn import radius_graph
 from torch_geometric.nn import GCNConv
 
@@ -42,7 +42,7 @@ def parse_args():
         help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # Algorithm specific arguments
-    parser.add_argument("--env-id", type=str, default="navigation",
+    parser.add_argument("--env-id", type=str, default="flocking",
         help="the id of the environment")
     parser.add_argument("--total-timesteps", type=int, default=300000000,
         help="total timesteps of the experiments")
@@ -91,18 +91,25 @@ def parse_args():
     # fmt: on
     return args
 
-class NavigationCleanObs(BaseNavigation):
+class FlockingCleanObs(BaseFlocking):
     def observation(self, agent):
-        # 1. Base kinematics (Ego Agent)
+        # 1. Base kinematics
         obs = [agent.state.pos, agent.state.vel]
         
-        # 2. Assigned Goal ONLY (Removes the distractors)
-        obs.append(agent.state.pos - agent.goal.state.pos)
+        # 2. Target Tracking (Direction fixed: Pointing FROM agent TO target)
+        obs.append(self._target.state.pos - agent.state.pos)
             
-        # 3. Relative Teammates (Position ONLY, respecting original info bounds)
+        # 3. Strict Index-Preserved Teammates
+        # We iterate over ALL agents so the array structure never shifts.
+        # When a == agent, the relative pos/vel becomes [0, 0], which the network ignores.
         for a in self.world.agents:
-            if a != agent:
-                obs.append(a.state.pos - agent.state.pos)
+            obs.append(a.state.pos - agent.state.pos)
+            obs.append(a.state.vel - agent.state.vel) 
+                
+        # 4. Relative Obstacles
+        for landmark in self.world.landmarks:
+            if landmark != self._target:
+                obs.append(landmark.state.pos - agent.state.pos)
                 
         return torch.cat(obs, dim=-1)
 
@@ -126,7 +133,7 @@ class GraphObservationNormalizer(nn.Module):
         B = x_flat.shape[0]
         x_reshaped = x_flat.view(B, self.n_max, self.feature_dim)
         
-        active_mask = x_reshaped[:, :, 6] > 0.5 
+        active_mask = x_reshaped[:, :, 8] > 0.5 
         
         # 1. SPATIAL ISOTROPIC VARIANCE (Pool X and Y together)
         valid_pos = x_reshaped[active_mask][:, :2]
@@ -151,7 +158,7 @@ class GraphObservationNormalizer(nn.Module):
         B = x_flat.shape[0]
         x_reshaped = x_flat.view(B, self.n_max, self.feature_dim).clone()
         
-        active_mask = x_reshaped[:, :, 6] > 0.5
+        active_mask = x_reshaped[:, :, 8] > 0.5
         valid_x = x_reshaped[active_mask] 
         valid_continuous = valid_x[:, :self.continuous_dim]
         
@@ -164,106 +171,23 @@ class GraphObservationNormalizer(nn.Module):
         return x_reshaped.view(B, -1)
 
 class MultiHeadGATBackbone(nn.Module):
-    def __init__(self, n_max, feature_dim=8, hidden_dim=64, out_dim=128, heads=4):
-        super().__init__()
-        self.n_max = n_max
-        self.feature_dim = feature_dim
-        
-        # We increase edge_dim to 4: [delta_x, delta_y, distance, is_self_loop]
-        # This prevents Softmax Attention Dilution at N=75 crowding
-        self.gat1 = GATConv(feature_dim, hidden_dim, heads=heads, concat=True, edge_dim=4, add_self_loops=False)
-        self.gat2 = GATConv(hidden_dim * heads, hidden_dim, heads=heads, concat=True, edge_dim=4, add_self_loops=False)
-        self.gat3 = GATConv(hidden_dim * heads, out_dim, heads=heads, concat=False, edge_dim=4, add_self_loops=False)
-        
-        self.skip_proj = nn.Linear(feature_dim, hidden_dim * heads)
-        self.elu = nn.ELU()
-
-    def _build_fc_dynamic_graph(self, x_flat):
-        B = x_flat.shape[0]
-        device = x_flat.device
-        
-        x_padded = x_flat.view(B, self.n_max, self.feature_dim)
-        active_mask = x_padded[:, :, 6] > 0.5  
-        valid_x = x_padded[active_mask] 
-        
-        batch_indices = torch.arange(B, device=device).view(-1, 1).expand(B, self.n_max)
-        valid_batch = batch_indices[active_mask] 
-        
-        is_same_batch = valid_batch.unsqueeze(1) == valid_batch.unsqueeze(0)
-        
-        # Keep diagonal True here so we manually construct explicit, distinct self-loops
-        edge_index = is_same_batch.nonzero(as_tuple=False).t().contiguous()
-        row, col = edge_index
-        
-        rel_pos = valid_x[row, :2] - valid_x[col, :2]
-        distances = torch.sqrt((rel_pos ** 2).sum(dim=-1, keepdim=True) + 1e-8)
-        
-        # Explicit binary anchor: 1.0 if self-loop, 0.0 if neighbor connection
-        is_self = (row == col).float().unsqueeze(-1)
-        
-        # Edge attributes: [dx, dy, distance, is_self_loop]
-        edge_attr = torch.cat([rel_pos, distances, is_self], dim=-1)
-        
-        return valid_x, edge_index, edge_attr, valid_batch
-
-    def forward(self, x_flat):
-        valid_x, edge_index, edge_attr, valid_batch = self._build_fc_dynamic_graph(x_flat)
-        
-        res = self.skip_proj(valid_x)
-        
-        h = self.gat1(valid_x, edge_index, edge_attr=edge_attr)
-        h = self.elu(h) + res 
-        
-        h2 = self.gat2(h, edge_index, edge_attr=edge_attr)
-        h2 = self.elu(h2) + h 
-        
-        node_embeddings = self.gat3(h2, edge_index, edge_attr=edge_attr) 
-        
-        return valid_x, node_embeddings, valid_batch
-
-class VectorGCNConv(MessagePassing):
-    """
-    An isotropic graph convolution that natively ingests multi-dimensional edge 
-    attributes without an attention mechanism or OOM-triggering edge MLPs.
-    """
-    def __init__(self, in_channels, out_channels, edge_dim=3):
-        # aggr='mean' strictly replaces the GAT attention softmax coefficients
-        super().__init__(aggr='mean') 
-        self.node_proj = nn.Linear(in_channels, out_channels, bias=False)
-        self.edge_proj = nn.Linear(edge_dim, out_channels, bias=False)
-        self.bias = nn.Parameter(torch.zeros(out_channels))
-
-    def forward(self, x, edge_index, edge_attr):
-        x_proj = self.node_proj(x)
-        return self.propagate(edge_index, x=x_proj, edge_attr=edge_attr)
-
-    def message(self, x_j, edge_attr):
-        return x_j + self.edge_proj(edge_attr)
-
-    def update(self, aggr_out):
-        return aggr_out + self.bias
-
-
-class FairVectorGCNBackbone(nn.Module):
     def __init__(self, n_max, feature_dim=9, hidden_dim=64, out_dim=128, heads=4):
         super().__init__()
         self.n_max = n_max
         self.feature_dim = feature_dim
         
-        # CAPACITY PARITY (Match GAT's concat=True expansion width)
-        wide_dim = hidden_dim * heads  # 64 * 4 = 256
+        # FIX 1: Re-enable self-loops and set fill_value=0.0 for edge attributes
+        # (A self loop has 0 displacement and 0 distance, so 0.0 is exactly correct)
+        self.gat1 = GATConv(feature_dim, hidden_dim, heads=heads, concat=True, edge_dim=3, add_self_loops=True, fill_value=0.0)
+        self.gat2 = GATConv(hidden_dim * heads, hidden_dim, heads=heads, concat=True, edge_dim=3, add_self_loops=True, fill_value=0.0)
+        self.gat3 = GATConv(hidden_dim * heads, out_dim, heads=heads, concat=False, edge_dim=3, add_self_loops=True, fill_value=0.0)
         
-        self.gcn1 = VectorGCNConv(feature_dim, wide_dim, edge_dim=3)
-        self.gcn2 = VectorGCNConv(wide_dim, wide_dim, edge_dim=3)
-        self.gcn3 = VectorGCNConv(wide_dim, out_dim, edge_dim=3)
+        # FIX 2: LayerNorm is removed. If you desperately need stability, use nn.BatchNorm1d 
+        # on the node sequence, but spatial RL usually performs better without normalization here.
         
-        # PARITY UPGRADE 2: LayerNorms at wide_dim (256)
-        self.ln1 = nn.LayerNorm(wide_dim)
-        self.ln2 = nn.LayerNorm(wide_dim)
-        
-        # PARITY UPGRADE 3: Dual Skip Connections
-        self.skip_proj1 = nn.Linear(feature_dim, wide_dim)
-        self.skip_proj2 = nn.Linear(wide_dim, out_dim) # The Ego Amnesia fix
+        # Skip connections kept intact
+        self.skip_proj1 = nn.Linear(feature_dim, hidden_dim * heads)
+        self.skip_proj2 = nn.Linear(hidden_dim * heads, out_dim) 
         
         self.elu = nn.ELU()
 
@@ -272,24 +196,24 @@ class FairVectorGCNBackbone(nn.Module):
         device = x_flat.device
         
         x_padded = x_flat.view(B, self.n_max, self.feature_dim)
-        active_mask = x_padded[:, :, 6] > 0.5  
+        active_mask = x_padded[:, :, 8] > 0.5  
         valid_x = x_padded[active_mask] 
         
         batch_indices = torch.arange(B, device=device).view(-1, 1).expand(B, self.n_max)
         valid_batch = batch_indices[active_mask] 
         
         is_same_batch = valid_batch.unsqueeze(1) == valid_batch.unsqueeze(0)
-        is_same_batch.fill_diagonal_(False) # Strips self-loops natively
+        
+        # Keep diagonal False here; GATConv will add the self-loops dynamically
+        is_same_batch.fill_diagonal_(False)
         edge_index = is_same_batch.nonzero(as_tuple=False).t().contiguous()
         
         row, col = edge_index
         rel_pos = valid_x[row, :2] - valid_x[col, :2]
         
-        # PARITY UPGRADE 1: Log-compressed distance
-        raw_distances = torch.sqrt((rel_pos ** 2).sum(dim=-1, keepdim=True) + 1e-8)
-        log_distances = torch.log(raw_distances + 1.0)
-        
-        edge_attr = torch.cat([rel_pos, log_distances], dim=-1)
+        # FIX 3: Revert to raw distances to keep scale strictly linear with rel_pos
+        distances = torch.sqrt((rel_pos ** 2).sum(dim=-1, keepdim=True) + 1e-8)
+        edge_attr = torch.cat([rel_pos, distances], dim=-1)
         
         return valid_x, edge_index, edge_attr, valid_batch
 
@@ -298,19 +222,15 @@ class FairVectorGCNBackbone(nn.Module):
         
         res1 = self.skip_proj1(valid_x)
         
-        # Layer 1 Pipeline
-        h = self.gcn1(valid_x, edge_index, edge_attr=edge_attr)
-        h = self.ln1(h)
+        # Forward passes without LayerNorm washing out the spatial scale
+        h = self.gat1(valid_x, edge_index, edge_attr=edge_attr)
         h = self.elu(h) + res1 
         
-        # Layer 2 Pipeline
-        h2 = self.gcn2(h, edge_index, edge_attr=edge_attr)
-        h2 = self.ln2(h2)
+        h2 = self.gat2(h, edge_index, edge_attr=edge_attr)
         h2 = self.elu(h2) + h 
         
-        # Layer 3 Pipeline (Ego Preservation Parity)
         res_final = self.skip_proj2(h2)
-        node_embeddings = self.gcn3(h2, edge_index, edge_attr=edge_attr) 
+        node_embeddings = self.gat3(h2, edge_index, edge_attr=edge_attr) 
         node_embeddings = self.elu(node_embeddings) + res_final
         
         return valid_x, node_embeddings, valid_batch
@@ -361,7 +281,7 @@ class GraphAgent(nn.Module):
         self.action_dim = np.prod(envs.single_action_space.shape)
         
         # GAT
-        self.backbone = MultiHeadGATBackbone(n_max=n_max, feature_dim=9)
+        self.backbone = MultiHeadGATBackbone(n_max=n_max, feature_dim=10)
 
         # GCN 
         # self.backbone = SimpleGCNBackbone(n_max=n_max, feature_dim=9)
@@ -394,7 +314,7 @@ class GraphAgent(nn.Module):
             nn.LayerNorm(128), nn.ReLU(),
         )
         self.critic_popart = PopArt(128, 1)
-        self.obs_normalizer = GraphObservationNormalizer(n_max=n_max, feature_dim=9, continuous_dim=4)
+        self.obs_normalizer = GraphObservationNormalizer(n_max=n_max, feature_dim=10, continuous_dim=4)
 
     def get_value(self, x_flat, denormalize=False):
         x_norm = self.obs_normalizer.normalize(x_flat)
@@ -478,13 +398,11 @@ class VMASVectorizedEnv:
         self.update_step = update_step
         
         self.env = vmas.make_env(
-            scenario=NavigationCleanObs() if args.env_id == "navigation" else args.env_id,
+            scenario= FlockingCleanObs() if args.env_id == "flocking" else args.env_id,
             num_envs=self.num_games,
             device=self.device,
             continuous_actions=True,
             n_agents=self.num_agents,
-            collisions=True,
-            observe_all_goals=False,
             seed=seed,
             dict_spaces=False,
             world_spawning_x=2.5,
@@ -494,9 +412,9 @@ class VMASVectorizedEnv:
         
         self.single_action_space = self.env.action_space[0]
         self.n_max = args.n_max
-        self.feature_dim = 9
+        self.feature_dim = 10
         
-        target_dim = self.n_max * self.feature_dim * 2
+        target_dim = self.n_max * self.feature_dim
         self.single_observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(target_dim,))
         
         self.episode_returns = torch.zeros(self.num_envs, device=self.device)
@@ -506,79 +424,80 @@ class VMASVectorizedEnv:
         self.video_frames = []
 
     def _apply_graph_formatting(self, stacked_vmas_obs):
-        B = self.num_games
-        N = self.num_agents
-        K = self.args.n_max # The fixed number of agents (and landmarks) to observe
+        # 1. Dynamically read batch size so evaluation (B=1) doesn't crash
+        B = stacked_vmas_obs.shape[0]
+        N = stacked_vmas_obs.shape[1]
+        K = self.args.n_max 
         
-        # 1. Extract raw absolute positions and velocities
+        # 1. Infer Obstacle Count from Observation Dimension
+        # Flocking shape: pos(2) + vel(2) + target_rel(2) + N*(rel_pos(2)+rel_vel(2)) + O*rel_obs(2)
+        obs_dim = stacked_vmas_obs.shape[-1]
+        O = (obs_dim - 6 - 4 * N) // 2 
+        
+        # 2. Extract Raw Components
         abs_pos = stacked_vmas_obs[:, :, 0:2] # (B, N, 2)
         vel = stacked_vmas_obs[:, :, 2:4]     # (B, N, 2)
-        ego_to_goal = stacked_vmas_obs[:, :, 4:6] # (B, N, 2)
+        target_rel = stacked_vmas_obs[:, :, 4:6] # (B, N, 2)
         
-        # 2. Reconstruct absolute positions of ALL goals
-        goal_abs = abs_pos - ego_to_goal 
+        # 3. Reconstruct Absolute Positions
+        # Use agent 0 to anchor the absolute positions of shared landmarks
+        target_abs = (abs_pos[:, 0:1, :] + target_rel[:, 0:1, :]) # (B, 1, 2)
         
-        # 3. Calculate Relative Positions independently
+        obstacles_rel = stacked_vmas_obs[:, 0:1, 6+4*N:].view(B, O, 2)
+        obstacles_abs = abs_pos[:, 0:1, :] + obstacles_rel # (B, O, 2)
+        
+        all_pos = torch.cat([abs_pos, target_abs, obstacles_abs], dim=1) # (B, N + 1 + O, 2)
+        all_vel = torch.cat([vel, torch.zeros((B, 1 + O, 2), device=self.device)], dim=1) # (B, N + 1 + O, 2)
+        
+        # 4. Calculate Relative Metrics
         ego_pos = abs_pos.unsqueeze(2) # (B, N, 1, 2)
-        rel_agents = abs_pos.unsqueeze(1) - ego_pos # (B, N, N, 2)
-        rel_goals = goal_abs.unsqueeze(1) - ego_pos # (B, N, N, 2)
+        rel_pos = all_pos.unsqueeze(1) - ego_pos # (B, N, N + 1 + O, 2)
+        distances = torch.norm(rel_pos, dim=-1) # (B, N, N + 1 + O)
         
-        # 4. Calculate Distances
-        dist_agents = torch.norm(rel_agents, dim=-1) # (B, N, N)
-        dist_goals = torch.norm(rel_goals, dim=-1) # (B, N, N)
-        
-        # 5. The "Ego & Target" Override
-        # Force Ego and Target Landmark distances to -infinity so they are always selected
+        # 5. K-Nearest Neighbors
+        # Force Ego to be selected by masking its distance to -1e9
         batch_idx = torch.arange(B, device=self.device).view(B, 1).expand(B, N)
         ego_idx = torch.arange(N, device=self.device).view(1, N).expand(B, N)
+        distances[batch_idx, ego_idx, ego_idx] = -1e9
         
-        dist_agents[batch_idx, ego_idx, ego_idx] = -1e9
-        dist_goals[batch_idx, ego_idx, ego_idx] = -1e9 # Ego's goal matches its index
+        total_entities = N + 1 + O
+        actual_k = min(K, total_entities)
+        _, topk_idx = torch.topk(distances, k=actual_k, dim=-1, largest=False) # (B, N, K)
         
-        # 6. Execute Independent K-Nearest Neighbors
-        actual_k = min(K, N) # Prevent crash if env N is smaller than K
-        _, topk_agents_idx = torch.topk(dist_agents, k=actual_k, dim=-1, largest=False) # (B, N, K)
-        _, topk_goals_idx = torch.topk(dist_goals, k=actual_k, dim=-1, largest=False) # (B, N, K)
+        # 6. Build the Dense Feature Matrix (Feature Dim = 10)
+        self.feature_dim = 10
+        graph = torch.zeros((B, N, total_entities, self.feature_dim), device=self.device)
         
-        # 7. Build the Dense Feature Matrices for ALL N entities
-        is_self_matrix = torch.eye(N, device=self.device).view(1, N, N)
+        graph[..., 0:2] = rel_pos
+        graph[..., 2:4] = all_vel.unsqueeze(1).expand(B, N, total_entities, 2)
         
-        # --- Agents Matrix ---
-        graph_agents = torch.zeros((B, N, N, self.feature_dim), device=self.device)
-        graph_agents[..., 0:2] = rel_agents
-        graph_agents[..., 4] = is_self_matrix # is_self
-        graph_agents[..., 6] = 1.0 # is_active
-        graph_agents[..., 7] = self.episode_tags.unsqueeze(1).expand(B, N, N)
-        graph_agents[..., 8] = 0.0 # is_my_goal
-        
-        # --- Goals Matrix ---
-        graph_goals = torch.zeros((B, N, N, self.feature_dim), device=self.device)
-        graph_goals[..., 0:2] = rel_goals
-        graph_goals[..., 5] = 1.0 # is_landmark
-        graph_goals[..., 6] = 1.0 # is_active
-        graph_goals[..., 7] = self.episode_tags.unsqueeze(1).expand(B, N, N)
-        graph_goals[..., 8] = is_self_matrix # is_my_goal
-
-        # 8. Gather Features
-        exp_agents_idx = topk_agents_idx.unsqueeze(-1).expand(-1, -1, -1, self.feature_dim)
-        gathered_agents = torch.gather(graph_agents, dim=2, index=exp_agents_idx)
-        
-        exp_goals_idx = topk_goals_idx.unsqueeze(-1).expand(-1, -1, -1, self.feature_dim)
-        gathered_goals = torch.gather(graph_goals, dim=2, index=exp_goals_idx)
-        
-        # 9. Apply Velocity strictly to Ego
-        # Because Ego's distance is -1e9, topk guarantees it is sorted to index 0 of the gathered agents
-        gathered_agents[:, :, 0, 2:4] = vel 
-        
-        # 10. Combine into 2*K nodes
-        graph = torch.cat([gathered_agents, gathered_goals], dim=2) # Shape: (B, N, 2K, 9)
-        
-        # 11. Zero-Padding if env size N < K
-        if actual_k < K:
-            padding = torch.zeros((B, N, 2 * (K - actual_k), self.feature_dim), device=self.device)
-            graph = torch.cat([graph, padding], dim=2)
+        # Identifiers
+        is_self_matrix = torch.eye(N, device=self.device)
+        graph[:, :, :N, 4] = is_self_matrix.unsqueeze(0) # is_self
+        graph[:, :, :N, 5] = 1.0 # is_agent
+        graph[:, :, N:N+1, 6] = 1.0 # is_target
+        if O > 0:
+            graph[:, :, N+1:, 7] = 1.0 # is_obstacle
             
-        return graph.reshape(self.num_envs, -1)
+        graph[..., 8] = 1.0 # is_active
+        agent_tags = self.episode_tags.unsqueeze(1).expand(B, N, N)
+        graph[:, :, :N, 9] = agent_tags
+        
+        # Give landmarks/targets a static tag (e.g., -1.0) so the GNN distinguishes them from agents
+        if total_entities > N:
+            graph[:, :, N:, 9] = -1.0
+        
+        # 7. Gather Top K Features
+        exp_idx = topk_idx.unsqueeze(-1).expand(-1, -1, -1, self.feature_dim)
+        gathered_graph = torch.gather(graph, dim=2, index=exp_idx)
+        
+        # 8. Zero-Padding if K > actual_entities
+        if actual_k < K:
+            padding = torch.zeros((B, N, K - actual_k, self.feature_dim), device=self.device)
+            gathered_graph = torch.cat([gathered_graph, padding], dim=2)
+            
+        # 9. Dynamically reshape based on current batch size B * N
+        return gathered_graph.reshape(B * N, -1)
 
     def reset(self, seed=None):
         if seed is not None:
@@ -633,7 +552,7 @@ class VMASVectorizedEnv:
         
         is_done = self.step_count >= self.args.max_cycles
         
-        # Navigation has no terminal states, only time truncations
+        # Flocking has no terminal states, only time truncations
         terminations = torch.zeros((self.num_envs,), device=self.device, dtype=torch.bool)
         truncations = torch.full((self.num_envs,), is_done, device=self.device, dtype=torch.bool)
         
@@ -745,7 +664,7 @@ if __name__ == "__main__":
         # Fallback for Atari or environments without a God-view state
         state_dim = num_agents_per_game * np.array(envs.single_observation_space.shape).prod()
 
-    n_max = args.n_max * 2
+    n_max = args.n_max
 
     agent = GraphAgent(
         envs=envs, 
@@ -1127,3 +1046,57 @@ if __name__ == "__main__":
 
     envs.close()
     writer.close()
+
+    print("--- STARTING LONG INFERENCE EVALUATION ---")
+    
+    # 1. Lock the agent's normalizers (CRITICAL)
+    agent.eval() 
+    
+    eval_max_cycles = 1500 # Set this to however long you want to watch
+    
+    # 2. Spin up a fresh, single-game environment with the long max-cycles
+    eval_env = vmas.make_env(
+        scenario=FlockingCleanObs() if args.env_id == "flocking" else args.env_id,
+        num_envs=1, # Just one game for the video
+        device=device,
+        continuous_actions=True,
+        n_agents=num_agents_per_game,
+        seed=args.seed + 100, # Offset seed so it's a novel starting position
+        dict_spaces=False
+    )
+    
+    # 3. Reset and prep the observation format
+    obs_list = eval_env.reset()
+    stacked_obs = torch.stack(obs_list, dim=1)
+    
+    # Generate eval tags and use the graph formatter directly
+    eval_tags = torch.rand((1, num_agents_per_game), device=device)
+    envs.episode_tags = eval_tags  # Pass tags to our wrapper instance temporarily
+    next_obs = envs._apply_graph_formatting(stacked_obs)
+    
+    frames = []
+
+    # 4. The rollout loop
+    with torch.no_grad():
+        for step in range(eval_max_cycles):
+            action, _, _, _ = agent.get_action_and_value(next_obs)
+            clipped_action = torch.clamp(action, -1.0, 1.0)
+            
+            actions_reshaped = clipped_action.view(1, num_agents_per_game, -1)
+            vmas_actions = [actions_reshaped[:, i, :] for i in range(num_agents_per_game)]
+            
+            vmas_obs, _, _, _ = eval_env.step(vmas_actions)
+            
+            frame = eval_env.render(mode="rgb_array", env_index=0)
+            if isinstance(frame, list): 
+                frame = frame[0]
+            frames.append(frame)
+            
+            stacked_obs = torch.stack(vmas_obs, dim=1)
+            next_obs = envs._apply_graph_formatting(stacked_obs)
+
+    
+    os.makedirs(f"videos/{run_name}", exist_ok=True)
+    video_path = f"videos/{run_name}/FINAL_LONG_EVAL_{eval_max_cycles}_cycles.mp4"
+    imageio.mimsave(video_path, frames, fps=15)
+    print(f"--- LONG EVALUATION SAVED TO {video_path} ---")
