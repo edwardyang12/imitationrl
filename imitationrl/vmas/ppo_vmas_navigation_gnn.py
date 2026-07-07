@@ -164,16 +164,14 @@ class GraphObservationNormalizer(nn.Module):
         return x_reshaped.view(B, -1)
 
 class MultiHeadGATBackbone(nn.Module):
-    def __init__(self, n_max, feature_dim=8, hidden_dim=64, out_dim=128, heads=4):
+    def __init__(self, n_max, feature_dim=9, hidden_dim=64, out_dim=128, heads=4):
         super().__init__()
         self.n_max = n_max
         self.feature_dim = feature_dim
         
-        # We increase edge_dim to 4: [delta_x, delta_y, distance, is_self_loop]
-        # This prevents Softmax Attention Dilution at N=75 crowding
-        self.gat1 = GATConv(feature_dim, hidden_dim, heads=heads, concat=True, edge_dim=4, add_self_loops=False)
-        self.gat2 = GATConv(hidden_dim * heads, hidden_dim, heads=heads, concat=True, edge_dim=4, add_self_loops=False)
-        self.gat3 = GATConv(hidden_dim * heads, out_dim, heads=heads, concat=False, edge_dim=4, add_self_loops=False)
+        self.gat1 = GATConv(feature_dim, hidden_dim, heads=heads, concat=True, edge_dim=3, add_self_loops=True)
+        self.gat2 = GATConv(hidden_dim * heads, hidden_dim, heads=heads, concat=True, edge_dim=3, add_self_loops=True)
+        self.gat3 = GATConv(hidden_dim * heads, out_dim, heads=heads, concat=False, edge_dim=3, add_self_loops=True)
         
         self.skip_proj = nn.Linear(feature_dim, hidden_dim * heads)
         self.elu = nn.ELU()
@@ -189,20 +187,35 @@ class MultiHeadGATBackbone(nn.Module):
         batch_indices = torch.arange(B, device=device).view(-1, 1).expand(B, self.n_max)
         valid_batch = batch_indices[active_mask] 
         
-        is_same_batch = valid_batch.unsqueeze(1) == valid_batch.unsqueeze(0)
+        # Memory-safe Block-Diagonal builder (Replaces OOM-prone broadcast)
+        local_idx = torch.arange(self.n_max, device=device)
+        grid_r, grid_c = torch.meshgrid(local_idx, local_idx, indexing='ij')
+        local_edges = torch.stack([grid_r.flatten(), grid_c.flatten()], dim=0)
         
-        # Keep diagonal True here so we manually construct explicit, distinct self-loops
-        edge_index = is_same_batch.nonzero(as_tuple=False).t().contiguous()
+        offsets = (torch.arange(B, device=device) * self.n_max).view(1, B, 1)
+        global_edges = (local_edges.unsqueeze(1) + offsets).view(2, -1)
+        
+        active_flat = active_mask.view(-1)
+        valid_edge_mask = active_flat[global_edges[0]] & active_flat[global_edges[1]]
+        
+        # Strip self-loops explicitly so PyG's add_self_loops can inject synthesized phantom features
+        is_not_self = global_edges[0] != global_edges[1]
+        valid_edge_mask = valid_edge_mask & is_not_self
+        
+        padded_edge_index = global_edges[:, valid_edge_mask]
+        
+        # CRITICAL FIX: Map padded indices back to the compressed valid_x space
+        padded_to_active = torch.zeros(B * self.n_max, dtype=torch.long, device=device)
+        padded_to_active[active_flat] = torch.arange(valid_x.shape[0], device=device)
+        
+        edge_index = padded_to_active[padded_edge_index]
         row, col = edge_index
         
         rel_pos = valid_x[row, :2] - valid_x[col, :2]
         distances = torch.sqrt((rel_pos ** 2).sum(dim=-1, keepdim=True) + 1e-8)
         
-        # Explicit binary anchor: 1.0 if self-loop, 0.0 if neighbor connection
-        is_self = (row == col).float().unsqueeze(-1)
-        
         # Edge attributes: [dx, dy, distance, is_self_loop]
-        edge_attr = torch.cat([rel_pos, distances, is_self], dim=-1)
+        edge_attr = torch.cat([rel_pos, distances], dim=-1)
         
         return valid_x, edge_index, edge_attr, valid_batch
 
@@ -278,11 +291,29 @@ class FairVectorGCNBackbone(nn.Module):
         batch_indices = torch.arange(B, device=device).view(-1, 1).expand(B, self.n_max)
         valid_batch = batch_indices[active_mask] 
         
-        is_same_batch = valid_batch.unsqueeze(1) == valid_batch.unsqueeze(0)
-        is_same_batch.fill_diagonal_(False) # Strips self-loops natively
-        edge_index = is_same_batch.nonzero(as_tuple=False).t().contiguous()
+        # UPDATED: Use the memory-safe Block-Diagonal builder to prevent OOM
+        local_idx = torch.arange(self.n_max, device=device)
+        grid_r, grid_c = torch.meshgrid(local_idx, local_idx, indexing='ij')
+        local_edges = torch.stack([grid_r.flatten(), grid_c.flatten()], dim=0)
         
+        offsets = (torch.arange(B, device=device) * self.n_max).view(1, B, 1)
+        global_edges = (local_edges.unsqueeze(1) + offsets).view(2, -1)
+        
+        active_flat = active_mask.view(-1)
+        valid_edge_mask = active_flat[global_edges[0]] & active_flat[global_edges[1]]
+        
+        # FIX: We intentionally DO NOT strip self-loops here! 
+        # VectorGCNConv does not auto-add self loops, so we must leave them in the graph 
+        # natively (with distance=0.0) so the ego node can remember its own features.
+        
+        padded_edge_index = global_edges[:, valid_edge_mask]
+        
+        padded_to_active = torch.zeros(B * self.n_max, dtype=torch.long, device=device)
+        padded_to_active[active_flat] = torch.arange(valid_x.shape[0], device=device)
+        
+        edge_index = padded_to_active[padded_edge_index]
         row, col = edge_index
+        
         rel_pos = valid_x[row, :2] - valid_x[col, :2]
         
         # PARITY UPGRADE 1: Log-compressed distance
@@ -447,9 +478,10 @@ class GraphAgent(nn.Module):
         
         if action is None:
             action = probs.sample()
-            
-        pooled_mean = global_mean_pool(node_embeddings, valid_batch)
-        pooled_max = global_max_pool(node_embeddings, valid_batch)
+
+        batch_size = x_flat.shape[0]
+        pooled_mean = global_mean_pool(node_embeddings, valid_batch, size=batch_size)
+        pooled_max = global_max_pool(node_embeddings, valid_batch, size=batch_size)
 
         active_counts = torch.bincount(valid_batch, minlength=x_flat.shape[0])
         density_scalar_expanded = (active_counts.float() / self.n_max).view(-1, 1)
