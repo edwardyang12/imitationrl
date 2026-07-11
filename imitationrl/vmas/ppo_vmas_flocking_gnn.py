@@ -82,8 +82,6 @@ def parse_args():
         help="number of agents and landmarks")
     parser.add_argument("--max-cycles", type=int, default=250,
         help="length of environment run")
-    parser.add_argument("--reward-cheat", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
-        help="if toggled, this experiment will have extra reward cheats")
     parser.add_argument("--n-max", type=int, default=5, help="Fixed context window size for the GNN")
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
@@ -98,12 +96,14 @@ class FlockingCleanObs(BaseFlocking):
         
         # 2. Target Tracking (Direction fixed: Pointing FROM agent TO target)
         obs.append(self._target.state.pos - agent.state.pos)
+        obs.append(self._target.state.vel - agent.state.vel)
             
         # 3. Strict Index-Preserved Teammates
         # We iterate over ALL agents so the array structure never shifts.
         # When a == agent, the relative pos/vel becomes [0, 0], which the network ignores.
         for a in self.world.agents:
             obs.append(a.state.pos - agent.state.pos)
+            obs.append(a.state.vel - agent.state.vel)
                 
         # 4. Relative Obstacles
         for landmark in self.world.landmarks:
@@ -111,6 +111,40 @@ class FlockingCleanObs(BaseFlocking):
                 obs.append(landmark.state.pos - agent.state.pos)
                 
         return torch.cat(obs, dim=-1)
+    
+    def reward(self, agent):
+        # 1. Fetch base VMAS reward (Handles Individual Target Distance + Hard Collision Penalties)
+        base_reward = super().reward(agent)
+        
+        # --- EXPLICIT DENSE REYNOLDS REWARD SHAPING ---
+        
+        # 2. Target Cruising Alignment (Match target's speed and direction)
+        target_match_penalty = -torch.linalg.norm(self._target.state.vel - agent.state.vel, dim=-1)
+        
+        # 3. Flock Uniform Heading Alignment (Match teammate average speed/direction)
+        all_vels = torch.stack([a.state.vel for a in self.world.agents], dim=1) 
+        mean_vel = all_vels.mean(dim=1) 
+        flock_match_penalty = -torch.linalg.norm(mean_vel - agent.state.vel, dim=-1)
+        
+        # 4. Reynolds Separation / Uniform Spacing
+        # Penalize agents that intrude into a "personal bubble" to encourage a wide, uniform lattice
+        separation_penalty = 0.0
+        desired_spacing = 0.35
+        for a in self.world.agents:
+            if a != agent:
+                dist = torch.linalg.norm(a.state.pos - agent.state.pos, dim=-1)
+                intrusion = torch.clamp(desired_spacing - dist, min=0.0)
+                separation_penalty -= (intrusion ** 2) * 5.0 # Scale up the squared penalty
+
+        # 5. Reynolds Cohesion (Steer towards the flock's center of mass)
+        all_pos = torch.stack([a.state.pos for a in self.world.agents], dim=1)
+        com = all_pos.mean(dim=1)
+        cohesion_penalty = -torch.linalg.norm(com - agent.state.pos, dim=-1)
+
+        # Combine base rewards with explicitly weighted Reynolds physics rules
+        shaped_reward = base_reward + (target_match_penalty * 0.05) + (flock_match_penalty * 0.05) + (separation_penalty * 0.1) + (cohesion_penalty * 0.05)
+        
+        return shaped_reward
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
@@ -118,7 +152,7 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 class GraphObservationNormalizer(nn.Module):
-    def __init__(self, n_max, feature_dim=9, continuous_dim=4, epsilon=1e-5):
+    def __init__(self, n_max, feature_dim=10, continuous_dim=4, epsilon=1e-5):
         super().__init__()
         self.n_max = n_max
         self.feature_dim = feature_dim
@@ -137,13 +171,13 @@ class GraphObservationNormalizer(nn.Module):
         # 1. SPATIAL ISOTROPIC VARIANCE (Pool X and Y together)
         valid_pos = x_reshaped[active_mask][:, :2]
         clamped_pos = torch.clamp(valid_pos, min=-5.0, max=5.0)
-        pos_var_scalar = (clamped_pos ** 2).mean() 
+        pos_var_scalar = torch.clamp((clamped_pos ** 2).mean(), min=0.1)
         
-        # 2. VELOCITY ISOTROPIC VARIANCE (Strictly isolate the Ego node: index 4 == 1.0)
-        ego_mask = (x_reshaped[:, :, 4] > 0.5) & active_mask
-        valid_vel = x_reshaped[ego_mask][:, 2:4]
+        # 2. VELOCITY ISOTROPIC VARIANCE (Use all agent nodes: index 5 == 1.0)
+        agent_mask = (x_reshaped[:, :, 5] > 0.5) & active_mask
+        valid_vel = x_reshaped[agent_mask][:, 2:4]
         clamped_vel = torch.clamp(valid_vel, min=-5.0, max=5.0)
-        vel_var_scalar = (clamped_vel ** 2).mean()
+        vel_var_scalar = torch.clamp((clamped_vel ** 2).mean(), min=0.1)
 
         # Reconstruct an isotropic variance buffer: [σ_p^2, σ_p^2, σ_v^2, σ_v^2]
         batch_var = torch.stack([pos_var_scalar, pos_var_scalar, vel_var_scalar, vel_var_scalar])
@@ -177,9 +211,9 @@ class MultiHeadGATBackbone(nn.Module):
         
         # FIX 1: Re-enable self-loops and set fill_value=0.0 for edge attributes
         # (A self loop has 0 displacement and 0 distance, so 0.0 is exactly correct)
-        self.gat1 = GATConv(feature_dim, hidden_dim, heads=heads, concat=True, edge_dim=3, add_self_loops=True)
-        self.gat2 = GATConv(hidden_dim * heads, hidden_dim, heads=heads, concat=True, edge_dim=3, add_self_loops=True)
-        self.gat3 = GATConv(hidden_dim * heads, out_dim, heads=heads, concat=False, edge_dim=3, add_self_loops=True)
+        self.gat1 = GATConv(feature_dim, hidden_dim, heads=heads, concat=True, edge_dim=5, add_self_loops=True)
+        self.gat2 = GATConv(hidden_dim * heads, hidden_dim, heads=heads, concat=True, edge_dim=5, add_self_loops=True)
+        self.gat3 = GATConv(hidden_dim * heads, out_dim, heads=heads, concat=False, edge_dim=5, add_self_loops=True)
 
         # Skip connections kept intact
         self.skip_proj = nn.Linear(feature_dim, hidden_dim * heads)
@@ -221,10 +255,12 @@ class MultiHeadGATBackbone(nn.Module):
         edge_index = padded_to_active[padded_edge_index]
         row, col = edge_index
         rel_pos = valid_x[row, :2] - valid_x[col, :2]
+
+        rel_vel = valid_x[row, 2:4] - valid_x[col, 2:4]
         
         # FIX 3: Revert to raw distances to keep scale strictly linear with rel_pos
         distances = torch.sqrt((rel_pos ** 2).sum(dim=-1, keepdim=True) + 1e-8)
-        edge_attr = torch.cat([rel_pos, distances], dim=-1)
+        edge_attr = torch.cat([rel_pos, distances, rel_vel], dim=-1)
         
         return valid_x, edge_index, edge_attr, valid_batch
 
@@ -435,27 +471,31 @@ class VMASVectorizedEnv:
         # 1. Dynamically read batch size so evaluation (B=1) doesn't crash
         B = stacked_vmas_obs.shape[0]
         N = stacked_vmas_obs.shape[1]
-        K = self.args.n_max 
+        K = self.n_max 
         
         # 1. Infer Obstacle Count from Observation Dimension
-        # Flocking shape: pos(2) + vel(2) + target_rel(2) + N*(rel_pos(2)) + O*rel_obs(2)
+        # Flocking shape: pos(2) + vel(2) + target_rel_pos(2) + target_rel_vel(2) + N*(rel_pos(2)+rel_vel(2)) + O*rel_obs(2)
         obs_dim = stacked_vmas_obs.shape[-1]
-        O = (obs_dim - 6 - 2 * N) // 2 
+        O = (obs_dim - 8 - 4 * N) // 2 
         
         # 2. Extract Raw Components
         abs_pos = stacked_vmas_obs[:, :, 0:2] # (B, N, 2)
         vel = stacked_vmas_obs[:, :, 2:4]     # (B, N, 2)
-        target_rel = stacked_vmas_obs[:, :, 4:6] # (B, N, 2)
+        target_rel_pos = stacked_vmas_obs[:, :, 4:6] 
+        target_rel_vel = stacked_vmas_obs[:, :, 6:8] 
         
         # 3. Reconstruct Absolute Positions
         # Use agent 0 to anchor the absolute positions of shared landmarks
-        target_abs = (abs_pos[:, 0:1, :] + target_rel[:, 0:1, :]) # (B, 1, 2)
+        target_abs_pos = (abs_pos[:, 0:1, :] + target_rel_pos[:, 0:1, :]) 
+        # Accurately recover Target Absolute Velocity
+        target_abs_vel = (vel[:, 0:1, :] + target_rel_vel[:, 0:1, :]) 
         
-        obstacles_rel = stacked_vmas_obs[:, 0:1, 6+2*N:].view(B, O, 2)
+        obstacles_rel = stacked_vmas_obs[:, 0:1, 8+4*N:].view(B, O, 2)
         obstacles_abs = abs_pos[:, 0:1, :] + obstacles_rel # (B, O, 2)
         
-        all_pos = torch.cat([abs_pos, target_abs, obstacles_abs], dim=1) # (B, N + 1 + O, 2)
-        all_vel = torch.cat([vel, torch.zeros((B, 1 + O, 2), device=self.device)], dim=1) # (B, N + 1 + O, 2)
+        all_pos = torch.cat([abs_pos, target_abs_pos, obstacles_abs], dim=1) # (B, N + 1 + O, 2)
+        obstacles_vel = torch.zeros((B, O, 2), device=self.device)
+        all_vel = torch.cat([vel, target_abs_vel, obstacles_vel], dim=1) 
         
         # 4. Calculate Relative Metrics
         ego_pos = abs_pos.unsqueeze(2) # (B, N, 1, 2)
@@ -482,13 +522,10 @@ class VMASVectorizedEnv:
         
         graph[..., 0:2] = rel_pos
 
-        is_self_mask = torch.eye(N, device=self.device)
-        # Pad mask with zeros for targets/obstacles so their velocity is strictly 0.0
-        padded_self_mask = torch.cat([is_self_mask, torch.zeros((N, total_entities - N), device=self.device)], dim=1)
-        expanded_mask = padded_self_mask.unsqueeze(0).unsqueeze(-1).expand(B, N, total_entities, 2)
-        
-        # Multiply all_vel by expanded_mask: Teammates become [0, 0], Ego keeps its velocity!
-        graph[..., 2:4] = all_vel.unsqueeze(1).expand(B, N, total_entities, 2) * expanded_mask
+        # --- Inject RELATIVE Velocity for All Entities ---
+        ego_vel = vel.unsqueeze(2) # (B, N, 1, 2)
+        rel_vel = all_vel.unsqueeze(1) - ego_vel # (B, N, total_entities, 2)
+        graph[..., 2:4] = rel_vel
         
         # Identifiers
         is_self_matrix = torch.eye(N, device=self.device)
@@ -855,68 +892,7 @@ if __name__ == "__main__":
                 next_obs, reward, done, next_info = step_data
                 resets = done
 
-            if args.reward_cheat:
-                agent_radius = 0.15
-                collision_penalty = 0.5
-                
-                cheat_raw_obs = next_info["raw_obs"].clone()
-                if "final_info" in next_info:
-                    for i, fin_info in enumerate(next_info["final_info"]):
-                        if fin_info is not None and "raw_obs" in fin_info:
-                            cheat_raw_obs[i] = fin_info["raw_obs"].clone()
-
-                raw_obs_tensor = torch.Tensor(cheat_raw_obs).to(device)
-                new_landmark_dist = raw_obs_tensor.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
-                new_landmark_dist = new_landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
-                
-                # Shape: [num_games, num_agents, num_landmarks]
-                dist = torch.norm(new_landmark_dist, dim=-1)
-                
-                # --- 1. EPISODIC STATIC ASSIGNMENT ---
-                # Check which games just reset (or are at step 0)
-                game_resets = resets.view(num_games, num_agents_per_game)[:, 0]
-                needs_assignment = needs_assignment | game_resets
-                
-                # If any game reset, recalculate its optimal shortest-path routing
-                if needs_assignment.any():
-                    dist_clone = dist.clone()
-                    
-                    # Only calculate for games that need it
-                    for g in range(num_games):
-                        if needs_assignment[g]:
-                            for _ in range(args.num_landmarks):
-                                flat_dist = dist_clone[g].view(-1)
-                                min_val, min_idx = flat_dist.min(dim=0)
-                                
-                                agent_idx = min_idx // args.num_landmarks
-                                landmark_idx = min_idx % args.num_landmarks
-                                
-                                current_assignments[g, agent_idx] = landmark_idx
-                                
-                                dist_clone[g, agent_idx, :] = float('inf')
-                                dist_clone[g, :, landmark_idx] = float('inf')
-                                
-                    needs_assignment.fill_(False)
-                
-                # Extract the distance to the frozen, optimally assigned target
-                assigned_dist = torch.gather(dist, 2, current_assignments.unsqueeze(-1)).squeeze(-1)
-                
-                # --- 2. PROCEDURAL SQUARE ROOT CALCULUS ---
-                # Calculate the mathematical tipping point for the dead-center snap
-                min_snap_multiplier = collision_penalty / np.sqrt(agent_radius)
-                
-                # Apply a safety factor (> 1.0) to guarantee the snap overpowers engine physics
-                snap_factor = 1.5 
-                procedural_multiplier = min_snap_multiplier * snap_factor
-                
-                # R = -M * sqrt(d)
-                individual_pull = -procedural_multiplier * torch.sqrt(assigned_dist + 1e-8)
-                
-                # Combine with native environment reward
-                rewards[step] = torch.tensor(reward).to(device).view(-1) + individual_pull.view(-1)
-            else:
-                # normalized_step_rewards = reward_norm(reward, done)
-                rewards[step] = reward.clone().to(device).view(-1)
+            rewards[step] = reward.clone().to(device).view(-1)
             next_obs, next_done = next_obs.clone().to(device), done.clone().to(device).float()
 
             # LOGGING TEAM DATA
@@ -931,7 +907,7 @@ if __name__ == "__main__":
                     # Option A: Mean Return per Agent across the team
                     avg_return = ep_returns.mean().item()
 
-                    raw_obs_tensor = torch.Tensor(next_info["raw_obs"]).to(device).view(num_games, num_agents_per_game, -1)
+                    raw_obs_tensor = torch.Tensor(next_info["terminal_raw_obs"]).to(device).view(num_games, num_agents_per_game, -1)
                     metrics = compute_flocking_metrics(raw_obs_tensor[done_games])
                     
                     writer.add_scalar("charts/polarization", metrics["metrics/polarization"], global_step)
@@ -1146,6 +1122,7 @@ if __name__ == "__main__":
     agent.eval() 
     
     eval_max_cycles = 1500 # Set this to however long you want to watch
+    eval_num_agents = 30
     
     # 2. Spin up a fresh, single-game environment with the long max-cycles
     eval_env = vmas.make_env(
@@ -1153,7 +1130,7 @@ if __name__ == "__main__":
         num_envs=1, # Just one game for the video
         device=device,
         continuous_actions=True,
-        n_agents=30,
+        n_agents=eval_num_agents,
         seed=args.seed + 100, # Offset seed so it's a novel starting position
         dict_spaces=False,
         n_obstacles = 1
@@ -1164,7 +1141,7 @@ if __name__ == "__main__":
     stacked_obs = torch.stack(obs_list, dim=1)
     
     # Generate eval tags and use the graph formatter directly
-    eval_tags = torch.rand((1, num_agents_per_game), device=device)
+    eval_tags = torch.rand((1, eval_num_agents), device=device)
     envs.episode_tags = eval_tags  # Pass tags to our wrapper instance temporarily
     next_obs = envs._apply_graph_formatting(stacked_obs)
     
@@ -1176,8 +1153,8 @@ if __name__ == "__main__":
             action, _, _, _ = agent.get_action_and_value(next_obs)
             clipped_action = torch.clamp(action, -1.0, 1.0)
             
-            actions_reshaped = clipped_action.view(1, num_agents_per_game, -1)
-            vmas_actions = [actions_reshaped[:, i, :] for i in range(num_agents_per_game)]
+            actions_reshaped = clipped_action.view(1, eval_num_agents, -1)
+            vmas_actions = [actions_reshaped[:, i, :] for i in range(eval_num_agents)]
             
             vmas_obs, _, _, _ = eval_env.step(vmas_actions)
             

@@ -82,8 +82,6 @@ def parse_args():
         help="number of agents and landmarks")
     parser.add_argument("--max-cycles", type=int, default=250,
         help="length of environment run")
-    parser.add_argument("--reward-cheat", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
-        help="if toggled, this experiment will have extra reward cheats")
     parser.add_argument("--n-max", type=int, default=5, help="Fixed context window size for the GNN")
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
@@ -164,7 +162,7 @@ class GraphObservationNormalizer(nn.Module):
         return x_reshaped.view(B, -1)
 
 class MultiHeadGATBackbone(nn.Module):
-    def __init__(self, n_max, feature_dim=9, hidden_dim=64, out_dim=128, heads=4):
+    def __init__(self, n_max, feature_dim=8, hidden_dim=64, out_dim=128, heads=4):
         super().__init__()
         self.n_max = n_max
         self.feature_dim = feature_dim
@@ -890,68 +888,7 @@ if __name__ == "__main__":
                 next_obs, reward, done, next_info = step_data
                 resets = done
 
-            if args.reward_cheat:
-                agent_radius = 0.15
-                collision_penalty = 0.5
-                
-                cheat_raw_obs = next_info["raw_obs"].clone()
-                if "final_info" in next_info:
-                    for i, fin_info in enumerate(next_info["final_info"]):
-                        if fin_info is not None and "raw_obs" in fin_info:
-                            cheat_raw_obs[i] = fin_info["raw_obs"].clone()
-
-                raw_obs_tensor = torch.Tensor(cheat_raw_obs).to(device)
-                new_landmark_dist = raw_obs_tensor.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
-                new_landmark_dist = new_landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
-                
-                # Shape: [num_games, num_agents, num_landmarks]
-                dist = torch.norm(new_landmark_dist, dim=-1)
-                
-                # --- 1. EPISODIC STATIC ASSIGNMENT ---
-                # Check which games just reset (or are at step 0)
-                game_resets = resets.view(num_games, num_agents_per_game)[:, 0]
-                needs_assignment = needs_assignment | game_resets
-                
-                # If any game reset, recalculate its optimal shortest-path routing
-                if needs_assignment.any():
-                    dist_clone = dist.clone()
-                    
-                    # Only calculate for games that need it
-                    for g in range(num_games):
-                        if needs_assignment[g]:
-                            for _ in range(args.num_landmarks):
-                                flat_dist = dist_clone[g].view(-1)
-                                min_val, min_idx = flat_dist.min(dim=0)
-                                
-                                agent_idx = min_idx // args.num_landmarks
-                                landmark_idx = min_idx % args.num_landmarks
-                                
-                                current_assignments[g, agent_idx] = landmark_idx
-                                
-                                dist_clone[g, agent_idx, :] = float('inf')
-                                dist_clone[g, :, landmark_idx] = float('inf')
-                                
-                    needs_assignment.fill_(False)
-                
-                # Extract the distance to the frozen, optimally assigned target
-                assigned_dist = torch.gather(dist, 2, current_assignments.unsqueeze(-1)).squeeze(-1)
-                
-                # --- 2. PROCEDURAL SQUARE ROOT CALCULUS ---
-                # Calculate the mathematical tipping point for the dead-center snap
-                min_snap_multiplier = collision_penalty / np.sqrt(agent_radius)
-                
-                # Apply a safety factor (> 1.0) to guarantee the snap overpowers engine physics
-                snap_factor = 1.5 
-                procedural_multiplier = min_snap_multiplier * snap_factor
-                
-                # R = -M * sqrt(d)
-                individual_pull = -procedural_multiplier * torch.sqrt(assigned_dist + 1e-8)
-                
-                # Combine with native environment reward
-                rewards[step] = torch.tensor(reward).to(device).view(-1) + individual_pull.view(-1)
-            else:
-                # normalized_step_rewards = reward_norm(reward, done)
-                rewards[step] = reward.clone().to(device).view(-1)
+            rewards[step] = reward.clone().to(device).view(-1)
             next_obs, next_done = next_obs.clone().to(device), done.clone().to(device).float()
 
             # LOGGING TEAM DATA
@@ -1080,9 +1017,7 @@ if __name__ == "__main__":
 
                 mb_advantages = b_advantages[mb_inds]
                 if args.norm_adv:
-                    mb_adv_reshaped = mb_advantages.view(-1, agent.num_agents)
-                    mb_adv_reshaped = (mb_adv_reshaped - mb_adv_reshaped.mean(dim=0)) / (mb_adv_reshaped.std(dim=0) + 1e-7)
-                    mb_advantages = mb_adv_reshaped.reshape(-1)
+                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
                 # Policy loss
                 pg_loss1 = -mb_advantages * ratio
