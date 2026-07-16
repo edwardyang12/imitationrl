@@ -256,26 +256,21 @@ class VectorGCNConv(MessagePassing):
 
 
 class FairVectorGCNBackbone(nn.Module):
-    def __init__(self, n_max, feature_dim=9, hidden_dim=64, out_dim=128, heads=4):
+    def __init__(self, n_max, feature_dim=8, hidden_dim=64, out_dim=128, heads=4):
         super().__init__()
         self.n_max = n_max
         self.feature_dim = feature_dim
         
-        # CAPACITY PARITY (Match GAT's concat=True expansion width)
-        wide_dim = hidden_dim * heads  # 64 * 4 = 256
+        # 1. CAPACITY PARITY: Match GAT's concat=True expansion width (64 * 4 = 256)
+        wide_dim = hidden_dim * heads  
         
+        # 2. STRUCTURAL PARITY: Exactly 3 convolutions, no LayerNorms
         self.gcn1 = VectorGCNConv(feature_dim, wide_dim, edge_dim=3)
         self.gcn2 = VectorGCNConv(wide_dim, wide_dim, edge_dim=3)
         self.gcn3 = VectorGCNConv(wide_dim, out_dim, edge_dim=3)
         
-        # PARITY UPGRADE 2: LayerNorms at wide_dim (256)
-        self.ln1 = nn.LayerNorm(wide_dim)
-        self.ln2 = nn.LayerNorm(wide_dim)
-        
-        # PARITY UPGRADE 3: Dual Skip Connections
-        self.skip_proj1 = nn.Linear(feature_dim, wide_dim)
-        self.skip_proj2 = nn.Linear(wide_dim, out_dim) # The Ego Amnesia fix
-        
+        # 3. RESIDUAL PARITY: Match GAT's single skip projection exactly
+        self.skip_proj = nn.Linear(feature_dim, wide_dim)
         self.elu = nn.ELU()
 
     def _build_fc_dynamic_graph(self, x_flat):
@@ -289,7 +284,7 @@ class FairVectorGCNBackbone(nn.Module):
         batch_indices = torch.arange(B, device=device).view(-1, 1).expand(B, self.n_max)
         valid_batch = batch_indices[active_mask] 
         
-        # UPDATED: Use the memory-safe Block-Diagonal builder to prevent OOM
+        # Memory-safe Block-Diagonal builder
         local_idx = torch.arange(self.n_max, device=device)
         grid_r, grid_c = torch.meshgrid(local_idx, local_idx, indexing='ij')
         local_edges = torch.stack([grid_r.flatten(), grid_c.flatten()], dim=0)
@@ -300,10 +295,9 @@ class FairVectorGCNBackbone(nn.Module):
         active_flat = active_mask.view(-1)
         valid_edge_mask = active_flat[global_edges[0]] & active_flat[global_edges[1]]
         
-        # FIX: We intentionally DO NOT strip self-loops here! 
-        # VectorGCNConv does not auto-add self loops, so we must leave them in the graph 
-        # natively (with distance=0.0) so the ego node can remember its own features.
-        
+        # CRITICAL PARITY NOTE: Unlike GATConv which has add_self_loops=True, 
+        # VectorGCNConv does not auto-inject self loops. We intentionally DO NOT strip 
+        # self-loops here so the ego node retains its own features during mean aggregation!
         padded_edge_index = global_edges[:, valid_edge_mask]
         
         padded_to_active = torch.zeros(B * self.n_max, dtype=torch.long, device=device)
@@ -314,33 +308,29 @@ class FairVectorGCNBackbone(nn.Module):
         
         rel_pos = valid_x[row, :2] - valid_x[col, :2]
         
-        # PARITY UPGRADE 1: Log-compressed distance
-        raw_distances = torch.sqrt((rel_pos ** 2).sum(dim=-1, keepdim=True) + 1e-8)
-        log_distances = torch.log(raw_distances + 1.0)
+        # 4. EDGE PARITY: Match GAT by using raw uncompressed distances
+        distances = torch.sqrt((rel_pos ** 2).sum(dim=-1, keepdim=True) + 1e-8)
         
-        edge_attr = torch.cat([rel_pos, log_distances], dim=-1)
+        # Identical 3D edge attributes: [dx, dy, distance]
+        edge_attr = torch.cat([rel_pos, distances], dim=-1)
         
         return valid_x, edge_index, edge_attr, valid_batch
 
     def forward(self, x_flat):
         valid_x, edge_index, edge_attr, valid_batch = self._build_fc_dynamic_graph(x_flat)
         
-        res1 = self.skip_proj1(valid_x)
+        res = self.skip_proj(valid_x)
         
-        # Layer 1 Pipeline
+        # Layer 1: Identical skip + ELU routing
         h = self.gcn1(valid_x, edge_index, edge_attr=edge_attr)
-        h = self.ln1(h)
-        h = self.elu(h) + res1 
+        h = self.elu(h) + res 
         
-        # Layer 2 Pipeline
+        # Layer 2: Identical residual routing
         h2 = self.gcn2(h, edge_index, edge_attr=edge_attr)
-        h2 = self.ln2(h2)
         h2 = self.elu(h2) + h 
         
-        # Layer 3 Pipeline (Ego Preservation Parity)
-        res_final = self.skip_proj2(h2)
+        # Layer 3: No final residual, matching GAT exactly
         node_embeddings = self.gcn3(h2, edge_index, edge_attr=edge_attr) 
-        node_embeddings = self.elu(node_embeddings) + res_final
         
         return valid_x, node_embeddings, valid_batch
 
@@ -393,7 +383,7 @@ class GraphAgent(nn.Module):
         self.backbone = MultiHeadGATBackbone(n_max=n_max, feature_dim=9)
 
         # GCN 
-        # self.backbone = SimpleGCNBackbone(n_max=n_max, feature_dim=9)
+        # self.backbone = FairVectorGCNBackbone(n_max=n_max, feature_dim=9)
         gat_out_dim = 128
         
         self.actor_mlp = nn.Sequential(
@@ -1016,6 +1006,12 @@ if __name__ == "__main__":
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
                 mb_advantages = b_advantages[mb_inds]
+
+                # will need this for heterogenous
+                # if args.norm_adv:
+                #     mb_adv_reshaped = mb_advantages.view(-1, agent.num_agents)
+                #     mb_adv_reshaped = (mb_adv_reshaped - mb_adv_reshaped.mean(dim=0)) / (mb_adv_reshaped.std(dim=0) + 1e-7)
+                #     mb_advantages = mb_adv_reshaped.reshape(-1)
                 if args.norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 

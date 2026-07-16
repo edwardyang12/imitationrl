@@ -129,7 +129,7 @@ class FlockingCleanObs(BaseFlocking):
         # 4. Reynolds Separation / Uniform Spacing
         # Penalize agents that intrude into a "personal bubble" to encourage a wide, uniform lattice
         separation_penalty = 0.0
-        desired_spacing = 0.35
+        desired_spacing = 0.4
         for a in self.world.agents:
             if a != agent:
                 dist = torch.linalg.norm(a.state.pos - agent.state.pos, dim=-1)
@@ -143,7 +143,6 @@ class FlockingCleanObs(BaseFlocking):
 
         # Combine base rewards with explicitly weighted Reynolds physics rules
         shaped_reward = base_reward + (target_match_penalty * 0.05) + (flock_match_penalty * 0.05) + (separation_penalty * 0.1) + (cohesion_penalty * 0.05)
-        
         return shaped_reward
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
@@ -451,7 +450,7 @@ class VMASVectorizedEnv:
             n_agents=self.num_agents,
             seed=seed,
             dict_spaces=False,
-            n_obstacles = 1
+            n_obstacles = 0
         )
         
         self.single_action_space = self.env.action_space[0]
@@ -466,6 +465,11 @@ class VMASVectorizedEnv:
         self.episode_count = 0
         self.record_this_episode = self.args.capture_video
         self.video_frames = []
+
+        self.ep_polarization = torch.zeros(self.num_games, device=self.device)
+        self.ep_cohesion = torch.zeros(self.num_games, device=self.device)
+        self.ep_tracking = torch.zeros(self.num_games, device=self.device)
+        self.ep_collisions = torch.zeros(self.num_games, device=self.device)
 
     def _apply_graph_formatting(self, stacked_vmas_obs):
         # 1. Dynamically read batch size so evaluation (B=1) doesn't crash
@@ -511,6 +515,14 @@ class VMASVectorizedEnv:
         # --- NEW: Force Target (index N) to ALWAYS be included in top-K ---
         target_idx = torch.full((B, N), N, device=self.device, dtype=torch.long)
         distances[batch_idx, ego_idx, target_idx] = -1e8
+        
+        # --- NEW: Force the Nearest Obstacle to ALWAYS be included ---
+        if O > 0:
+            obs_distances = distances[:, :, N+1:N+1+O]
+            _, nearest_obs_local_idx = torch.min(obs_distances, dim=-1)
+            nearest_obs_global_idx = nearest_obs_local_idx + (N + 1)
+            # Mask the nearest obstacle distance to -1e7
+            distances[batch_idx, ego_idx, nearest_obs_global_idx] = -1e7
         # ------------------------------------------------------------------
         
         total_entities = N + 1 + O
@@ -562,6 +574,11 @@ class VMASVectorizedEnv:
         vmas_obs = self.env.reset()
         self.episode_returns.zero_()
         self.step_count = 0
+
+        self.ep_polarization.zero_()
+        self.ep_cohesion.zero_()
+        self.ep_tracking.zero_()
+        self.ep_collisions.zero_()
         
         # Generate new random tags for tracking identity across the episode
         self.episode_tags = torch.rand((self.num_games, self.num_agents), device=self.device)
@@ -578,8 +595,17 @@ class VMASVectorizedEnv:
         vmas_obs, vmas_rews, _, vmas_info = self.env.step(vmas_actions)
         self.step_count += 1
         
-        rewards = torch.stack(vmas_rews, dim=1).reshape(-1)
+        rewards = torch.stack(vmas_rews, dim=1).reshape(-1).detach()
         self.episode_returns += rewards
+        stacked_obs = torch.stack(vmas_obs, dim=1).detach()
+
+        # --- CONTINUOUSLY ACCUMULATE METRICS ---
+        with torch.no_grad():
+            step_metrics = compute_flocking_metrics(stacked_obs)
+            self.ep_polarization += step_metrics["polarization"]
+            self.ep_cohesion += step_metrics["cohesion_spread"]
+            self.ep_tracking += step_metrics["tracking_error"]
+            self.ep_collisions += step_metrics["collision_rate"]
 
         # --- RESTORED VIDEO LOGIC ---
         if self.record_this_episode:
@@ -603,7 +629,6 @@ class VMASVectorizedEnv:
             self.video_frames.append(grid)
         # ----------------------------
 
-        stacked_obs = torch.stack(vmas_obs, dim=1)
         final_obs = self._apply_graph_formatting(stacked_obs)
         
         is_done = self.step_count >= self.args.max_cycles
@@ -618,6 +643,14 @@ class VMASVectorizedEnv:
             self.episode_count += 1
             info["terminal_raw_obs"] = info["raw_obs"].clone()
             info["terminal_observation"] = final_obs.clone()
+
+            # --- PACK TRUE EPISODIC AVERAGES INTO INFO DICT ---
+            info["episode_metrics"] = {
+                "polarization": (self.ep_polarization / self.step_count).mean().item(),
+                "cohesion_spread": (self.ep_cohesion / self.step_count).mean().item(),
+                "tracking_error": (self.ep_tracking / self.step_count).mean().item(),
+                "collision_rate": (self.ep_collisions / self.step_count).mean().item(),
+            }
             
             # --- RESTORED VIDEO SAVE LOGIC ---
             if self.record_this_episode and self.video_frames:
@@ -640,6 +673,11 @@ class VMASVectorizedEnv:
             vmas_obs = self.env.reset()
             self.episode_returns.zero_()
             self.step_count = 0
+
+            self.ep_polarization.zero_()
+            self.ep_cohesion.zero_()
+            self.ep_tracking.zero_()
+            self.ep_collisions.zero_()
             
             self.episode_tags = torch.rand((self.num_games, self.num_agents), device=self.device)
             stacked_obs = torch.stack(vmas_obs, dim=1)
@@ -650,16 +688,11 @@ class VMASVectorizedEnv:
 
     def close(self): pass
 
-def compute_flocking_metrics(stacked_vmas_obs, agent_radius=0.15):
+def compute_flocking_metrics(stacked_vmas_obs, agent_radius=0.1):
     """
     Computes scale-invariant physical metrics for multi-agent flocking.
-    
-    Args:
-        stacked_vmas_obs: Tensor of shape (Batch, N, Obs_Dim)
-        agent_radius: The physical radius of the agents in the environment simulator
-        
-    Returns:
-        dict: A dictionary of mean metric values across the batch
+    Modified to return un-aggregated batched tensors so they can be integrated
+    across the entire episode cleanly.
     """
     B = stacked_vmas_obs.shape[0]
     N = stacked_vmas_obs.shape[1]
@@ -670,44 +703,38 @@ def compute_flocking_metrics(stacked_vmas_obs, agent_radius=0.15):
     target_rel = stacked_vmas_obs[:, 0:1, 4:6] # (B, 1, 2)
     target_abs = pos[:, 0:1, :] + target_rel # (B, 1, 2)
     
-    # --- Metric 1: Polarization Order Parameter (Heading Alignment) ---
-    # Normalizes velocities to get pure heading directions, then averages them.
-    # 1.0 = Perfect parallel alignment, ~0.0 = Chaotic scatter or inward radial pointing
+    # --- Metric 1: Polarization Order Parameter ---
     speeds = torch.norm(vel, dim=-1, keepdim=True) + 1e-8
     headings = vel / speeds
     mean_headings = headings.sum(dim=1) / N
-    polarization = torch.norm(mean_headings, dim=-1).mean().item()
+    polarization = torch.norm(mean_headings, dim=-1) # Shape (B,)
     
     # --- Metric 2: Center-of-Mass Cohesion Spread ---
-    # Measures how tightly packed the flock is.
     com = pos.mean(dim=1, keepdim=True) # (B, 1, 2)
-    cohesion_spread = torch.norm(pos - com, dim=-1).mean().item()
+    cohesion_spread = torch.norm(pos - com, dim=-1).mean(dim=1) # Shape (B,)
     
     # --- Metric 3: Target Tracking Error ---
-    # Distance between the flock's Center of Mass and the actual Target
-    tracking_error = torch.norm(com - target_abs, dim=-1).mean().item()
+    tracking_error = torch.norm(com - target_abs, dim=-1).squeeze(1) # Shape (B,)
     
     # --- Metric 4: Collision / Crowding Rate ---
-    # % of agents currently violating the physical collision boundary of another agent
     pos_expanded_1 = pos.unsqueeze(2) # (B, N, 1, 2)
     pos_expanded_2 = pos.unsqueeze(1) # (B, 1, N, 2)
     pairwise_distances = torch.norm(pos_expanded_1 - pos_expanded_2, dim=-1) # (B, N, N)
     
-    # Ignore self-distances (diagonal)
     eye_mask = torch.eye(N, device=pos.device).unsqueeze(0).bool()
     pairwise_distances.masked_fill_(eye_mask, float('inf'))
     
-    # Check if distance is less than 2x radius (diameter)
     collision_threshold = agent_radius * 2.0
     is_colliding = (pairwise_distances < collision_threshold).any(dim=-1).float() # (B, N)
-    collision_rate = is_colliding.mean().item()
+    collision_rate = is_colliding.mean(dim=1) # Shape (B,)
     
     return {
-        "metrics/polarization": polarization,
-        "metrics/cohesion_spread": cohesion_spread,
-        "metrics/tracking_error": tracking_error,
-        "metrics/collision_rate": collision_rate
+        "polarization": polarization,
+        "cohesion_spread": cohesion_spread,
+        "tracking_error": tracking_error,
+        "collision_rate": collision_rate
     }
+
 
 if __name__ == "__main__":
 
@@ -906,19 +933,15 @@ if __name__ == "__main__":
                     
                     # Option A: Mean Return per Agent across the team
                     avg_return = ep_returns.mean().item()
-
-                    raw_obs_tensor = torch.Tensor(next_info["terminal_raw_obs"]).to(device).view(num_games, num_agents_per_game, -1)
-                    metrics = compute_flocking_metrics(raw_obs_tensor[done_games])
-                    
-                    writer.add_scalar("charts/polarization", metrics["metrics/polarization"], global_step)
-                    writer.add_scalar("charts/cohesion_spread", metrics["metrics/cohesion_spread"], global_step)
-                    writer.add_scalar("charts/tracking_error", metrics["metrics/tracking_error"], global_step)
-                    writer.add_scalar("charts/collision_rate", metrics["metrics/collision_rate"], global_step)
-                    
-                    # Option B: Total Cumulative Return of the whole team per game
-                    # avg_return = ep_returns.sum(dim=1).mean().item()
-                    
                     avg_length = ep_lengths.float().mean().item()
+
+                    # Grab the continuous episodic averages cleanly from next_info
+                    metrics = next_info["episode_metrics"]
+                    
+                    writer.add_scalar("charts/polarization", metrics["polarization"], global_step)
+                    writer.add_scalar("charts/cohesion_spread", metrics["cohesion_spread"], global_step)
+                    writer.add_scalar("charts/tracking_error", metrics["tracking_error"], global_step)
+                    writer.add_scalar("charts/collision_rate", metrics["collision_rate"], global_step)
                     
                     print(f"global_step={global_step}, episodic_return={avg_return:.2f}")
                     writer.add_scalar("charts/team_episodic_return", avg_return, global_step)
@@ -1133,7 +1156,7 @@ if __name__ == "__main__":
         n_agents=eval_num_agents,
         seed=args.seed + 100, # Offset seed so it's a novel starting position
         dict_spaces=False,
-        n_obstacles = 1
+        n_obstacles = 0
     )
     
     # 3. Reset and prep the observation format

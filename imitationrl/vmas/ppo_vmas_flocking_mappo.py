@@ -149,30 +149,56 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 class ObservationNormalizer(nn.Module):
-    def __init__(self, shape, epsilon=1e-5):
+    def __init__(self, n_max, feature_dim=9, continuous_dim=4, epsilon=1e-5):
         super().__init__()
-        self.register_buffer("running_mean", torch.zeros(shape))
-        self.register_buffer("running_var", torch.ones(shape))
+        self.n_max = n_max
+        self.feature_dim = feature_dim
+        self.continuous_dim = continuous_dim
+        
+        # Track 4 floats, but we will strictly keep X=Y and VX=VY isotropic
+        self.register_buffer("running_var", torch.ones(continuous_dim))
         self.count = epsilon
 
-    def update(self, x):
-        batch_mean = x.mean(dim=0)
-        batch_var = x.var(dim=0, unbiased=False)
-        batch_count = x.shape[0]
-
-        # Update running mean and variance using Welford's algorithm
-        delta = batch_mean - self.running_mean
-        new_mean = self.running_mean + delta * batch_count / (self.count + batch_count)
-        m_a = self.running_var * self.count
-        m_b = batch_var * batch_count
-        m_2 = m_a + m_b + delta**2 * self.count * batch_count / (self.count + batch_count)
+    def update(self, x_flat):
+        B = x_flat.shape[0]
+        x_reshaped = x_flat.view(B, self.n_max, self.feature_dim)
         
-        self.running_mean = new_mean
-        self.running_var = m_2 / (self.count + batch_count)
+        active_mask = x_reshaped[:, :, 6] > 0.5 
+        
+        # 1. SPATIAL ISOTROPIC VARIANCE (Pool X and Y together)
+        valid_pos = x_reshaped[active_mask][:, :2]
+        clamped_pos = torch.clamp(valid_pos, min=-5.0, max=5.0)
+        pos_var_scalar = (clamped_pos ** 2).mean() 
+        
+        # 2. VELOCITY ISOTROPIC VARIANCE (Strictly isolate the Ego node: index 4 == 1.0)
+        ego_mask = (x_reshaped[:, :, 4] > 0.5) & active_mask
+        valid_vel = x_reshaped[ego_mask][:, 2:4]
+        clamped_vel = torch.clamp(valid_vel, min=-5.0, max=5.0)
+        vel_var_scalar = (clamped_vel ** 2).mean()
+
+        # Reconstruct an isotropic variance buffer: [σ_p^2, σ_p^2, σ_v^2, σ_v^2]
+        batch_var = torch.stack([pos_var_scalar, pos_var_scalar, vel_var_scalar, vel_var_scalar])
+        batch_count = valid_pos.shape[0]
+
+        delta_var = batch_var - self.running_var
+        self.running_var = self.running_var + delta_var * (batch_count / (self.count + batch_count))
         self.count += batch_count
 
-    def normalize(self, x):
-        return (x - self.running_mean) / torch.sqrt(self.running_var + 1e-8)
+    def normalize(self, x_flat):
+        B = x_flat.shape[0]
+        x_reshaped = x_flat.view(B, self.n_max, self.feature_dim).clone()
+        
+        active_mask = x_reshaped[:, :, 6] > 0.5
+        valid_x = x_reshaped[active_mask] 
+        valid_continuous = valid_x[:, :self.continuous_dim]
+        
+        # Safe isotropic scale
+        normalized_continuous = valid_continuous / torch.sqrt(self.running_var + 1e-8)
+        
+        valid_x[:, :self.continuous_dim] = normalized_continuous
+        x_reshaped[active_mask] = valid_x
+        
+        return x_reshaped.view(B, -1)
 
 class PopArt(nn.Module):
     def __init__(self, input_dim, output_dim, beta=0.99):

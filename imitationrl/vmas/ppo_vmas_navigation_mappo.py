@@ -18,6 +18,7 @@ import torch.optim as optim
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 from vmas.scenarios.navigation import Scenario as BaseNavigation
+from ppo_vmas_navigation_gnn import GraphObservationNormalizer
 
 def parse_args():
     # fmt: off
@@ -32,7 +33,7 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="vmas",
+    parser.add_argument("--wandb-project-name", type=str, default="vmas-navigation-mlp",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
@@ -42,13 +43,13 @@ def parse_args():
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="navigation",
         help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=100000000,
+    parser.add_argument("--total-timesteps", type=int, default=300000000,
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=7e-4,
         help="the learning rate of the optimizer")
-    parser.add_argument("--num-envs", type=int, default=2048,
+    parser.add_argument("--num-envs", type=int, default=4096,
         help="the number of parallel game environments")
-    parser.add_argument("--num-steps", type=int, default=128,
+    parser.add_argument("--num-steps", type=int, default=256,
         help="the number of steps to run in each environment per policy rollout")
     parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggle learning rate annealing for policy and value networks")
@@ -58,7 +59,7 @@ def parse_args():
         help="the discount factor gamma")
     parser.add_argument("--gae-lambda", type=float, default=0.95,
         help="the lambda for the general advantage estimation")
-    parser.add_argument("--num-minibatches", type=int, default=128,
+    parser.add_argument("--num-minibatches", type=int, default=256,
         help="the number of mini-batches")
     parser.add_argument("--update-epochs", type=int, default=5,
         help="the K epochs to update the policy")
@@ -78,10 +79,11 @@ def parse_args():
         help="the target KL divergence threshold")
     parser.add_argument("--num-landmarks", type=int, default=3,
         help="number of agents and landmarks")
-    parser.add_argument("--max-cycles", type=int, default=100,
+    parser.add_argument("--max-cycles", type=int, default=250,
         help="length of environment run")
     parser.add_argument("--reward-cheat", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will have extra reward cheats")
+    parser.add_argument("--n-max", type=int, default=5, help="Fixed context window size for K-NN")
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -107,32 +109,6 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
-
-class ObservationNormalizer(nn.Module):
-    def __init__(self, shape, epsilon=1e-5):
-        super().__init__()
-        self.register_buffer("running_mean", torch.zeros(shape))
-        self.register_buffer("running_var", torch.ones(shape))
-        self.count = epsilon
-
-    def update(self, x):
-        batch_mean = x.mean(dim=0)
-        batch_var = x.var(dim=0, unbiased=False)
-        batch_count = x.shape[0]
-
-        # Update running mean and variance using Welford's algorithm
-        delta = batch_mean - self.running_mean
-        new_mean = self.running_mean + delta * batch_count / (self.count + batch_count)
-        m_a = self.running_var * self.count
-        m_b = batch_var * batch_count
-        m_2 = m_a + m_b + delta**2 * self.count * batch_count / (self.count + batch_count)
-        
-        self.running_mean = new_mean
-        self.running_var = m_2 / (self.count + batch_count)
-        self.count += batch_count
-
-    def normalize(self, x):
-        return (x - self.running_mean) / torch.sqrt(self.running_var + 1e-8)
 
 class PopArt(nn.Module):
     def __init__(self, input_dim, output_dim, beta=0.99):
@@ -173,22 +149,18 @@ class PopArt(nn.Module):
         return (x - self.mean) / torch.sqrt(self.std**2 + 1e-8)
 
 class Agent(nn.Module):
-    def __init__(self, single_action_space, single_obs_shape, num_agents, state_dim):
+    def __init__(self, single_action_space, single_obs_shape, num_agents, state_dim, n_max=10):
         super().__init__()
         self.num_agents = num_agents
-
-        self.obs_dim = np.array(single_obs_shape).prod()
+        self.obs_dim = np.array(single_obs_shape).prod() # Exactly 2 * n_max * 9
         self.action_dim = np.prod(single_action_space.shape)
-        # self.value_normalizer = ValueNormalizer(num_agents)
-        self.obs_normalizer = ObservationNormalizer(self.obs_dim)
+        
+        # Shared Isotropic Normalizer
+        self.obs_normalizer = GraphObservationNormalizer(n_max=n_max, feature_dim=9, continuous_dim=4)
 
-        self.agent_id_embedding = nn.Embedding(num_agents, 10) # this 10 can be changed later
-
-        self.state_normalizer = ObservationNormalizer(state_dim)
-
-        # SHARED ACTOR: One brain for all agents
+        # 1. DECENTRALIZED ACTOR (No embeddings, no global state -> 100% invariant to N!)
         self.actor = nn.Sequential(
-            layer_init(nn.Linear(self.obs_dim + 10, 1024)),
+            layer_init(nn.Linear(self.obs_dim, 1024)),
             nn.LayerNorm(1024), nn.ReLU(),
             layer_init(nn.Linear(1024, 512)),
             nn.LayerNorm(512), nn.ReLU(),
@@ -197,22 +169,17 @@ class Agent(nn.Module):
             layer_init(nn.Linear(256, 256)),
             nn.ReLU(),
         )
-
-        # The Mean Head (Restored Tanh for instant braking)
         self.actor_mean = nn.Sequential(
             layer_init(nn.Linear(256, self.action_dim), std=0.01),
             nn.Tanh() 
         )
-
-        # The Variance Head (Starts with a bias of -0.5 to match your original initialization)
         self.actor_logstd = nn.Parameter(torch.zeros(1, self.action_dim))
 
-        # SHARED CENTRALIZED CRITIC: One brain to judge the whole team
-        concatenated_obs_dim = self.num_agents * self.obs_dim
-        self.critic_projection = nn.Linear(concatenated_obs_dim, state_dim) if concatenated_obs_dim != state_dim else nn.Identity()
-        
+        # 2. CENTRALIZED CRITIC (Receives joint state of ALL agents to stabilize GAE training!)
+        # Notice we use state_dim (or num_agents * obs_dim), which gives it true CTDE clarity.
+        joint_critic_dim = self.num_agents * self.obs_dim
         self.critic_encoder = nn.Sequential(
-            layer_init(nn.Linear(state_dim, 512)),
+            layer_init(nn.Linear(joint_critic_dim, 512)), 
             nn.LayerNorm(512), nn.ReLU(),
             layer_init(nn.Linear(512, 512)),
             nn.LayerNorm(512), nn.ReLU(),
@@ -221,48 +188,37 @@ class Agent(nn.Module):
             layer_init(nn.Linear(256, 256)),
             nn.ReLU(),
         )
-        self.critic = PopArt(256, self.num_agents)
+        self.critic = PopArt(256, 1)
 
-    def get_value(self, x, centralized_state=None, denormalize=False):
-        if centralized_state is None:
-            x_norm = self.obs_normalizer.normalize(x)
-            batch_size = x.shape[0]
-            num_games = batch_size // self.num_agents
-            proxy_state = x_norm.view(num_games, -1)
-            centralized_state = self.critic_projection(proxy_state)
-        else:
-            centralized_state = self.state_normalizer.normalize(centralized_state)
-            
-        all_agent_values = self.critic(self.critic_encoder(centralized_state)) 
-        if denormalize:
-            all_agent_values = self.critic.denormalize(all_agent_values)
-        return all_agent_values.view(-1, 1)
-
-    def get_action_and_value(self, x, action=None, centralized_state=None, denormalize=False):
+    def get_value(self, x, denormalize=False):
         x_norm = self.obs_normalizer.normalize(x)
-        batch_size = x.shape[0] 
+        batch_size = x.shape[0]
+        num_games = batch_size // self.num_agents
         
-        agent_ids = torch.arange(self.num_agents).to(x.device).repeat(batch_size // self.num_agents)
-        embedded_ids = self.agent_id_embedding(agent_ids)
-        actor_input = torch.cat([x_norm, embedded_ids], dim=-1)
+        # Concatenate local K-NN observations across all agents in the game into a joint state vector
+        joint_state = x_norm.view(num_games, -1)
+        expanded_joint_state = joint_state.repeat_interleave(self.num_agents, dim=0)
         
-        # Extract features
-        actor_features = self.actor(actor_input)
+        values = self.critic(self.critic_encoder(expanded_joint_state)) 
+        if denormalize:
+            values = self.critic.denormalize(values)
+        return values.view(-1, 1)
+
+    def get_action_and_value(self, x, action=None, denormalize=False):
+        x_norm = self.obs_normalizer.normalize(x)
         
-        # Branch into Mean and LogStd
+        # Actor strictly observes local K-NN graph
+        actor_features = self.actor(x_norm)
         action_means = self.actor_mean(actor_features)
         action_logstds = self.actor_logstd.expand_as(action_means)
-        
-        # Loosely bound the logstd to prevent NaN explosions, allowing near-zero variance
         safe_logstds = torch.clamp(action_logstds, min=-5.0, max=2.0)
         action_stds = safe_logstds.exp()
         
         probs = Normal(action_means, action_stds)
-        
         if action is None:
             action = probs.sample()
             
-        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.get_value(x, centralized_state, denormalize)
+        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.get_value(x, denormalize)
 
 class VMASVectorizedEnv:
     def __init__(self, args, seed, run_name, update_step=0):
@@ -283,13 +239,18 @@ class VMASVectorizedEnv:
             collisions=True,
             observe_all_goals=False,
             seed=seed,
-            dict_spaces=False
+            dict_spaces=False,
+            world_spawning_x=2.5,
+            world_spawning_y=2.5,
+            enforce_bounds=True
         )
         
         vmas_obs_dim = self.env.observation_space[0].shape[0]
         self.single_action_space = self.env.action_space[0]
+        self.n_max = args.n_max
+        self.feature_dim = 9
         
-        target_dim = vmas_obs_dim + self.num_agents
+        target_dim = self.n_max * 2 * self.feature_dim
         self.single_observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(target_dim,))
         
         self.episode_returns = torch.zeros(self.num_envs, device=self.device)
@@ -299,10 +260,80 @@ class VMASVectorizedEnv:
         self.record_this_episode = self.args.capture_video
         self.video_frames = []
 
-    def _apply_stack_and_indicator(self, stacked_vmas_obs):
-        indicators = torch.eye(self.num_agents, device=self.device).unsqueeze(0).expand(self.num_games, -1, -1)
-        final_obs = torch.cat([stacked_vmas_obs, indicators], dim=-1)
-        return final_obs.reshape(self.num_envs, -1)
+    def _apply_graph_formatting(self, stacked_vmas_obs):
+        B = self.num_games
+        N = self.num_agents
+        K = self.args.n_max # The fixed number of agents (and landmarks) to observe
+        
+        # 1. Extract raw absolute positions and velocities
+        abs_pos = stacked_vmas_obs[:, :, 0:2] # (B, N, 2)
+        vel = stacked_vmas_obs[:, :, 2:4]     # (B, N, 2)
+        ego_to_goal = stacked_vmas_obs[:, :, 4:6] # (B, N, 2)
+        
+        # 2. Reconstruct absolute positions of ALL goals
+        goal_abs = abs_pos - ego_to_goal 
+        
+        # 3. Calculate Relative Positions independently
+        ego_pos = abs_pos.unsqueeze(2) # (B, N, 1, 2)
+        rel_agents = abs_pos.unsqueeze(1) - ego_pos # (B, N, N, 2)
+        rel_goals = goal_abs.unsqueeze(1) - ego_pos # (B, N, N, 2)
+        
+        # 4. Calculate Distances
+        dist_agents = torch.norm(rel_agents, dim=-1) # (B, N, N)
+        dist_goals = torch.norm(rel_goals, dim=-1) # (B, N, N)
+        
+        # 5. The "Ego & Target" Override
+        # Force Ego and Target Landmark distances to -infinity so they are always selected
+        batch_idx = torch.arange(B, device=self.device).view(B, 1).expand(B, N)
+        ego_idx = torch.arange(N, device=self.device).view(1, N).expand(B, N)
+        
+        dist_agents[batch_idx, ego_idx, ego_idx] = -1e9
+        dist_goals[batch_idx, ego_idx, ego_idx] = -1e9 # Ego's goal matches its index
+        
+        # 6. Execute Independent K-Nearest Neighbors
+        actual_k = min(K, N) # Prevent crash if env N is smaller than K
+        _, topk_agents_idx = torch.topk(dist_agents, k=actual_k, dim=-1, largest=False) # (B, N, K)
+        _, topk_goals_idx = torch.topk(dist_goals, k=actual_k, dim=-1, largest=False) # (B, N, K)
+        
+        # 7. Build the Dense Feature Matrices for ALL N entities
+        is_self_matrix = torch.eye(N, device=self.device).view(1, N, N)
+        
+        # --- Agents Matrix ---
+        graph_agents = torch.zeros((B, N, N, self.feature_dim), device=self.device)
+        graph_agents[..., 0:2] = rel_agents
+        graph_agents[..., 4] = is_self_matrix # is_self
+        graph_agents[..., 6] = 1.0 # is_active
+        graph_agents[..., 7] = self.episode_tags.unsqueeze(1).expand(B, N, N)
+        graph_agents[..., 8] = 0.0 # is_my_goal
+        
+        # --- Goals Matrix ---
+        graph_goals = torch.zeros((B, N, N, self.feature_dim), device=self.device)
+        graph_goals[..., 0:2] = rel_goals
+        graph_goals[..., 5] = 1.0 # is_landmark
+        graph_goals[..., 6] = 1.0 # is_active
+        graph_goals[..., 7] = self.episode_tags.unsqueeze(1).expand(B, N, N)
+        graph_goals[..., 8] = is_self_matrix # is_my_goal
+
+        # 8. Gather Features
+        exp_agents_idx = topk_agents_idx.unsqueeze(-1).expand(-1, -1, -1, self.feature_dim)
+        gathered_agents = torch.gather(graph_agents, dim=2, index=exp_agents_idx)
+        
+        exp_goals_idx = topk_goals_idx.unsqueeze(-1).expand(-1, -1, -1, self.feature_dim)
+        gathered_goals = torch.gather(graph_goals, dim=2, index=exp_goals_idx)
+        
+        # 9. Apply Velocity strictly to Ego
+        # Because Ego's distance is -1e9, topk guarantees it is sorted to index 0 of the gathered agents
+        gathered_agents[:, :, 0, 2:4] = vel 
+        
+        # 10. Combine into 2*K nodes
+        graph = torch.cat([gathered_agents, gathered_goals], dim=2) # Shape: (B, N, 2K, 9)
+        
+        # 11. Zero-Padding if env size N < K
+        if actual_k < K:
+            padding = torch.zeros((B, N, 2 * (K - actual_k), self.feature_dim), device=self.device)
+            graph = torch.cat([graph, padding], dim=2)
+            
+        return graph.reshape(self.num_envs, -1)
 
     def reset(self, seed=None):
         if seed is not None:
@@ -311,13 +342,15 @@ class VMASVectorizedEnv:
         vmas_obs = self.env.reset()
         self.episode_returns.zero_()
         self.step_count = 0
+        self.episode_tags = torch.rand((self.num_games, self.num_agents), device=self.device)
         
         stacked_obs = torch.stack(vmas_obs, dim=1)
-        final_obs = self._apply_stack_and_indicator(stacked_obs)
+        final_obs = self._apply_graph_formatting(stacked_obs)
             
         info = {
             "raw_obs": stacked_obs.reshape(self.num_envs, -1),
-            "global_state": final_obs 
+            # Centralized K-NN view: Concatenate local K-NN views across all agents in the game
+            "global_state": final_obs.view(self.num_games, -1).clone() 
         }
         return final_obs, info
 
@@ -354,20 +387,20 @@ class VMASVectorizedEnv:
             self.video_frames.append(grid)
 
         stacked_obs = torch.stack(vmas_obs, dim=1)
-        final_obs = self._apply_stack_and_indicator(stacked_obs)
+        final_obs = self._apply_graph_formatting(stacked_obs)
         
         is_done = self.step_count >= self.args.max_cycles
         dones = torch.full((self.num_envs,), is_done, device=self.device, dtype=torch.float32)
         
         info = {
             "raw_obs": stacked_obs.reshape(self.num_envs, -1),
-            "global_state": final_obs.clone()
+            "global_state": final_obs.view(self.num_games, -1).clone()
         }
         
         if is_done:
             self.episode_count += 1
-            
             info["terminal_raw_obs"] = info["raw_obs"].clone()
+            info["terminal_observation"] = final_obs.clone() # <- ADD THIS BACK
             info["terminal_global_state"] = info["global_state"].clone()
             
             if self.record_this_episode and self.video_frames:
@@ -376,7 +409,7 @@ class VMASVectorizedEnv:
                 imageio.mimsave(file_path, self.video_frames, fps=15)
                 self.video_frames = []
             
-            if self.args.capture_video and self.episode_count % 100 == 0:
+            if self.args.capture_video and self.episode_count % 50 == 0:
                 self.record_this_episode = True
             else:
                 self.record_this_episode = False
@@ -390,12 +423,13 @@ class VMASVectorizedEnv:
             vmas_obs = self.env.reset()
             self.episode_returns.zero_()
             self.step_count = 0
+            self.episode_tags = torch.rand((self.num_games, self.num_agents), device=self.device)
             
             stacked_obs = torch.stack(vmas_obs, dim=1)
-            final_obs = self._apply_stack_and_indicator(stacked_obs)
+            final_obs = self._apply_graph_formatting(stacked_obs)
             
             info["raw_obs"] = stacked_obs.reshape(self.num_envs, -1)
-            info["global_state"] = final_obs.clone()
+            info["global_state"] = final_obs.view(self.num_games, -1).clone()
                 
         return final_obs, rewards, dones, info
 
@@ -472,18 +506,20 @@ if __name__ == "__main__":
         # Fallback for Atari or environments without a God-view state
         state_dim = num_agents_per_game * np.array(envs.single_observation_space.shape).prod()
 
-    states = torch.zeros((args.num_steps, num_games, state_dim)).to(device)
-
-    agent = Agent(envs.single_action_space, envs.single_observation_space.shape, num_agents_per_game, state_dim=state_dim).to(device)
+    agent = Agent(
+        envs.single_action_space, 
+        envs.single_observation_space.shape, 
+        num_agents_per_game, 
+        state_dim=state_dim, 
+        n_max=args.n_max * 2
+    ).to(device)
     optimizer = optim.Adam([
             {'params': list(agent.actor.parameters()) + 
                        list(agent.actor_mean.parameters()) + 
-                       [agent.actor_logstd] + 
-                       list(agent.agent_id_embedding.parameters()), 'lr': 3e-4}, 
+                       [agent.actor_logstd], 'lr': 3e-4}, 
             
             {'params': list(agent.critic_encoder.parameters()) + 
-                    list(agent.critic.parameters()) + 
-                    list(agent.critic_projection.parameters()), 'lr': 1e-3} 
+                       list(agent.critic.parameters()), 'lr': 1e-3} 
         ], eps=1e-5)
 
     # ALGO Logic: Storage setup
@@ -558,12 +594,10 @@ if __name__ == "__main__":
             global_step += actual_num_envs
             obs[step] = next_obs
             dones[step] = next_done
-            current_game_states = next_obs.view(num_games, -1)
-            states[step] = current_game_states
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs, centralized_state=states[step], denormalize=True)
+                action, logprob, _, value = agent.get_action_and_value(next_obs, denormalize=True)
                 values[step] = value.flatten()
             actions[step] = action
             logprobs[step] = logprob
@@ -665,29 +699,18 @@ if __name__ == "__main__":
             boot_obs = next_obs.clone()
             
             if "global_state" in next_info:
-                # 1. Create a separate tracker for the Raw MPE physics
                 boot_raw_obs = next_info["raw_obs"].clone()
                 
                 # --- TELEPORTATION FIX ---
-                # A. Inject Final Graph Obs
-                if "terminal_global_state" in next_info:
-                    boot_obs = next_info["terminal_global_state"].clone()
+                # Must use terminal_observation [num_envs, obs_dim], NOT terminal_global_state!
+                if "terminal_observation" in next_info:
+                    boot_obs = next_info["terminal_observation"].clone()
                 
                 if "terminal_raw_obs" in next_info:
                     boot_raw_obs = next_info["terminal_raw_obs"].clone()
 
-                # 2. Build the Final State correctly
-                final_state = boot_obs.view(num_games, -1)
-            else:
-                # Fallback for Atari
-                if "final_observation" in next_info:
-                    for idx, final_obs in enumerate(next_info["final_observation"]):
-                        if final_obs is not None:
-                            boot_obs[idx] = torch.Tensor(final_obs).to(device)
-                final_state = boot_obs.view(num_games, -1)
-
             # First Pass
-            next_value = agent.get_value(boot_obs, centralized_state=final_state, denormalize=True).flatten()
+            next_value = agent.get_value(boot_obs, denormalize=True).flatten()
     
             # Standard GAE to get returns
             temp_advantages = torch.zeros_like(rewards).to(device)
@@ -702,28 +725,20 @@ if __name__ == "__main__":
                 delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
                 temp_advantages[t] = lastgaelam = delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
             
-            # This is our optimization target
             b_returns = (temp_advantages + values).reshape(-1)
             b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
-            b_states = states.reshape((-1, state_dim))
 
-            # 2. UPDATE STATS NOW (Before SGD)1
-            # This aligns the normalizers with the data we just collected
-            agent.critic.update(b_returns.view(-1, agent.num_agents))
-
+            # 2. UPDATE STATS NOW (Only obs_normalizer and PopArt are needed!)
+            agent.critic.update(b_returns.view(-1, 1))
             agent.obs_normalizer.update(b_obs)
-            agent.state_normalizer.update(b_states)
 
-            # 3. Second Pass: RE-CALCULATE Values and Advantages with NEW stats
-            # This is the crucial step you were missing. 
-            # It ensures 'values' and 'returns' are in the same normalized space for SGD.
+            # 3. Second Pass: RE-CALCULATE Values
             new_values = agent.get_value(
                 obs.view(-1, agent.obs_dim), 
-                centralized_state=states.view(-1, state_dim), 
                 denormalize=True
             ).view(args.num_steps, actual_num_envs)
             
-            new_next_value = agent.get_value(boot_obs, centralized_state=final_state, denormalize=True).flatten()
+            new_next_value = agent.get_value(boot_obs, denormalize=True).flatten()
             
             # Final GAE calculation for the actual SGD update
             advantages = torch.zeros_like(rewards).to(device)
@@ -748,13 +763,11 @@ if __name__ == "__main__":
         b_advantages = advantages.reshape(-1)
         b_returns = returns.reshape(-1)
         b_values = values.reshape(-1)
-        b_states = states.reshape((-1, state_dim))
 
         # Optimizing the policy and value network
         b_inds = np.arange(args.batch_size)
         clipfracs = []
 
-        # 1. Determine the number of 'joint-steps' (all agents in a game at one time)
         num_joint_steps = args.batch_size // agent.num_agents
         joint_inds = np.arange(num_joint_steps)
 
@@ -762,33 +775,30 @@ if __name__ == "__main__":
             rng.shuffle(joint_inds)
             for start in range(0, num_joint_steps, args.minibatch_size // agent.num_agents):
                 end = start + (args.minibatch_size // agent.num_agents)
-                # Pick joint indices and expand them to include all agents in those games
                 mb_joint_inds = joint_inds[start:end]
-                
-                # This ensures we always pick Agent 0, 1, 2... from the same game/time together
                 mb_inds = (mb_joint_inds[:, None] * agent.num_agents + np.arange(agent.num_agents)).flatten()
-                mb_state_inds = mb_joint_inds
-                mb_states_for_critic = b_states[mb_state_inds]
 
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(
                     b_obs[mb_inds], 
-                    b_actions[mb_inds], 
-                    centralized_state=mb_states_for_critic
+                    b_actions[mb_inds]
                 )
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
                 with torch.no_grad():
-                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
                     old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
                 mb_advantages = b_advantages[mb_inds]
+
+                # will need this for heterogenous
+                # if args.norm_adv:
+                #     mb_adv_reshaped = mb_advantages.view(-1, agent.num_agents)
+                #     mb_adv_reshaped = (mb_adv_reshaped - mb_adv_reshaped.mean(dim=0)) / (mb_adv_reshaped.std(dim=0) + 1e-7)
+                #     mb_advantages = mb_adv_reshaped.reshape(-1)
                 if args.norm_adv:
-                    mb_adv_reshaped = mb_advantages.view(-1, agent.num_agents)
-                    mb_adv_reshaped = (mb_adv_reshaped - mb_adv_reshaped.mean(dim=0)) / (mb_adv_reshaped.std(dim=0) + 1e-7)
-                    mb_advantages = mb_adv_reshaped.reshape(-1)
+                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
                 # Policy loss
                 pg_loss1 = -mb_advantages * ratio
@@ -797,25 +807,11 @@ if __name__ == "__main__":
 
                 # Value loss
                 newvalue = newvalue.view(-1)
-
-                # Reshape to align with PopArt agent-specific stats
-                mb_returns_reshaped = b_returns[mb_inds].view(-1, agent.num_agents)
-                mb_values_reshaped = b_values[mb_inds].view(-1, agent.num_agents)
                 
-                # Normalize targets correctly using the per-agent ID statistics
-                normalized_returns = agent.critic.normalize(mb_returns_reshaped).reshape(-1)
-                normalized_values = agent.critic.normalize(mb_values_reshaped).reshape(-1)
+                normalized_returns = agent.critic.normalize(b_returns[mb_inds].view(-1, 1)).reshape(-1)
+                normalized_values = agent.critic.normalize(b_values[mb_inds].view(-1, 1)).reshape(-1)
 
-                # Standard individual value loss
                 v_loss_unclipped = (newvalue - normalized_returns) ** 2
-                
-                # NEW: Value Decomposition Loss
-                # Reshape to [Minibatch_Games, num_agents]
-                # nv_reshaped = newvalue.view(-1, agent.num_agents)
-                # nr_reshaped = normalized_returns.view(-1, agent.num_agents)
-                
-                # Penalize the difference between Sum(Predicted Values) and Sum(Actual Returns)
-                # joint_v_loss = 0.5 * ((nv_reshaped.sum(dim=1) - nr_reshaped.sum(dim=1)) ** 2).mean()
 
                 if args.clip_vloss:
                     v_clipped = normalized_values + torch.clamp(
@@ -826,12 +822,8 @@ if __name__ == "__main__":
                     v_loss = 0.5 * v_loss_max.mean()
                 else:
                     v_loss = 0.5 * v_loss_unclipped.mean()
-
-                # Combine with a weight for the joint loss
-                # total_v_loss = v_loss + 0.01 * joint_v_loss 
                 
                 entropy_loss = entropy.mean()
-                # loss = pg_loss - ent_coef_now * entropy_loss + total_v_loss * args.vf_coef
                 loss = pg_loss - ent_coef_now * entropy_loss + v_loss * args.vf_coef
 
                 optimizer.zero_grad()
@@ -862,7 +854,7 @@ if __name__ == "__main__":
         writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
         writer.add_scalar("charts/ent_coef_now", ent_coef_now, global_step)
 
-        if update % 100 == 0 or update == num_updates:
+        if update % 75 == 0 or update == num_updates:
             save_dir = f"models/{run_name}"
             os.makedirs(save_dir, exist_ok=True)
             torch.save(agent.state_dict(), f"{save_dir}/{update}_model.pth")
