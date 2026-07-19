@@ -9,7 +9,7 @@ import json
 
 # Import the architecture and environment wrapper directly from your training script
 # from ppo_vmas_navigation_gnn import GraphAgent, VMASVectorizedEnv
-from ppo_vmas_navigation_mappo import Agent, VMASVectorizedEnv
+from ppo_vmas_navigation_mappo import Agent, TransformerAgent, VMASVectorizedEnv
 
 class BehavioralMetricTracker:
     def __init__(self, num_games, num_agents, agent_radius=0.15, contact_threshold=0.30, goal_tolerance=0.15):
@@ -134,7 +134,7 @@ def parse_harvest_args():
     parser.add_argument("--seed", type=int, default=42, help="Random seed for the harvesting environment")
     parser.add_argument("--output-dir", type=str, default="./expert_data", help="Directory to save the harvested numpy arrays")
     parser.add_argument("--video-interval", type=int, default=10000, help="Record a sample video every X steps")
-    parser.add_argument("--max-cycles", type=int, default=250, help="Length of an environment episode before auto-reset")
+    parser.add_argument("--max-cycles", type=int, default=350, help="Length of an environment episode before auto-reset")
     
     args = parser.parse_args()
     
@@ -179,12 +179,20 @@ def harvest_vmas_dataset():
 
     # MLP
     state_dim = envs.num_agents * np.array(envs.single_observation_space.shape).prod()
-    oracle = Agent(
+    # oracle = Agent(
+    #     envs.single_action_space, 
+    #     envs.single_observation_space.shape, 
+    #     num_agents = envs.num_agents, 
+    #     state_dim=state_dim, 
+    #     n_max=n_max_nodes
+    # ).to(device)
+
+    oracle = TransformerAgent(
         envs.single_action_space, 
         envs.single_observation_space.shape, 
-        num_agents = envs.num_agents, 
+        envs.num_agents, 
         state_dim=state_dim, 
-        n_max=n_max_nodes
+        n_max=args.n_max * 2
     ).to(device)
 
     # oracle = GraphAgent(
@@ -249,6 +257,9 @@ def harvest_vmas_dataset():
                 
                 # 4. Extract MLP features and map directly to deterministic action means (no sampling!)
                 actor_features = oracle.actor_mlp(node_embeddings[agent_mask])
+            elif hasattr(oracle, 'transformer'):
+                backbone_outputs = oracle._forward_actor_backbone(obs_norm)
+                actor_features = oracle.actor(backbone_outputs)
             else:
                 # MLP Forward Pass (Append agent ID embeddings)
                 actor_features = oracle.actor(obs_norm)

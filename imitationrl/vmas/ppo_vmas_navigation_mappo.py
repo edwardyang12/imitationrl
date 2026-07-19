@@ -33,7 +33,7 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="vmas-navigation-mlp",
+    parser.add_argument("--wandb-project-name", type=str, default="vmas-navigation-transformer",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
@@ -81,8 +81,6 @@ def parse_args():
         help="number of agents and landmarks")
     parser.add_argument("--max-cycles", type=int, default=250,
         help="length of environment run")
-    parser.add_argument("--reward-cheat", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
-        help="if toggled, this experiment will have extra reward cheats")
     parser.add_argument("--n-max", type=int, default=5, help="Fixed context window size for K-NN")
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
@@ -147,6 +145,135 @@ class PopArt(nn.Module):
     
     def normalize(self, x):
         return (x - self.mean) / torch.sqrt(self.std**2 + 1e-8)
+
+class TransformerAgent(nn.Module):
+    def __init__(self, single_action_space, single_obs_shape, num_agents, state_dim, n_max=10, d_model=256, nhead=4, num_layers=3):
+        super().__init__()
+        self.num_agents = num_agents
+        self.obs_dim = np.array(single_obs_shape).prod() # Exactly 2 * n_max * 9
+        self.action_dim = np.prod(single_action_space.shape)
+        self.n_max_nodes = n_max 
+        self.feature_dim = 9
+        
+        # 1. SHARED NORMALIZER
+        self.obs_normalizer = GraphObservationNormalizer(n_max=n_max, feature_dim=self.feature_dim, continuous_dim=4)
+        
+        # 2. UPGRADE: Terminal LayerNorm on token_proj!
+        # Guarantees that ego_initial and goal_initial have strictly bounded unit variance.
+        self.token_proj = nn.Sequential(
+            layer_init(nn.Linear(self.feature_dim, d_model)),
+            nn.LayerNorm(d_model),
+            nn.ReLU(),
+            layer_init(nn.Linear(d_model, d_model)),
+            nn.LayerNorm(d_model) # <-- STABILIZATION FIX A
+        )
+        
+        # 3. TRANSFORMER ENCODER
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, 
+            nhead=nhead, 
+            dim_feedforward=d_model * 4, 
+            batch_first=True, 
+            activation='gelu', 
+            norm_first=True
+        )
+        # UPGRADE: Pass a terminal LayerNorm into the encoder!
+        # Guarantees that out (and ego_final) matches the exact scale of initial tokens.
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, 
+            num_layers=num_layers, 
+            norm=nn.LayerNorm(d_model), # <-- STABILIZATION FIX B
+            enable_nested_tensor=False
+        )
+        
+        # 4. UPGRADE: Normalize the concatenated Tri-Token before projection!
+        self.actor = nn.Sequential(
+            nn.LayerNorm(d_model * 3), # <-- STABILIZATION FIX C (Locks concatenation scale)
+            layer_init(nn.Linear(d_model * 3, 128)),
+            nn.LayerNorm(128), nn.ReLU(),
+            layer_init(nn.Linear(128, 64)),
+            nn.LayerNorm(64), nn.ReLU(),
+            layer_init(nn.Linear(64, 64)),
+            nn.ReLU(),
+        )
+        self.actor_mean = nn.Sequential(
+            layer_init(nn.Linear(64, self.action_dim), std=0.01),
+            nn.Tanh() 
+        )
+        self.actor_logstd = nn.Parameter(torch.zeros(1, self.action_dim))
+
+        # 5. CENTRALIZED CRITIC
+        joint_critic_dim = self.num_agents * self.obs_dim
+        self.critic_encoder = nn.Sequential(
+            layer_init(nn.Linear(joint_critic_dim, 512)), 
+            nn.LayerNorm(512), nn.ReLU(),
+            layer_init(nn.Linear(512, 512)),
+            nn.LayerNorm(512), nn.ReLU(),
+            layer_init(nn.Linear(512, 256)),
+            nn.LayerNorm(256), nn.ReLU(),
+            layer_init(nn.Linear(256, 256)),
+            nn.ReLU(),
+        )
+        self.critic = PopArt(256, 1)
+
+    def _forward_actor_backbone(self, x_norm):
+        B = x_norm.shape[0]
+        tokens = x_norm.view(B, self.n_max_nodes, self.feature_dim)
+        key_padding_mask = (tokens[:, :, 6] < 0.5)
+        
+        h = self.token_proj(tokens)
+        out = self.transformer(h, src_key_padding_mask=key_padding_mask)
+        
+        # All 3 tokens now share identical unit-variance distributions!
+        ego_final = out[:, 0, :]
+        ego_initial = h[:, 0, :]
+        goal_initial = h[:, self.n_max_nodes // 2, :]
+        
+        combined_ego = torch.cat([ego_final, ego_initial, goal_initial], dim=-1)
+        
+        return combined_ego
+
+    def get_actor_parameters(self):
+        # Cleanly bundles the entire Transformer backbone + Actor head + LogStd
+        return (
+            list(self.token_proj.parameters()) +
+            list(self.transformer.parameters()) +
+            list(self.actor.parameters()) +
+            list(self.actor_mean.parameters()) +
+            [self.actor_logstd]
+        )
+
+    def get_value(self, x, denormalize=False):
+        x_norm = self.obs_normalizer.normalize(x)
+        batch_size = x.shape[0]
+        num_games = batch_size // self.num_agents
+        
+        joint_state = x_norm.view(num_games, -1)
+        expanded_joint_state = joint_state.repeat_interleave(self.num_agents, dim=0)
+        
+        values = self.critic(self.critic_encoder(expanded_joint_state)) 
+        if denormalize:
+            values = self.critic.denormalize(values)
+        return values.view(-1, 1)
+
+    def get_action_and_value(self, x, action=None, denormalize=False):
+        x_norm = self.obs_normalizer.normalize(x)
+        
+        combined_ego = self._forward_actor_backbone(x_norm)
+        actor_features = self.actor(combined_ego)
+        
+        action_means = self.actor_mean(actor_features)
+        action_logstds = self.actor_logstd.expand_as(action_means)
+        
+        # STRICT PARITY: Retaining max=2.0 exactly as requested!
+        safe_logstds = torch.clamp(action_logstds, min=-5.0, max=2.0)
+        action_stds = safe_logstds.exp()
+        
+        probs = Normal(action_means, action_stds)
+        if action is None:
+            action = probs.sample()
+            
+        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.get_value(x, denormalize)
 
 class Agent(nn.Module):
     def __init__(self, single_action_space, single_obs_shape, num_agents, state_dim, n_max=10):
@@ -506,18 +633,23 @@ if __name__ == "__main__":
         # Fallback for Atari or environments without a God-view state
         state_dim = num_agents_per_game * np.array(envs.single_observation_space.shape).prod()
 
-    agent = Agent(
+    agent = TransformerAgent(
         envs.single_action_space, 
         envs.single_observation_space.shape, 
         num_agents_per_game, 
         state_dim=state_dim, 
         n_max=args.n_max * 2
     ).to(device)
+
+    # agent = Agent(
+    #     envs.single_action_space, 
+    #     envs.single_observation_space.shape, 
+    #     num_agents_per_game, 
+    #     state_dim=state_dim, 
+    #     n_max=args.n_max * 2
+    # ).to(device)
     optimizer = optim.Adam([
-            {'params': list(agent.actor.parameters()) + 
-                       list(agent.actor_mean.parameters()) + 
-                       [agent.actor_logstd], 'lr': 3e-4}, 
-            
+            {'params': agent.get_actor_parameters(), 'lr': 3e-4}, 
             {'params': list(agent.critic_encoder.parameters()) + 
                        list(agent.critic.parameters()), 'lr': 1e-3} 
         ], eps=1e-5)
@@ -617,68 +749,7 @@ if __name__ == "__main__":
                 next_obs, reward, done, next_info = step_data
                 resets = done
 
-            if args.reward_cheat:
-                agent_radius = 0.15
-                collision_penalty = 0.5
-                
-                cheat_raw_obs = next_info["raw_obs"].clone()
-                if "final_info" in next_info:
-                    for i, fin_info in enumerate(next_info["final_info"]):
-                        if fin_info is not None and "raw_obs" in fin_info:
-                            cheat_raw_obs[i] = fin_info["raw_obs"].clone()
-
-                raw_obs_tensor = torch.Tensor(cheat_raw_obs).to(device)
-                new_landmark_dist = raw_obs_tensor.view(num_games, num_agents_per_game, -1)[:, :, 4:4+2*args.num_landmarks]
-                new_landmark_dist = new_landmark_dist.view(num_games, num_agents_per_game, args.num_landmarks, 2)
-                
-                # Shape: [num_games, num_agents, num_landmarks]
-                dist = torch.norm(new_landmark_dist, dim=-1)
-                
-                # --- 1. EPISODIC STATIC ASSIGNMENT ---
-                # Check which games just reset (or are at step 0)
-                game_resets = torch.Tensor(resets).to(device).view(num_games, num_agents_per_game)[:, 0].bool()
-                needs_assignment = needs_assignment | game_resets
-                
-                # If any game reset, recalculate its optimal shortest-path routing
-                if needs_assignment.any():
-                    dist_clone = dist.clone()
-                    
-                    # Only calculate for games that need it
-                    for g in range(num_games):
-                        if needs_assignment[g]:
-                            for _ in range(args.num_landmarks):
-                                flat_dist = dist_clone[g].view(-1)
-                                min_val, min_idx = flat_dist.min(dim=0)
-                                
-                                agent_idx = min_idx // args.num_landmarks
-                                landmark_idx = min_idx % args.num_landmarks
-                                
-                                current_assignments[g, agent_idx] = landmark_idx
-                                
-                                dist_clone[g, agent_idx, :] = float('inf')
-                                dist_clone[g, :, landmark_idx] = float('inf')
-                                
-                    needs_assignment.fill_(False)
-                
-                # Extract the distance to the frozen, optimally assigned target
-                assigned_dist = torch.gather(dist, 2, current_assignments.unsqueeze(-1)).squeeze(-1)
-                
-                # --- 2. PROCEDURAL SQUARE ROOT CALCULUS ---
-                # Calculate the mathematical tipping point for the dead-center snap
-                min_snap_multiplier = collision_penalty / np.sqrt(agent_radius)
-                
-                # Apply a safety factor (> 1.0) to guarantee the snap overpowers engine physics
-                snap_factor = 1.5 
-                procedural_multiplier = min_snap_multiplier * snap_factor
-                
-                # R = -M * sqrt(d)
-                individual_pull = -procedural_multiplier * torch.sqrt(assigned_dist + 1e-8)
-                
-                # Combine with native environment reward
-                rewards[step] = torch.tensor(reward).to(device).view(-1) + individual_pull.view(-1)
-            else:
-                # normalized_step_rewards = reward_norm(reward, done)
-                rewards[step] = reward.clone().to(device).view(-1)
+            rewards[step] = reward.clone().to(device).view(-1)
             next_obs, next_done = next_obs.clone().to(device), done.clone().to(device)
 
             # LOGGING TEAM DATA

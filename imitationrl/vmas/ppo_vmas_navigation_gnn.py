@@ -232,27 +232,33 @@ class MultiHeadGATBackbone(nn.Module):
         
         return valid_x, node_embeddings, valid_batch
 
-class VectorGCNConv(MessagePassing):
+class SeparatedVectorGCNConv(MessagePassing):
     """
-    An isotropic graph convolution that natively ingests multi-dimensional edge 
-    attributes without an attention mechanism or OOM-triggering edge MLPs.
+    A GraphSAGE-style isotropic convolution that separates the root node from 
+    the neighbor average. This preserves 100% of the ego agent's kinematics 
+    (velocity/position) while averaging environmental context without attention.
     """
     def __init__(self, in_channels, out_channels, edge_dim=3):
-        # aggr='mean' strictly replaces the GAT attention softmax coefficients
         super().__init__(aggr='mean') 
+        # Separate linear projections for the Ego node vs Neighbor nodes
+        self.root_proj = nn.Linear(in_channels, out_channels, bias=False)
         self.node_proj = nn.Linear(in_channels, out_channels, bias=False)
         self.edge_proj = nn.Linear(edge_dim, out_channels, bias=False)
         self.bias = nn.Parameter(torch.zeros(out_channels))
 
     def forward(self, x, edge_index, edge_attr):
+        # 1. Project the ego node independently at 100% strength
+        root_out = self.root_proj(x)
+        
+        # 2. Project neighbors and propagate messages
         x_proj = self.node_proj(x)
-        return self.propagate(edge_index, x=x_proj, edge_attr=edge_attr)
+        aggr_out = self.propagate(edge_index, x=x_proj, edge_attr=edge_attr)
+        
+        # 3. Combine Ego Kinematics + Neighbor Context
+        return root_out + aggr_out + self.bias
 
     def message(self, x_j, edge_attr):
         return x_j + self.edge_proj(edge_attr)
-
-    def update(self, aggr_out):
-        return aggr_out + self.bias
 
 
 class FairVectorGCNBackbone(nn.Module):
@@ -261,15 +267,13 @@ class FairVectorGCNBackbone(nn.Module):
         self.n_max = n_max
         self.feature_dim = feature_dim
         
-        # 1. CAPACITY PARITY: Match GAT's concat=True expansion width (64 * 4 = 256)
-        wide_dim = hidden_dim * heads  
+        wide_dim = hidden_dim * heads  # 256
         
-        # 2. STRUCTURAL PARITY: Exactly 3 convolutions, no LayerNorms
-        self.gcn1 = VectorGCNConv(feature_dim, wide_dim, edge_dim=3)
-        self.gcn2 = VectorGCNConv(wide_dim, wide_dim, edge_dim=3)
-        self.gcn3 = VectorGCNConv(wide_dim, out_dim, edge_dim=3)
+        # Swap to the Separated Vector GCN
+        self.gcn1 = SeparatedVectorGCNConv(feature_dim, wide_dim, edge_dim=3)
+        self.gcn2 = SeparatedVectorGCNConv(wide_dim, wide_dim, edge_dim=3)
+        self.gcn3 = SeparatedVectorGCNConv(wide_dim, out_dim, edge_dim=3)
         
-        # 3. RESIDUAL PARITY: Match GAT's single skip projection exactly
         self.skip_proj = nn.Linear(feature_dim, wide_dim)
         self.elu = nn.ELU()
 
@@ -284,7 +288,6 @@ class FairVectorGCNBackbone(nn.Module):
         batch_indices = torch.arange(B, device=device).view(-1, 1).expand(B, self.n_max)
         valid_batch = batch_indices[active_mask] 
         
-        # Memory-safe Block-Diagonal builder
         local_idx = torch.arange(self.n_max, device=device)
         grid_r, grid_c = torch.meshgrid(local_idx, local_idx, indexing='ij')
         local_edges = torch.stack([grid_r.flatten(), grid_c.flatten()], dim=0)
@@ -295,9 +298,13 @@ class FairVectorGCNBackbone(nn.Module):
         active_flat = active_mask.view(-1)
         valid_edge_mask = active_flat[global_edges[0]] & active_flat[global_edges[1]]
         
-        # CRITICAL PARITY NOTE: Unlike GATConv which has add_self_loops=True, 
-        # VectorGCNConv does not auto-inject self loops. We intentionally DO NOT strip 
-        # self-loops here so the ego node retains its own features during mean aggregation!
+        # CRITICAL FIX: Strip self-loops! 
+        # Because SeparatedVectorGCNConv handles the root node via self.root_proj, 
+        # we MUST strip self-loops from edge_index so the ego node does not get 
+        # redundantly mixed into the neighbor averaging pool.
+        is_not_self = global_edges[0] != global_edges[1]
+        valid_edge_mask = valid_edge_mask & is_not_self
+        
         padded_edge_index = global_edges[:, valid_edge_mask]
         
         padded_to_active = torch.zeros(B * self.n_max, dtype=torch.long, device=device)
@@ -307,11 +314,8 @@ class FairVectorGCNBackbone(nn.Module):
         row, col = edge_index
         
         rel_pos = valid_x[row, :2] - valid_x[col, :2]
-        
-        # 4. EDGE PARITY: Match GAT by using raw uncompressed distances
         distances = torch.sqrt((rel_pos ** 2).sum(dim=-1, keepdim=True) + 1e-8)
         
-        # Identical 3D edge attributes: [dx, dy, distance]
         edge_attr = torch.cat([rel_pos, distances], dim=-1)
         
         return valid_x, edge_index, edge_attr, valid_batch
@@ -380,10 +384,10 @@ class GraphAgent(nn.Module):
         self.action_dim = np.prod(envs.single_action_space.shape)
         
         # GAT
-        self.backbone = MultiHeadGATBackbone(n_max=n_max, feature_dim=9)
+        # self.backbone = MultiHeadGATBackbone(n_max=n_max, feature_dim=9)
 
         # GCN 
-        # self.backbone = FairVectorGCNBackbone(n_max=n_max, feature_dim=9)
+        self.backbone = FairVectorGCNBackbone(n_max=n_max, feature_dim=9)
         gat_out_dim = 128
         
         self.actor_mlp = nn.Sequential(
