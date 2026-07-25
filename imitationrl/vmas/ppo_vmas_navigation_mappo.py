@@ -154,21 +154,25 @@ class TransformerAgent(nn.Module):
         self.action_dim = np.prod(single_action_space.shape)
         self.n_max_nodes = n_max 
         self.feature_dim = 9
+        self.nhead = nhead # Needed for multi-head distance mask expansion
         
         # 1. SHARED NORMALIZER
         self.obs_normalizer = GraphObservationNormalizer(n_max=n_max, feature_dim=self.feature_dim, continuous_dim=4)
         
-        # 2. UPGRADE: Terminal LayerNorm on token_proj!
-        # Guarantees that ego_initial and goal_initial have strictly bounded unit variance.
+        # 2. UPGRADE: Learnable Spatial Horizon per Attention Head!
+        # Initialized to 1.0 so Euclidean distance immediately biases attention on Step 0.
+        self.geom_scale = nn.Parameter(torch.ones(1, nhead, 1, 1))
+        
+        # 3. TERMINAL LAYERNORM TOKEN PROJECTION
         self.token_proj = nn.Sequential(
             layer_init(nn.Linear(self.feature_dim, d_model)),
             nn.LayerNorm(d_model),
             nn.ReLU(),
             layer_init(nn.Linear(d_model, d_model)),
-            nn.LayerNorm(d_model) # <-- STABILIZATION FIX A
+            nn.LayerNorm(d_model) 
         )
         
-        # 3. TRANSFORMER ENCODER
+        # 4. TRANSFORMER ENCODER
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=d_model, 
             nhead=nhead, 
@@ -177,18 +181,16 @@ class TransformerAgent(nn.Module):
             activation='gelu', 
             norm_first=True
         )
-        # UPGRADE: Pass a terminal LayerNorm into the encoder!
-        # Guarantees that out (and ego_final) matches the exact scale of initial tokens.
         self.transformer = nn.TransformerEncoder(
             encoder_layer, 
             num_layers=num_layers, 
-            norm=nn.LayerNorm(d_model), # <-- STABILIZATION FIX B
+            norm=nn.LayerNorm(d_model), 
             enable_nested_tensor=False
         )
         
-        # 4. UPGRADE: Normalize the concatenated Tri-Token before projection!
+        # 5. TRI-TOKEN ACTOR HEAD (d_model * 3)
         self.actor = nn.Sequential(
-            nn.LayerNorm(d_model * 3), # <-- STABILIZATION FIX C (Locks concatenation scale)
+            nn.LayerNorm(d_model * 3), 
             layer_init(nn.Linear(d_model * 3, 128)),
             nn.LayerNorm(128), nn.ReLU(),
             layer_init(nn.Linear(128, 64)),
@@ -202,7 +204,7 @@ class TransformerAgent(nn.Module):
         )
         self.actor_logstd = nn.Parameter(torch.zeros(1, self.action_dim))
 
-        # 5. CENTRALIZED CRITIC
+        # 6. CENTRALIZED CRITIC
         joint_critic_dim = self.num_agents * self.obs_dim
         self.critic_encoder = nn.Sequential(
             layer_init(nn.Linear(joint_critic_dim, 512)), 
@@ -221,10 +223,26 @@ class TransformerAgent(nn.Module):
         tokens = x_norm.view(B, self.n_max_nodes, self.feature_dim)
         key_padding_mask = (tokens[:, :, 6] < 0.5)
         
-        h = self.token_proj(tokens)
-        out = self.transformer(h, src_key_padding_mask=key_padding_mask)
+        # --- UPGRADE: Euclidean Attention Biasing ---
+        # 1. Extract physical relative coordinates [dx, dy] for all 2K tokens
+        pos = tokens[:, :, 0:2] # [B, 2K, 2]
         
-        # All 3 tokens now share identical unit-variance distributions!
+        # 2. Calculate Pairwise Euclidean Distance Matrix [B, 1, 2K, 2K]
+        pos_i = pos.unsqueeze(2) # [B, 2K, 1, 2]
+        pos_j = pos.unsqueeze(1) # [B, 1, 2K, 2]
+        dist_matrix = torch.norm(pos_i - pos_j, dim=-1, keepdim=True).permute(0, 3, 1, 2)
+        
+        # 3. Apply per-head learnable spatial scaling: (-gamma_h * distance) -> [B, nhead, 2K, 2K]
+        scaled_dist = -torch.abs(self.geom_scale) * dist_matrix
+        
+        # 4. Reshape to [B * nhead, 2K, 2K] as required by PyTorch nn.TransformerEncoder
+        geom_mask = scaled_dist.view(B * self.nhead, self.n_max_nodes, self.n_max_nodes)
+        
+        # Pass tokens AND the geometric distance kernel into the Transformer
+        h = self.token_proj(tokens)
+        out = self.transformer(h, mask=geom_mask, src_key_padding_mask=key_padding_mask)
+        
+        # Tri-Token Concatenation
         ego_final = out[:, 0, :]
         ego_initial = h[:, 0, :]
         goal_initial = h[:, self.n_max_nodes // 2, :]
@@ -234,8 +252,9 @@ class TransformerAgent(nn.Module):
         return combined_ego
 
     def get_actor_parameters(self):
-        # Cleanly bundles the entire Transformer backbone + Actor head + LogStd
+        # Includes self.geom_scale so attention heads learn their spatial horizons!
         return (
+            [self.geom_scale] +
             list(self.token_proj.parameters()) +
             list(self.transformer.parameters()) +
             list(self.actor.parameters()) +

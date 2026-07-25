@@ -384,10 +384,10 @@ class GraphAgent(nn.Module):
         self.action_dim = np.prod(envs.single_action_space.shape)
         
         # GAT
-        # self.backbone = MultiHeadGATBackbone(n_max=n_max, feature_dim=9)
+        self.backbone = MultiHeadGATBackbone(n_max=n_max, feature_dim=9)
 
         # GCN 
-        self.backbone = FairVectorGCNBackbone(n_max=n_max, feature_dim=9)
+        # self.backbone = FairVectorGCNBackbone(n_max=n_max, feature_dim=9)
         gat_out_dim = 128
         
         self.actor_mlp = nn.Sequential(
