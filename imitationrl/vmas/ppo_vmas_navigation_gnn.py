@@ -984,89 +984,109 @@ if __name__ == "__main__":
         # 1. Determine the number of 'joint-steps' (all agents in a game at one time)
         num_joint_steps = args.batch_size // agent.num_agents
         joint_inds = np.arange(num_joint_steps)
+        
+        # OOM FIX: Split the minibatch into 4 smaller chunks (increase to 8 if you still OOM)
+        num_micro_chunks = 4 
 
         for epoch in range(args.update_epochs):
             rng.shuffle(joint_inds)
             for start in range(0, num_joint_steps, args.minibatch_size // agent.num_agents):
                 end = start + (args.minibatch_size // agent.num_agents)
+                
                 # Pick joint indices and expand them to include all agents in those games
                 mb_joint_inds = joint_inds[start:end]
-                
-                # This ensures we always pick Agent 0, 1, 2... from the same game/time together
                 mb_inds = (mb_joint_inds[:, None] * agent.num_agents + np.arange(agent.num_agents)).flatten()
-                mb_state_inds = mb_joint_inds
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(
-                    b_obs[mb_inds], 
-                    b_actions[mb_inds]
-                )
-                logratio = newlogprob - b_logprobs[mb_inds]
-                ratio = logratio.exp()
-
-                with torch.no_grad():
-                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
-                    old_approx_kl = (-logratio).mean()
-                    approx_kl = ((ratio - 1) - logratio).mean()
-                    clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
-
+                # MATH SAFEGUARD 1: Pre-normalize advantages for the ENTIRE minibatch 
                 mb_advantages = b_advantages[mb_inds]
-
-                # will need this for heterogenous
-                # if args.norm_adv:
-                #     mb_adv_reshaped = mb_advantages.view(-1, agent.num_agents)
-                #     mb_adv_reshaped = (mb_adv_reshaped - mb_adv_reshaped.mean(dim=0)) / (mb_adv_reshaped.std(dim=0) + 1e-7)
-                #     mb_advantages = mb_adv_reshaped.reshape(-1)
                 if args.norm_adv:
                     mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
-                # Policy loss
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-                # Value loss
-                newvalue = newvalue.view(-1)
-
-                # Reshape to align with PopArt agent-specific stats
-                normalized_returns = agent.critic_popart.normalize(b_returns[mb_inds].view(-1, 1)).reshape(-1)
-                normalized_values = agent.critic_popart.normalize(b_values[mb_inds].view(-1, 1)).reshape(-1)
-
-                # Standard individual value loss
-                v_loss_unclipped = (newvalue - normalized_returns) ** 2
+                # Zero gradients ONCE per minibatch
+                optimizer.zero_grad() 
                 
-                # NEW: Value Decomposition Loss
-                # Reshape to [Minibatch_Games, num_agents]
-                # nv_reshaped = newvalue.view(-1, agent.num_agents)
-                # nr_reshaped = normalized_returns.view(-1, agent.num_agents)
+                # Calculate micro-chunk dimensions
+                micro_chunk_size = math.ceil(len(mb_joint_inds) / num_micro_chunks)
                 
-                # Penalize the difference between Sum(Predicted Values) and Sum(Actual Returns)
-                # joint_v_loss = 0.5 * ((nv_reshaped.sum(dim=1) - nr_reshaped.sum(dim=1)) ** 2).mean()
+                # Initialize accumulators for the TensorBoard logger
+                mb_approx_kl = 0.0
+                mb_old_approx_kl = 0.0
+                
+                for micro_start in range(0, len(mb_joint_inds), micro_chunk_size):
+                    micro_end = micro_start + micro_chunk_size
+                    micro_joint_inds = mb_joint_inds[micro_start:micro_end]
+                    
+                    # Convert micro joint indices to flat agent indices
+                    micro_inds = (micro_joint_inds[:, None] * agent.num_agents + np.arange(agent.num_agents)).flatten()
+                    
+                    # CRITICAL FIX: Calculate chunk_ratio HERE before it is used
+                    chunk_ratio = len(micro_inds) / len(mb_inds)
+                    
+                    # Grab the correct slice of the pre-normalized advantages
+                    slice_start = micro_start * agent.num_agents
+                    slice_end = micro_end * agent.num_agents
+                    micro_adv = mb_advantages[slice_start:slice_end]
 
-                if args.clip_vloss:
-                    v_clipped = normalized_values + torch.clamp(
-                        newvalue - normalized_values, -args.clip_coef, args.clip_coef,
+                    # Push the smaller chunk through the GNN
+                    _, newlogprob, entropy, newvalue = agent.get_action_and_value(
+                        b_obs[micro_inds], 
+                        b_actions[micro_inds]
                     )
-                    v_loss_clipped = (v_clipped - normalized_returns) ** 2
-                    v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
-                    v_loss = 0.5 * v_loss_max.mean()
-                else:
-                    v_loss = 0.5 * v_loss_unclipped.mean()
+                    
+                    logratio = newlogprob - b_logprobs[micro_inds]
+                    ratio = logratio.exp()
 
-                # Combine with a weight for the joint loss
-                # total_v_loss = v_loss + 0.01 * joint_v_loss 
+                    with torch.no_grad():
+                        current_old_approx_kl = (-logratio).mean()
+                        current_approx_kl = ((ratio - 1) - logratio).mean()
+                        
+                        # Accumulate tracking variables safely
+                        mb_approx_kl += (current_approx_kl.item() * chunk_ratio)
+                        mb_old_approx_kl += (current_old_approx_kl.item() * chunk_ratio)
+                        clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
+
+                    # Policy loss
+                    pg_loss1 = -micro_adv * ratio
+                    pg_loss2 = -micro_adv * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
+                    pg_loss = torch.max(pg_loss1, pg_loss2).mean()
+
+                    # Value loss
+                    newvalue = newvalue.view(-1)
+                    normalized_returns = agent.critic_popart.normalize(b_returns[micro_inds].view(-1, 1)).reshape(-1)
+                    normalized_values = agent.critic_popart.normalize(b_values[micro_inds].view(-1, 1)).reshape(-1)
+
+                    v_loss_unclipped = (newvalue - normalized_returns) ** 2
+                    
+                    if args.clip_vloss:
+                        v_clipped = normalized_values + torch.clamp(
+                            newvalue - normalized_values, -args.clip_coef, args.clip_coef,
+                        )
+                        v_loss_clipped = (v_clipped - normalized_returns) ** 2
+                        v_loss_max = torch.max(v_loss_unclipped, v_loss_clipped)
+                        v_loss = 0.5 * v_loss_max.mean()
+                    else:
+                        v_loss = 0.5 * v_loss_unclipped.mean()
+
+                    entropy_loss = entropy.mean()
+                    loss = pg_loss - ent_coef_now * entropy_loss + v_loss * args.vf_coef
+                    
+                    # Scale the loss so gradients accumulate to the true mean
+                    loss = loss * chunk_ratio
+                    
+                    # Accumulate gradients (DO NOT STEP YET)
+                    loss.backward()
                 
-                entropy_loss = entropy.mean()
-                # loss = pg_loss - ent_coef_now * entropy_loss + total_v_loss * args.vf_coef
-                loss = pg_loss - ent_coef_now * entropy_loss + v_loss * args.vf_coef
-
-                optimizer.zero_grad()
-                loss.backward()
+                # Step the optimizer ONCE per minibatch
                 nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
                 optimizer.step()
+                
+                # Expose the final accumulated KL values for the early-stopping check and TensorBoard
+                approx_kl = mb_approx_kl
+                old_approx_kl = mb_old_approx_kl
 
-            if args.target_kl is not None:
-                if approx_kl > args.target_kl:
-                    break
+                if args.target_kl is not None:
+                    if mb_approx_kl > args.target_kl:
+                        break
         if update % 500 == 0:
                 gc.collect()
 
@@ -1079,8 +1099,8 @@ if __name__ == "__main__":
         writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
         writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
         writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
-        writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
-        writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
+        writer.add_scalar("losses/old_approx_kl", old_approx_kl, global_step)
+        writer.add_scalar("losses/approx_kl", approx_kl, global_step)
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
         print("SPS:", int(global_step / (time.time() - start_time)))
