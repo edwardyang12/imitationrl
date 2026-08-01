@@ -10,7 +10,7 @@ import json
 
 # Import the architecture and environment wrapper directly from your training script
 # from ppo_vmas_navigation_gnn import GraphAgent, VMASVectorizedEnv
-from ppo_vmas_navigation_mappo import Agent, TransformerAgent, VMASVectorizedEnv
+from ppo_vmas_navigation_mappo import Agent, TransformerAgent, PointNetAgent, VMASVectorizedEnv
 
 class BehavioralMetricTracker:
     def __init__(self, num_games, num_agents, agent_radius=0.1, contact_threshold=0.20, goal_tolerance=0.25):
@@ -223,6 +223,8 @@ def parse_harvest_args():
     # --- Mode Configuration ---
     parser.add_argument("--mode", type=str, choices=["harvest", "inference"], default="harvest", 
                         help="Choose 'harvest' for long data collection or 'inference' for a multi-N evaluation sweep.")
+    parser.add_argument("--prefix", type=str, default="", 
+                        help="An optional string to prepend to the output video folder and CSV filename.")
     
     # --- Inference Arguments ---
     parser.add_argument("--n-test-array", type=int, nargs="+", default=[5, 7, 10], 
@@ -255,13 +257,13 @@ def load_oracle_model(args, envs, device):
     """Helper to initialize architecture and load strict weights."""
     state_dim = envs.num_agents * np.array(envs.single_observation_space.shape).prod()
     
-    oracle = TransformerAgent(
-        envs.single_action_space, 
-        envs.single_observation_space.shape, 
-        envs.num_agents, 
-        state_dim=state_dim, 
-        n_max=args.n_max * 2
-    ).to(device)
+    # oracle = TransformerAgent(
+    #     envs.single_action_space, 
+    #     envs.single_observation_space.shape, 
+    #     envs.num_agents, 
+    #     state_dim=state_dim, 
+    #     n_max=args.n_max * 2
+    # ).to(device)
 
     # oracle = Agent(
     #     envs.single_action_space, 
@@ -276,6 +278,14 @@ def load_oracle_model(args, envs, device):
     #     n_max=args.n_max * 2, 
     #     num_agents=args.num_landmarks
     # ).to(device)
+
+    oracle = PointNetAgent(
+        envs.single_action_space, 
+        envs.single_observation_space.shape, 
+        num_agents = envs.num_agents, 
+        state_dim=state_dim, 
+        n_max=args.n_max * 2
+    ).to(device)
 
     # MLP and GraphAgent alternatives remain functionally available here if uncommented
     
@@ -306,6 +316,10 @@ def get_action(oracle, obs):
     elif hasattr(oracle, 'transformer'):
         backbone_outputs = oracle._forward_actor_backbone(obs_norm)
         actor_features = oracle.actor(backbone_outputs)
+    elif hasattr(oracle, 'rho'):
+        # PointNet routing uses rho instead of actor
+        backbone_outputs = oracle._forward_actor_backbone(obs_norm)
+        actor_features = oracle.rho(backbone_outputs)
     else:
         actor_features = oracle.actor(obs_norm)
         
@@ -320,12 +334,23 @@ def run_inference(args):
     device = torch.device("cuda" if args.cuda else "cpu")
     all_metrics = []
     
+    # Handle the prefix formatting
+    prefix_str = f"{args.prefix}_" if args.prefix else ""
+    
     # Create a directory specifically for inference videos
-    video_dir = os.path.join(args.output_dir, "inference_videos")
+    video_folder_name = f"{prefix_str}inference_videos"
+    video_dir = os.path.join(args.output_dir, video_folder_name)
     os.makedirs(video_dir, exist_ok=True)
+    
+    # Resolve the final CSV path
+    csv_dirname = os.path.dirname(args.csv_output)
+    csv_basename = os.path.basename(args.csv_output)
+    final_csv_name = f"{prefix_str}{csv_basename}"
+    final_csv_path = os.path.join(csv_dirname, final_csv_name) if csv_dirname else final_csv_name
     
     print(f"\n--- STARTING DETERMINISTIC INFERENCE SWEEP ---")
     print(f"Oracle Model: {args.model_path}")
+    print(f"Prefix: '{args.prefix}'" if args.prefix else "Prefix: None")
     print(f"N_test configurations to evaluate: {args.n_test_array}")
     
     for n_test in args.n_test_array:
@@ -335,7 +360,7 @@ def run_inference(args):
         args.num_landmarks = n_test
         args.num_envs = n_test
         
-        envs = VMASVectorizedEnv(args, args.seed, run_name=f"infer_run_{n_test}", update_step=0)
+        envs = VMASVectorizedEnv(args, args.seed, run_name=f"{prefix_str}infer_run_{n_test}", update_step=0)
         tracker = BehavioralMetricTracker(envs.num_games, envs.num_agents)
         oracle = load_oracle_model(args, envs, device)
         
@@ -367,7 +392,7 @@ def run_inference(args):
                     raw_obs = step_data[-1]["raw_obs"].clone().to(device)
 
         # Save the video for this N_test
-        video_path = os.path.join(video_dir, f"inference_N{n_test}.mp4")
+        video_path = os.path.join(video_dir, f"{prefix_str}inference_N{n_test}.mp4")
         imageio.mimsave(video_path, video_frames, fps=15)
         print(f"Saved video to: {video_path}")
 
@@ -384,15 +409,15 @@ def run_inference(args):
 
     # Aggregate and Save to CSV
     if all_metrics:
-        os.makedirs(os.path.dirname(os.path.abspath(args.csv_output)), exist_ok=True)
+        os.makedirs(os.path.dirname(os.path.abspath(final_csv_path)), exist_ok=True)
         keys = all_metrics[0].keys()
         
-        with open(args.csv_output, 'w', newline='') as csvfile:
+        with open(final_csv_path, 'w', newline='') as csvfile:
             writer = csv.DictWriter(csvfile, fieldnames=keys)
             writer.writeheader()
             writer.writerows(all_metrics)
             
-        print(f"\n[Success] All inference metrics saved to: {args.csv_output}")
+        print(f"\n[Success] All inference metrics saved to: {final_csv_path}")
 
 def harvest_imitation_data(args):
     """Runs long-term data collection up to --num-trajectories."""

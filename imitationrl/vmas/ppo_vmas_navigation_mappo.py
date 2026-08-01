@@ -33,7 +33,7 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="vmas-navigation-transformer",
+    parser.add_argument("--wandb-project-name", type=str, default="vmas-navigation-pointnet",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
@@ -145,6 +145,122 @@ class PopArt(nn.Module):
     
     def normalize(self, x):
         return (x - self.mean) / torch.sqrt(self.std**2 + 1e-8)
+
+class PointNetAgent(nn.Module):
+    def __init__(self, single_action_space, single_obs_shape, num_agents, state_dim, n_max=10):
+        super().__init__()
+        self.num_agents = num_agents
+        self.obs_dim = np.array(single_obs_shape).prod() # Exactly 2 * n_max * 9
+        self.action_dim = np.prod(single_action_space.shape)
+        self.n_max_nodes = n_max 
+        self.feature_dim = 9
+        
+        # 1. SHARED NORMALIZER
+        self.obs_normalizer = GraphObservationNormalizer(n_max=n_max, feature_dim=self.feature_dim, continuous_dim=4)
+        
+        # 2. DEEPSETS NODE ENCODER (phi) - Applied to each token independently
+        self.phi = nn.Sequential(
+            layer_init(nn.Linear(self.feature_dim, 128)),
+            nn.LayerNorm(128), nn.ReLU(),
+            layer_init(nn.Linear(128, 128)),
+            nn.LayerNorm(128), nn.ReLU(),
+            layer_init(nn.Linear(128, 128)),
+            nn.LayerNorm(128), nn.ReLU()
+        )
+        
+        # 3. GLOBAL ACTOR PROCESSOR (rho) - Applied to the aggregated feature
+        self.rho = nn.Sequential(
+            layer_init(nn.Linear(128, 128)),
+            nn.LayerNorm(128), nn.ReLU(),
+            layer_init(nn.Linear(128, 64)),
+            nn.LayerNorm(64), nn.ReLU(),
+            layer_init(nn.Linear(64, 64)),
+            nn.ReLU()
+        )
+        
+        self.actor_mean = nn.Sequential(
+            layer_init(nn.Linear(64, self.action_dim), std=0.01),
+            nn.Tanh() 
+        )
+        self.actor_logstd = nn.Parameter(torch.zeros(1, self.action_dim))
+
+        # 4. CENTRALIZED CRITIC (Retains identical CTDE architecture)
+        joint_critic_dim = self.num_agents * self.obs_dim
+        self.critic_encoder = nn.Sequential(
+            layer_init(nn.Linear(joint_critic_dim, 512)), 
+            nn.LayerNorm(512), nn.ReLU(),
+            layer_init(nn.Linear(512, 512)),
+            nn.LayerNorm(512), nn.ReLU(),
+            layer_init(nn.Linear(512, 256)),
+            nn.LayerNorm(256), nn.ReLU(),
+            layer_init(nn.Linear(256, 256)),
+            nn.ReLU(),
+        )
+        self.critic = PopArt(256, 1)
+
+    def _forward_actor_backbone(self, x_norm):
+        B = x_norm.shape[0]
+        # Reshape into [Batch, Nodes, Features]
+        tokens = x_norm.view(B, self.n_max_nodes, self.feature_dim)
+        
+        # Identify active nodes to mask out padding before max pooling
+        # Using the is_active flag at index 6 from your graph formatting
+        is_active = (tokens[:, :, 6] >= 0.5).unsqueeze(-1).float()
+        
+        # 1. Independent Node Processing (phi)
+        node_features = self.phi(tokens) # Shape: [B, n_max_nodes, 128]
+        
+        # 2. Masking
+        # Set inactive nodes to a highly negative value so they drop out during max-pooling
+        masked_features = node_features + (1.0 - is_active) * -1e9
+        
+        # 3. Permutation-Invariant Aggregation (Max Pooling)
+        global_feature, _ = torch.max(masked_features, dim=1) # Shape: [B, 128]
+        
+        return global_feature
+
+    def get_actor_parameters(self):
+        return (
+            list(self.phi.parameters()) +
+            list(self.rho.parameters()) +
+            list(self.actor_mean.parameters()) +
+            [self.actor_logstd]
+        )
+
+    def get_value(self, x, denormalize=False):
+        x_norm = self.obs_normalizer.normalize(x)
+        batch_size = x.shape[0]
+        num_games = batch_size // self.num_agents
+        
+        joint_state = x_norm.view(num_games, -1)
+        expanded_joint_state = joint_state.repeat_interleave(self.num_agents, dim=0)
+        
+        values = self.critic(self.critic_encoder(expanded_joint_state)) 
+        if denormalize:
+            values = self.critic.denormalize(values)
+        return values.view(-1, 1)
+
+    def get_action_and_value(self, x, action=None, denormalize=False):
+        x_norm = self.obs_normalizer.normalize(x)
+        
+        # Get permutation-invariant global feature
+        global_feature = self._forward_actor_backbone(x_norm)
+        
+        # Pass through the final processor (rho)
+        actor_features = self.rho(global_feature)
+        
+        action_means = self.actor_mean(actor_features)
+        action_logstds = self.actor_logstd.expand_as(action_means)
+        
+        # STRICT PARITY: Retaining max=2.0 exactly as requested!
+        safe_logstds = torch.clamp(action_logstds, min=-5.0, max=2.0)
+        action_stds = safe_logstds.exp()
+        
+        probs = Normal(action_means, action_stds)
+        if action is None:
+            action = probs.sample()
+            
+        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.get_value(x, denormalize)
 
 class TransformerAgent(nn.Module):
     def __init__(self, single_action_space, single_obs_shape, num_agents, state_dim, n_max=10, d_model=256, nhead=4, num_layers=3):
@@ -652,13 +768,21 @@ if __name__ == "__main__":
         # Fallback for Atari or environments without a God-view state
         state_dim = num_agents_per_game * np.array(envs.single_observation_space.shape).prod()
 
-    agent = TransformerAgent(
+    agent = PointNetAgent(
         envs.single_action_space, 
         envs.single_observation_space.shape, 
         num_agents_per_game, 
         state_dim=state_dim, 
         n_max=args.n_max * 2
     ).to(device)
+
+    # agent = TransformerAgent(
+    #     envs.single_action_space, 
+    #     envs.single_observation_space.shape, 
+    #     num_agents_per_game, 
+    #     state_dim=state_dim, 
+    #     n_max=args.n_max * 2
+    # ).to(device)
 
     # agent = Agent(
     #     envs.single_action_space, 
@@ -667,11 +791,21 @@ if __name__ == "__main__":
     #     state_dim=state_dim, 
     #     n_max=args.n_max * 2
     # ).to(device)
+
     optimizer = optim.Adam([
             {'params': agent.get_actor_parameters(), 'lr': 3e-4}, 
             {'params': list(agent.critic_encoder.parameters()) + 
                        list(agent.critic.parameters()), 'lr': 1e-3} 
         ], eps=1e-5)
+
+    # optimizer = optim.Adam([
+    #         {'params': list(agent.actor.parameters()) + 
+    #                    list(agent.actor_mean.parameters()) + 
+    #                    [agent.actor_logstd], 'lr': 3e-4}, 
+            
+    #         {'params': list(agent.critic_encoder.parameters()) + 
+    #                    list(agent.critic.parameters()), 'lr': 1e-3} 
+    #     ], eps=1e-5)
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, actual_num_envs) + envs.single_observation_space.shape).to(device)
