@@ -1145,7 +1145,7 @@ if __name__ == "__main__":
     agent.eval() 
     
     eval_max_cycles = 1500 # Set this to however long you want to watch
-    eval_num_agents = 30
+    eval_num_agents = 50
     
     # 2. Spin up a fresh, single-game environment with the long max-cycles
     eval_env = vmas.make_env(

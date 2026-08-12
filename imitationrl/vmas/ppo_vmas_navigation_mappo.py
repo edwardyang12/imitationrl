@@ -33,7 +33,7 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="vmas-navigation-pointnet",
+    parser.add_argument("--wandb-project-name", type=str, default="vmas-navigation-transformer",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
@@ -768,21 +768,21 @@ if __name__ == "__main__":
         # Fallback for Atari or environments without a God-view state
         state_dim = num_agents_per_game * np.array(envs.single_observation_space.shape).prod()
 
-    agent = PointNetAgent(
-        envs.single_action_space, 
-        envs.single_observation_space.shape, 
-        num_agents_per_game, 
-        state_dim=state_dim, 
-        n_max=args.n_max * 2
-    ).to(device)
-
-    # agent = TransformerAgent(
+    # agent = PointNetAgent(
     #     envs.single_action_space, 
     #     envs.single_observation_space.shape, 
     #     num_agents_per_game, 
     #     state_dim=state_dim, 
     #     n_max=args.n_max * 2
     # ).to(device)
+
+    agent = TransformerAgent(
+        envs.single_action_space, 
+        envs.single_observation_space.shape, 
+        num_agents_per_game, 
+        state_dim=state_dim, 
+        n_max=args.n_max * 2
+    ).to(device)
 
     # agent = Agent(
     #     envs.single_action_space, 
