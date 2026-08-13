@@ -790,21 +790,7 @@ if __name__ == "__main__":
         next_info = {}
     next_done = torch.zeros(actual_num_envs).to(device)
 
-    if "global_state" in next_info:
-        # Use the actual shape of the global state provided by your wrappers
-        # state_dim = next_info["global_state"].shape[-1]
-        state_dim = num_agents_per_game * np.array(envs.single_observation_space.shape).prod()
-
-        state0 = next_info["global_state"][0]
-        state1 = next_info["global_state"][num_agents_per_game] if len(next_info["global_state"]) > 1 else None
-        if state1 is not None:
-            diff = torch.abs(state0 - state1).sum().item()
-            print(f"DEBUG: Environmental Divergence Score: {diff}")
-            if diff == 0:
-                print("WARNING: Environments are still synchronized!")
-    else:
-        # Fallback for Atari or environments without a God-view state
-        state_dim = num_agents_per_game * np.array(envs.single_observation_space.shape).prod()
+    state_dim = num_agents_per_game * np.array(envs.single_observation_space.shape).prod()
 
     n_max = args.n_max
 
@@ -887,9 +873,6 @@ if __name__ == "__main__":
                 next_info = {}
             next_done = torch.zeros(actual_num_envs).to(device)
             
-            # Re-sync the global state tracking
-            if "global_state" in next_info:
-                current_game_states = next_obs.view(num_games, -1)
             print("--- PHOENIX REBOOT COMPLETE ---")
 
         for step in range(0, args.num_steps):
@@ -1042,7 +1025,6 @@ if __name__ == "__main__":
                 
                 # This ensures we always pick Agent 0, 1, 2... from the same game/time together
                 mb_inds = (mb_joint_inds[:, None] * agent.num_agents + np.arange(agent.num_agents)).flatten()
-                mb_state_inds = mb_joint_inds
 
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(
                     b_obs[mb_inds], 
