@@ -9,7 +9,8 @@ from tqdm import tqdm
 import json
 
 # Import the architecture and environment wrapper directly from your flocking training script
-from ppo_vmas_flocking_gnn import GraphAgent, VMASVectorizedEnv
+#from ppo_vmas_flocking_gnn import GraphAgent, VMASVectorizedEnv
+from ppo_vmas_flocking_mappo import Agent, PointNetAgent, VMASVectorizedEnv
 
 class FlockingMetricTracker:
     def __init__(self, num_games, num_agents, agent_radius=0.1, desired_spacing=0.4, n_max=5, comm_radius=2.0):
@@ -198,11 +199,29 @@ def parse_harvest_args():
 
 def load_oracle_model(args, envs, device):
     """Initializes the architecture and loads strict weights.[cite: 1]"""
-    oracle = GraphAgent(
-        envs=envs, 
-        n_max=args.n_max, 
-        num_agents=envs.num_agents
+    state_dim = envs.num_agents * np.array(envs.single_observation_space.shape).prod()
+
+    # oracle = Agent(
+    #         envs.single_action_space, 
+    #         envs.single_observation_space.shape, 
+    #         num_agents = envs.num_agents, 
+    #         state_dim=state_dim, 
+    #         n_max=args.n_max
+    #     ).to(device)
+
+    oracle = PointNetAgent(
+        envs.single_action_space, 
+        envs.single_observation_space.shape, 
+        num_agents = envs.num_agents, 
+        state_dim=state_dim, 
+        n_max=args.n_max
     ).to(device)
+
+    # oracle = GraphAgent(
+    #     envs=envs, 
+    #     n_max=args.n_max, 
+    #     num_agents=envs.num_agents
+    # ).to(device)
 
     print(f"Loading Oracle weights from {args.model_path}...")
     state_dict = torch.load(args.model_path, map_location=device, weights_only=True)
@@ -223,9 +242,21 @@ def get_action(oracle, obs):
     else:
         obs_norm = obs
         
-    valid_x, node_embeddings, _ = oracle.backbone(obs_norm)
-    agent_mask = valid_x[:, 4] > 0.5
-    actor_features = oracle.actor_mlp(node_embeddings[agent_mask])
+    if hasattr(oracle, 'backbone'):
+        backbone_outputs = oracle.backbone(obs_norm)
+        valid_x = backbone_outputs[0]
+        node_embeddings = backbone_outputs[1]
+        agent_mask = valid_x[:, 4] > 0.5
+        actor_features = oracle.actor_mlp(node_embeddings[agent_mask])
+    elif hasattr(oracle, 'transformer'):
+        backbone_outputs = oracle._forward_actor_backbone(obs_norm)
+        actor_features = oracle.actor(backbone_outputs)
+    elif hasattr(oracle, 'rho'):
+        # PointNet routing uses rho instead of actor
+        backbone_outputs = oracle._forward_actor_backbone(obs_norm)
+        actor_features = oracle.rho(backbone_outputs)
+    else:
+        actor_features = oracle.actor(obs_norm)
         
     deterministic_action = oracle.actor_mean(actor_features)
     
