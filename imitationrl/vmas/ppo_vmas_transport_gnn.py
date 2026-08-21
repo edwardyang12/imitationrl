@@ -20,6 +20,8 @@ from torch.utils.tensorboard import SummaryWriter
 from vmas.scenarios.transport import Scenario as BaseTransport
 from torch_geometric.nn import radius_graph
 from torch_geometric.nn import GCNConv
+from vmas.simulator.core import World, Agent, Landmark, Sphere, Box, Color
+from vmas.simulator.utils import ScenarioUtils
 
 def parse_args():
     # fmt: off
@@ -44,13 +46,13 @@ def parse_args():
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="transport",
         help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=300000000,
+    parser.add_argument("--total-timesteps", type=int, default=700000000,
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=7e-4,
         help="the learning rate of the optimizer")
     parser.add_argument("--num-envs", type=int, default=4096,
         help="the number of parallel game environments")
-    parser.add_argument("--num-steps", type=int, default=512,
+    parser.add_argument("--num-steps", type=int, default=1024,
         help="the number of steps to run in each environment per policy rollout")
     parser.add_argument("--anneal-lr", type=lambda x: bool(strtobool(x)), default=True, nargs="?", const=True,
         help="Toggle learning rate annealing for policy and value networks")
@@ -82,7 +84,7 @@ def parse_args():
         help="number of agents and landmarks")
     parser.add_argument("--num-packages", type=int, default=1,
         help="number of packages to transport")
-    parser.add_argument("--max-cycles", type=int, default=400,
+    parser.add_argument("--max-cycles", type=int, default=1000,
         help="length of environment run")
     parser.add_argument("--n-max", type=int, default=5, help="Fixed context window size for the GNN")
     args = parser.parse_args()
@@ -92,12 +94,61 @@ def parse_args():
     return args
 
 class TransportCleanScenario(BaseTransport):
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
+    def make_world(self, batch_dim: int, device: torch.device, **kwargs):
+        n_agents = kwargs.pop("n_agents", 4)
+        self.n_packages = kwargs.pop("n_packages", 1)
+        self.package_width = kwargs.pop("package_width", 0.15)
+        self.package_length = kwargs.pop("package_length", 0.15)
+        self.package_mass = kwargs.pop("package_mass", 30)
+        ScenarioUtils.check_kwargs_consumed(kwargs)
+
+        self.shaping_factor = 100
+        
+        # --- CRITICAL FIX: Expanded World Bounds ---
+        self.world_semidim = 1.3
+        self.agent_radius = 0.03
+
+        world = World(
+            batch_dim,
+            device,
+            x_semidim=self.world_semidim + 2 * self.agent_radius + max(self.package_length, self.package_width),
+            y_semidim=self.world_semidim + 2 * self.agent_radius + max(self.package_length, self.package_width),
+        )
+        
+        for i in range(n_agents):
+            agent = Agent(
+                name=f"agent_{i}",
+                shape=Sphere(self.agent_radius),
+                u_multiplier=0.6,
+            )
+            world.add_agent(agent)
+            
+        goal = Landmark(
+            name="goal",
+            collide=False,
+            shape=Sphere(radius=0.15),
+            color=Color.LIGHT_GREEN,
+        )
+        world.add_landmark(goal)
+        
+        self.packages = []
+        for i in range(self.n_packages):
+            package = Landmark(
+                name=f"package {i}",
+                collide=True,
+                movable=True,
+                mass=self.package_mass,
+                shape=Box(length=self.package_length, width=self.package_width),
+                color=Color.RED,
+            )
+            package.goal = goal
+            self.packages.append(package)
+            world.add_landmark(package)
+
+        return world
         
     def reward(self, agent):
-        base_reward = super().reward(agent)
-        return base_reward
+        return super().reward(agent)
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
@@ -405,8 +456,8 @@ class VMASVectorizedEnv:
             n_packages=args.num_packages,
             seed=seed,
             dict_spaces=False,
-            package_width=0.3,
-            package_length=0.3
+            package_width=0.35,
+            package_length=0.35
         )
         
         self.single_action_space = self.env.action_space[0]
@@ -616,7 +667,7 @@ class VMASVectorizedEnv:
                 imageio.mimsave(file_path, self.video_frames, fps=15)
                 self.video_frames = []
             
-            self.record_this_episode = (self.args.capture_video and self.episode_count % 50 == 0)
+            self.record_this_episode = (self.args.capture_video and self.episode_count % 25 == 0)
 
             # ---------------------------------
 
@@ -656,11 +707,15 @@ def compute_transport_metrics(world, agent_radius=0.1):
     goal_pos = torch.stack([l.state.pos for l in world.landmarks if not l.movable and not l.collide], dim=1) # (B, G, 2)
     
     # 1. Package-to-Goal Transport Error & Velocity Goodput
-    if goal_pos.shape[1] == package_pos.shape[1] and goal_pos.shape[1] > 0:
+    if package_pos.shape[1] > 0 and goal_pos.shape[1] > 0:
+        # PyTorch will automatically broadcast the single goal_pos (B, 1, 2) 
+        # across all packages in package_pos (B, P, 2)
         transport_error = torch.norm(package_pos - goal_pos, dim=-1).mean(dim=1)
+        
         to_goal_dir = goal_pos - package_pos
         to_goal_dist = torch.norm(to_goal_dir, dim=-1, keepdim=True) + 1e-8
         to_goal_unit = to_goal_dir / to_goal_dist
+        
         transport_velocity = (package_vel * to_goal_unit).sum(dim=-1).mean(dim=1)
     else:
         transport_error = torch.zeros(B, device=agent_pos.device)
@@ -1083,9 +1138,9 @@ if __name__ == "__main__":
     # 1. Lock the agent's normalizers (CRITICAL)
     agent.eval() 
     
-    eval_max_cycles = 1500 # Set this to however long you want to watch
+    eval_max_cycles = 2000 # Set this to however long you want to watch
     eval_num_agents = 50
-    n_packages = 2
+    n_packages = args.num_packages
     
     # 2. Spin up a fresh, single-game environment with the long max-cycles
     eval_env = vmas.make_env(
@@ -1097,8 +1152,8 @@ if __name__ == "__main__":
         seed=args.seed + 100, # Offset seed so it's a novel starting position
         dict_spaces=False,
         n_packages = n_packages,
-        package_width=0.3,
-        package_length=0.3
+        package_width=0.35,
+        package_length=0.35
     )
     
     # 3. Reset and prep the observation format
