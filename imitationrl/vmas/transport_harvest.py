@@ -10,8 +10,8 @@ import math
 import json
 
 # Import the architecture, environment wrapper, and metrics directly from your transport training script
-# from ppo_vmas_transport_mappo import PointNetAgent, MAPPOAgent, VMASVectorizedEnv
-from ppo_vmas_transport_gnn import GraphAgent, VMASVectorizedEnv
+from ppo_vmas_transport_mappo import PointNetAgent, MAPPOAgent, VMASVectorizedEnv
+# from ppo_vmas_transport_gnn import GraphAgent, VMASVectorizedEnv
 
 def compute_transport_metrics(world, agent_radius=0.03):
     B = len(world.agents[0].state.pos)
@@ -229,19 +229,19 @@ def load_oracle_model(args, envs, device):
     """Initializes the architecture and loads strict weights."""
     state_dim = envs.num_agents * np.array(envs.single_observation_space.shape).prod()
 
-    # oracle = PointNetAgent(
-    #     envs.single_action_space, 
-    #     envs.single_observation_space.shape, 
-    #     num_agents=envs.num_agents, 
-    #     state_dim=state_dim, 
-    #     n_max=args.n_max
-    # ).to(device)
-
-    oracle = GraphAgent(
-        envs=envs, 
-        n_max=args.n_max, 
-        num_agents=envs.num_agents
+    oracle = PointNetAgent(
+        envs.single_action_space, 
+        envs.single_observation_space.shape, 
+        num_agents=envs.num_agents, 
+        state_dim=state_dim, 
+        n_max=args.n_max
     ).to(device)
+
+    # oracle = GraphAgent(
+    #     envs=envs, 
+    #     n_max=args.n_max, 
+    #     num_agents=envs.num_agents
+    # ).to(device)
 
     print(f"Loading Oracle weights from {args.model_path}...")
     state_dict = torch.load(args.model_path, map_location=device, weights_only=True)

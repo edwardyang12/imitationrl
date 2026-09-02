@@ -300,6 +300,38 @@ def plot_behavioral_breakdowns(df, n_train, n_max, output_dir="plots"):
     plt.savefig(os.path.join(output_dir, '4_Behavioral_Breakdowns.pdf'))
     plt.close()
 
+def plot_saturation_curve(df, output_dir="plots"):
+    # Focus exclusively on the extreme density stress test
+    df_105 = df[df['N_test'] == 105].copy()
+    if df_105.empty: return
+
+    fig, ax = plt.subplots(figsize=(8, 6))
+    current_palette = {k: v for k, v in MODEL_COLORS.items() if k in df_105['Model'].unique()}
+    
+    # Seaborn automatically averages across the N_train values and plots the confidence interval
+    sns.lineplot(
+        data=df_105, x='n_max', y='S_rate (Final Goal Retention Rate %)', 
+        hue='Model', palette=current_palette, marker='o', linewidth=2.5, errorbar=('ci', 95), ax=ax
+    )
+    
+    # Mark the saturation threshold
+    ax.axhline(95, ls='--', color='gray', alpha=0.7, label='95% Saturation Threshold')
+    
+    ax.set_title('Context Window Saturation (Evaluated at N=105)')
+    ax.set_xlabel('Context Window Size (n_max)')
+    ax.set_ylabel('Mean Success Rate (%) Across All N_train')
+    ax.set_ylim(0, 105)
+    
+    # Ensure x-axis ticks match your discrete n_max values
+    ax.set_xticks(sorted(df_105['n_max'].unique()))
+    ax.grid(True, linestyle='--', alpha=0.5)
+    ax.legend()
+    
+    plt.tight_layout()
+    os.makedirs(output_dir, exist_ok=True)
+    plt.savefig(os.path.join(output_dir, '5_Saturation_Curve.pdf'))
+    plt.close()
+
 # ---------------------------------------------------------
 # Main Execution
 # ---------------------------------------------------------
@@ -332,5 +364,8 @@ if __name__ == "__main__":
     
     print("Generating Graph 4: Behavioral Breakdown Curves...")
     plot_behavioral_breakdowns(metrics_df, args.baseline_ntrain, args.baseline_nmax, args.output_dir)
+
+    print("Generating Graph 5: Saturation Curve...")
+    plot_saturation_curve(metrics_df, args.output_dir)
     
     print("\n[Success] All graphs generated and saved.")
