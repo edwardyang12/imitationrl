@@ -10,7 +10,7 @@ import json
 
 # Import the architecture and environment wrapper directly from your flocking training script
 # from ppo_vmas_flocking_gnn import GraphAgent, VMASVectorizedEnv
-from ppo_vmas_flocking_mappo import Agent, PointNetAgent, VMASVectorizedEnv
+from ppo_vmas_flocking_mappo import Agent, PointNetAgent, VMASVectorizedEnv, TransformerAgent
 
 class FlockingMetricTracker:
     def __init__(self, num_games, num_agents, agent_radius=0.1, desired_spacing=0.4, n_max=5, comm_radius=2.0):
@@ -209,10 +209,18 @@ def load_oracle_model(args, envs, device):
     #         n_max=args.n_max
     #     ).to(device)
 
-    oracle = PointNetAgent(
+    # oracle = PointNetAgent(
+    #     envs.single_action_space, 
+    #     envs.single_observation_space.shape, 
+    #     num_agents = envs.num_agents, 
+    #     state_dim=state_dim, 
+    #     n_max=args.n_max
+    # ).to(device)
+
+    oracle = TransformerAgent(
         envs.single_action_space, 
         envs.single_observation_space.shape, 
-        num_agents = envs.num_agents, 
+        envs.num_agents, 
         state_dim=state_dim, 
         n_max=args.n_max
     ).to(device)
@@ -232,7 +240,7 @@ def load_oracle_model(args, envs, device):
             del state_dict[k]
             
     oracle.load_state_dict(state_dict, strict=False)
-    oracle.eval()
+    oracle.train() # for transformer this needs to be train() and not eval()
     return oracle
 
 def get_action(oracle, obs):

@@ -31,7 +31,7 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="vmas-flocking-mlp",
+    parser.add_argument("--wandb-project-name", type=str, default="vmas-flocking-transformer",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
@@ -302,7 +302,7 @@ class TransformerAgent(nn.Module):
             layer_init(nn.Linear(256, 256)),
             nn.ReLU(),
         )
-        self.critic = PopArt(256, 1)
+        self.critic_popart = PopArt(256, 1)
 
     def _forward_actor_backbone(self, x_norm):
         B = x_norm.shape[0]
@@ -350,12 +350,12 @@ class TransformerAgent(nn.Module):
         joint_state = x_norm.view(num_games, -1)
         expanded_joint_state = joint_state.repeat_interleave(self.num_agents, dim=0)
         
-        values = self.critic(self.critic_encoder(expanded_joint_state)) 
+        values = self.critic_popart(self.critic_encoder(expanded_joint_state)) 
         if denormalize:
-            values = self.critic.denormalize(values)
+            values = self.critic_popart.denormalize(values)
         return values.view(-1, 1)
 
-    def get_action_and_value(self, x, action=None, denormalize=False):
+    def get_action_and_value(self, x, action=None, denormalize=False, compute_value=True):
         x_norm = self.obs_normalizer.normalize(x)
         
         ego_features = self._forward_actor_backbone(x_norm)
@@ -370,8 +370,10 @@ class TransformerAgent(nn.Module):
         probs = Normal(action_means, action_stds)
         if action is None:
             action = probs.sample()
+
+        value = self.get_value(x, denormalize) if compute_value else None
             
-        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.get_value(x, denormalize)
+        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), value
 
 class PointNetAgent(nn.Module):
     def __init__(self, single_action_space, single_obs_shape, num_agents, state_dim, n_max=10):
@@ -937,8 +939,7 @@ if __name__ == "__main__":
     #     n_max=args.n_max
     # ).to(device)
 
-
-    agent = Agent(
+    agent = TransformerAgent(
         envs.single_action_space, 
         envs.single_observation_space.shape, 
         num_agents_per_game, 
@@ -946,20 +947,28 @@ if __name__ == "__main__":
         n_max=args.n_max
     ).to(device)
 
-    # optimizer = optim.Adam([
-    #         {'params': agent.get_actor_parameters(), 'lr': 3e-4}, 
-    #         {'params': list(agent.critic_encoder.parameters()) + 
-    #                     list(agent.critic_popart.parameters()), 'lr': 1e-3} 
-    #     ], eps=1e-5)
+    # agent = Agent(
+    #     envs.single_action_space, 
+    #     envs.single_observation_space.shape, 
+    #     num_agents_per_game, 
+    #     state_dim=state_dim, 
+    #     n_max=args.n_max
+    # ).to(device)
 
     optimizer = optim.Adam([
-            {'params': list(agent.actor.parameters()) + 
-                       list(agent.actor_mean.parameters()) + 
-                       [agent.actor_logstd], 'lr': 3e-4}, 
-            
+            {'params': agent.get_actor_parameters(), 'lr': 3e-4}, 
             {'params': list(agent.critic_encoder.parameters()) + 
-                       list(agent.critic_popart.parameters()), 'lr': 1e-3} 
-            ], eps=1e-5)
+                        list(agent.critic_popart.parameters()), 'lr': 1e-3} 
+        ], eps=1e-5)
+
+    # optimizer = optim.Adam([
+    #         {'params': list(agent.actor.parameters()) + 
+    #                    list(agent.actor_mean.parameters()) + 
+    #                    [agent.actor_logstd], 'lr': 3e-4}, 
+            
+    #         {'params': list(agent.critic_encoder.parameters()) + 
+    #                    list(agent.critic_popart.parameters()), 'lr': 1e-3} 
+    #         ], eps=1e-5)
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, actual_num_envs) + envs.single_observation_space.shape).to(device)
@@ -1117,10 +1126,21 @@ if __name__ == "__main__":
             # 3. Second Pass: RE-CALCULATE Values and Advantages with NEW stats
             # This is the crucial step you were missing. 
             # It ensures 'values' and 'returns' are in the same normalized space for SGD.
-            new_values = agent.get_value(
-                obs.view(-1, obs.shape[-1]),
-                denormalize=True
-            ).view(args.num_steps, actual_num_envs)
+            # new_values = agent.get_value(
+            #     obs.view(-1, obs.shape[-1]),  # <- Use obs.shape[-1] instead of agent.obs_dim
+            #     denormalize=True
+            # ).view(args.num_steps, actual_num_envs)
+
+            b_obs_flat = obs.view(-1, obs.shape[-1])
+            new_values_flat = torch.zeros(b_obs_flat.shape[0], device=device)
+            
+            # Process the massive batch in safe chunks to protect GAT memory
+            chunk_size = args.batch_size // args.num_minibatches 
+            for start in range(0, b_obs_flat.shape[0], chunk_size):
+                end = start + chunk_size
+                new_values_flat[start:end] = agent.get_value(b_obs_flat[start:end], denormalize=True).flatten()
+                
+            new_values = new_values_flat.view(args.num_steps, actual_num_envs)
             
             new_next_value = agent.get_value(boot_obs, denormalize=True).flatten()
             
