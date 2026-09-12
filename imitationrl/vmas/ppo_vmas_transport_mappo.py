@@ -36,7 +36,7 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="vmas-transport-mlp",
+    parser.add_argument("--wandb-project-name", type=str, default="vmas-transport-transformer",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
@@ -46,7 +46,7 @@ def parse_args():
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="transport",
         help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=700000000,
+    parser.add_argument("--total-timesteps", type=int, default=500000000,
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=7e-4,
         help="the learning rate of the optimizer")
@@ -400,6 +400,142 @@ class MAPPOAgent(nn.Module):
             
         return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), value
 
+class TransformerAgent(nn.Module):
+    def __init__(self, single_action_space, single_obs_shape, num_agents, state_dim, n_max=10, d_model=256, nhead=4, num_layers=3):
+        super().__init__()
+        self.num_agents = num_agents
+        self.obs_dim = np.array(single_obs_shape).prod() 
+        self.action_dim = np.prod(single_action_space.shape)
+        self.n_max_nodes = n_max 
+        
+        self.feature_dim = 11
+        self.nhead = nhead 
+        
+        self.obs_normalizer = GraphObservationNormalizer(n_max=n_max, feature_dim=self.feature_dim, continuous_dim=4)
+        
+        self.geom_scale = nn.Parameter(torch.ones(1, nhead, 1, 1))
+        
+        self.token_proj = nn.Sequential(
+            layer_init(nn.Linear(self.feature_dim, d_model)),
+            nn.LayerNorm(d_model),
+            nn.ReLU(),
+            layer_init(nn.Linear(d_model, d_model)),
+            nn.LayerNorm(d_model) 
+        )
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, 
+            nhead=nhead, 
+            dim_feedforward=d_model * 4, 
+            batch_first=True, 
+            activation='gelu', 
+            norm_first=True
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, 
+            num_layers=num_layers, 
+            norm=nn.LayerNorm(d_model), 
+            enable_nested_tensor=False
+        )
+        
+        self.actor = nn.Sequential(
+            nn.LayerNorm(d_model * 3), 
+            layer_init(nn.Linear(d_model * 3, 128)),
+            nn.LayerNorm(128), nn.ReLU(),
+            layer_init(nn.Linear(128, 64)),
+            nn.LayerNorm(64), nn.ReLU(),
+            layer_init(nn.Linear(64, 64)),
+            nn.ReLU(),
+        )
+        self.actor_mean = nn.Sequential(
+            layer_init(nn.Linear(64, self.action_dim), std=0.01),
+            nn.Tanh() 
+        )
+        self.actor_logstd = nn.Parameter(torch.zeros(1, self.action_dim))
+
+        joint_critic_dim = self.num_agents * self.obs_dim
+        self.critic_encoder = nn.Sequential(
+            layer_init(nn.Linear(joint_critic_dim, 512)), 
+            nn.LayerNorm(512), nn.ReLU(),
+            layer_init(nn.Linear(512, 512)),
+            nn.LayerNorm(512), nn.ReLU(),
+            layer_init(nn.Linear(512, 256)),
+            nn.LayerNorm(256), nn.ReLU(),
+            layer_init(nn.Linear(256, 256)),
+            nn.ReLU(),
+        )
+        self.critic_popart = PopArt(256, 1)
+
+    def _forward_actor_backbone(self, x_norm):
+        B = x_norm.shape[0]
+        tokens = x_norm.view(B, self.n_max_nodes, self.feature_dim)
+        
+        key_padding_mask = (tokens[:, :, 9] < 0.5)
+        
+        # Euclidean Attention Biasing
+        pos = tokens[:, :, 0:2] 
+        pos_i = pos.unsqueeze(2) 
+        pos_j = pos.unsqueeze(1) 
+        dist_matrix = torch.norm(pos_i - pos_j, dim=-1, keepdim=True).permute(0, 3, 1, 2)
+        
+        scaled_dist = -torch.abs(self.geom_scale) * dist_matrix
+        geom_mask = scaled_dist.view(B * self.nhead, self.n_max_nodes, self.n_max_nodes)
+        
+        h = self.token_proj(tokens)
+        out = self.transformer(h, mask=geom_mask, src_key_padding_mask=key_padding_mask)
+        
+        # Restored Tri-Token Concatenation with Flocking Indices
+        ego_final = out[:, 0, :]
+        ego_initial = h[:, 0, :]
+        target_initial = h[:, 1, :] # Target is deterministically anchored at index 1
+        
+        combined_ego = torch.cat([ego_final, ego_initial, target_initial], dim=-1)
+        
+        return combined_ego
+
+    def get_actor_parameters(self):
+        return (
+            [self.geom_scale] +
+            list(self.token_proj.parameters()) +
+            list(self.transformer.parameters()) +
+            list(self.actor.parameters()) +
+            list(self.actor_mean.parameters()) +
+            [self.actor_logstd]
+        )
+
+    def get_value(self, x, denormalize=False):
+        x_norm = self.obs_normalizer.normalize(x)
+        batch_size = x.shape[0]
+        num_games = batch_size // self.num_agents
+        
+        joint_state = x_norm.view(num_games, -1)
+        expanded_joint_state = joint_state.repeat_interleave(self.num_agents, dim=0)
+        
+        values = self.critic_popart(self.critic_encoder(expanded_joint_state)) 
+        if denormalize:
+            values = self.critic_popart.denormalize(values)
+        return values.view(-1, 1)
+
+    def get_action_and_value(self, x, action=None, denormalize=False, compute_value=True):
+        x_norm = self.obs_normalizer.normalize(x)
+        
+        ego_features = self._forward_actor_backbone(x_norm)
+        actor_features = self.actor(ego_features)
+        
+        action_means = self.actor_mean(actor_features)
+        action_logstds = self.actor_logstd.expand_as(action_means)
+        
+        safe_logstds = torch.clamp(action_logstds, min=-5.0, max=2.0)
+        action_stds = safe_logstds.exp()
+        
+        probs = Normal(action_means, action_stds)
+        if action is None:
+            action = probs.sample()
+
+        value = self.get_value(x, denormalize) if compute_value else None
+            
+        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), value
+
 class PopArt(nn.Module):
     def __init__(self, input_dim, output_dim, beta=0.99):
         super().__init__()
@@ -526,17 +662,19 @@ class VMASVectorizedEnv:
         rel_vel = all_vel.unsqueeze(1) - ego_vel   # (B, N, total_entities, 2)
         
         # 3. K-Nearest Neighbors selection with priority distance masking
-        batch_idx = torch.arange(B, device=self.device).view(B, 1).expand(B, N)
-        ego_idx = torch.arange(N, device=self.device).view(1, N).expand(B, N)
-        distances[batch_idx, ego_idx, ego_idx] = -1e9 # Force Ego inclusion
-        
-        if P > 0:
-            distances[:, :, N : N + P] -= 1e8 # Heavily prioritize Packages
-        if G > 0:
-            distances[:, :, N + P : N + P + G] -= 1e7 # Prioritize Goals next
+        idx_list = []
+        for i in range(N):
+            teammates = [j for j in range(N) if j != i]
             
-        actual_k = min(K, total_entities)
-        _, topk_idx = torch.topk(distances, k=actual_k, dim=-1, largest=False)
+            # Build strict sequence: Ego first, then all Packages, then Goals, then Teammates
+            seq = [i] + list(range(N, N + P)) + list(range(N + P, N + P + G)) + teammates
+            seq = seq[:K] # Truncate to fit n_max context window
+            
+            idx_list.append(seq)
+            
+        # Convert to tensor and expand to batch size: (B, N, actual_k)
+        topk_idx = torch.tensor(idx_list, device=self.device).unsqueeze(0).expand(B, -1, -1)
+        actual_k = topk_idx.shape[2]
         
         # 4. Build dense 11-dimensional feature matrix
         graph = torch.zeros((B, N, total_entities, self.feature_dim), device=self.device)
@@ -816,13 +954,21 @@ if __name__ == "__main__":
     #     n_max=args.n_max
     # ).to(device)
 
-    agent = PointNetAgent(
+    agent = TransformerAgent(
         envs.single_action_space, 
         envs.single_observation_space.shape, 
         num_agents_per_game, 
         state_dim=state_dim, 
         n_max=args.n_max
     ).to(device)
+
+    # agent = PointNetAgent(
+    #     envs.single_action_space, 
+    #     envs.single_observation_space.shape, 
+    #     num_agents_per_game, 
+    #     state_dim=state_dim, 
+    #     n_max=args.n_max
+    # ).to(device)
 
     # optimizer = optim.Adam([
     #         {'params': list(agent.actor.parameters()) + 

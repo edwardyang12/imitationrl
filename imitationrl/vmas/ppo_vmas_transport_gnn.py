@@ -105,7 +105,7 @@ class TransportCleanScenario(BaseTransport):
         self.shaping_factor = 100
         
         # --- CRITICAL FIX: Expanded World Bounds ---
-        self.world_semidim = 1.6 # need 1.6 to fit 105 agents
+        self.world_semidim = 1.6 # need 1.6 to fit 105 agents usually 1.3
         self.agent_radius = 0.03
 
         world = World(

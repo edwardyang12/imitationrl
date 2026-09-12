@@ -229,13 +229,21 @@ def load_oracle_model(args, envs, device):
     """Initializes the architecture and loads strict weights."""
     state_dim = envs.num_agents * np.array(envs.single_observation_space.shape).prod()
 
-    oracle = PointNetAgent(
-        envs.single_action_space, 
-        envs.single_observation_space.shape, 
-        num_agents=envs.num_agents, 
-        state_dim=state_dim, 
-        n_max=args.n_max
-    ).to(device)
+    oracle = MAPPOAgent(
+            envs.single_action_space, 
+            envs.single_observation_space.shape, 
+            envs.num_agents, 
+            state_dim=state_dim, 
+            n_max=args.n_max
+        ).to(device)
+
+    # oracle = PointNetAgent(
+    #     envs.single_action_space, 
+    #     envs.single_observation_space.shape, 
+    #     num_agents=envs.num_agents, 
+    #     state_dim=state_dim, 
+    #     n_max=args.n_max
+    # ).to(device)
 
     # oracle = GraphAgent(
     #     envs=envs, 
