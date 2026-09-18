@@ -10,7 +10,7 @@ import math
 import json
 
 # Import the architecture, environment wrapper, and metrics directly from your transport training script
-from ppo_vmas_transport_mappo import PointNetAgent, MAPPOAgent, VMASVectorizedEnv
+from ppo_vmas_transport_mappo import PointNetAgent, TransformerAgent, MAPPOAgent, VMASVectorizedEnv
 # from ppo_vmas_transport_gnn import GraphAgent, VMASVectorizedEnv
 
 def compute_transport_metrics(world, agent_radius=0.03):
@@ -237,6 +237,15 @@ def load_oracle_model(args, envs, device):
             n_max=args.n_max
         ).to(device)
 
+    oracle = TransformerAgent(
+            envs.single_action_space, 
+            envs.single_observation_space.shape, 
+            envs.num_agents,
+            state_dim=state_dim, 
+            n_max=args.n_max
+        ).to(device)
+    
+
     # oracle = PointNetAgent(
     #     envs.single_action_space, 
     #     envs.single_observation_space.shape, 
@@ -261,7 +270,7 @@ def load_oracle_model(args, envs, device):
             del state_dict[k]
             
     oracle.load_state_dict(state_dict, strict=False)
-    oracle.eval()
+    oracle.train() # for transformer this needs to be train() and not eval()
     return oracle
 
 def get_action(oracle, obs):

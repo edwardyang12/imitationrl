@@ -30,6 +30,23 @@ MODEL_COLORS = {
     'PTN': "#a02c89"          
 }
 
+BEST_IN_CLASS_NMAX = {
+    'GAT': 8,
+    'T': 8,
+    'PTN': 5,
+    'MLP': 15
+}
+
+def filter_best_in_class(df, n_train):
+    """Filters the dataframe so each model is plotted at its optimal n_max."""
+    optimal_dfs = []
+    for model, opt_nmax in BEST_IN_CLASS_NMAX.items():
+        subset = df[(df['Model'] == model) & (df['N_train'] == n_train) & (df['n_max'] == opt_nmax)]
+        optimal_dfs.append(subset)
+    if not optimal_dfs:
+        return pd.DataFrame()
+    return pd.concat(optimal_dfs, ignore_index=True)
+
 # High-Contrast Colormap for Error (Lower is better: Green -> Red -> Black)
 c_nodes = [0.0, 0.3, 0.5, 0.8, 1.0]
 c_colors = ["#1e7a1e", "#2ca02c", "#ffc107", "#d62728", "#1a1a1a"]
@@ -111,7 +128,7 @@ def export_top_configs(df, output_dir="plots_flocking"):
 # Graph 1: Scaling / Survival Curves
 # ---------------------------------------------------------
 def plot_scaling_curves(df, n_train, n_max, output_dir="plots_flocking"):
-    df_base = df[(df['N_train'] == n_train) & (df['n_max'] == n_max)].copy()
+    df_base = filter_best_in_class(df, n_train).copy()
     
     if df_base.empty:
         print(f"[Warning] No data for baseline config (N_train={n_train}, n_max={n_max}). Skipping Graph 1.")
@@ -126,7 +143,7 @@ def plot_scaling_curves(df, n_train, n_max, output_dir="plots_flocking"):
     )
     
     ax.axhline(0.40, ls='--', color='gray', alpha=0.7, label='Optimal Tracking Threshold (0.4)')
-    ax.set_title(f'Zero-Shot Scaling: Target Tracking (Trained N={n_train}, n_max={n_max})')
+    ax.set_title(f'Zero-Shot Scaling: Target Tracking (Trained N={n_train}, Best-in-Class n_max)')
     ax.set_xlabel('Test Population Density (N_test)')
     ax.set_ylabel('Mean Target Tracking Error (Lower is Better)')
     ax.set_ylim(bottom=0.0)
@@ -209,8 +226,9 @@ def plot_hyperparameter_trends(df, output_dir="plots_flocking"):
 # ---------------------------------------------------------
 # Graph 3: Critical Density Benchmark
 # ---------------------------------------------------------
-def plot_critical_density_bars(df, n_crit=50, output_dir="plots_flocking"):
-    df_crit = df[df['N_test'] == n_crit].copy()
+def plot_critical_density_bars(df, n_train = 20, n_crit=50, output_dir="plots_flocking"):
+    df_crit = filter_best_in_class(df, n_train)
+    df_crit = df_crit[df_crit['N_test'] == n_crit].copy()
     if df_crit.empty:
         n_crit = df['N_test'].unique()[len(df['N_test'].unique())//2]
         df_crit = df[df['N_test'] == n_crit].copy()
@@ -257,7 +275,7 @@ def plot_critical_density_bars(df, n_crit=50, output_dir="plots_flocking"):
 # Graph 4: Behavioral Breakdowns
 # ---------------------------------------------------------
 def plot_behavioral_breakdowns(df, n_train, n_max, output_dir="plots_flocking"):
-    df_base = df[(df['N_train'] == n_train) & (df['n_max'] == n_max)].copy()
+    df_base = filter_best_in_class(df, n_train).copy()
     if df_base.empty: return
 
     metrics = [
@@ -288,7 +306,7 @@ def plot_behavioral_breakdowns(df, n_train, n_max, output_dir="plots_flocking"):
     axes[2].set_xlabel('Test Population Density (N_test)')
     axes[3].set_xlabel('Test Population Density (N_test)')
     
-    plt.suptitle(f'Flocking Breakdown Mechanics (Trained N={n_train}, n_max={n_max})', fontsize=16, y=1.02)
+    plt.suptitle(f'Flocking Breakdown Mechanics (Trained N={n_train}, Best-in-Class n_max)', fontsize=16, y=1.02)
     plt.tight_layout()
     
     os.makedirs(output_dir, exist_ok=True)
@@ -301,7 +319,7 @@ def plot_behavioral_breakdowns(df, n_train, n_max, output_dir="plots_flocking"):
 def plot_behavioral_pareto_frontier(df, n_train, n_max, output_dir="plots_flocking"):
     fig, ax = plt.subplots(figsize=(8, 6))
     
-    df_base = df[(df['N_train'] == n_train) & (df['n_max'] == n_max)].copy()
+    df_base = filter_best_in_class(df, n_train).copy()
     
     if df_base.empty:
         print(f"[Warning] No data for Pareto config (N_train={n_train}, n_max={n_max}).")
@@ -332,7 +350,7 @@ def plot_behavioral_pareto_frontier(df, n_train, n_max, output_dir="plots_flocki
             alpha=0.4
         )
         
-    ax.set_title(f'Efficiency Trade-off (Trained N={n_train}, n_max={n_max})')
+    ax.set_title(f'Efficiency Trade-off (Trained N={n_train}, Best-in-Class n_max)')
     ax.set_xlabel('Mean Target Tracking Error (Lower is Better)')
     ax.set_ylabel('Mean Collision Rate (Lower is Better)')
     ax.grid(True, linestyle='--', alpha=0.5)
@@ -384,7 +402,7 @@ if __name__ == "__main__":
     parser.add_argument("--output-dir", type=str, default="plots_flocking", help="Directory for PDFs")
     parser.add_argument("--n-crit", type=int, default=80, help="Critical density N for Graph 3")
     parser.add_argument("--baseline-ntrain", type=int, default=20, help="N_train value for line graphs")
-    parser.add_argument("--baseline-nmax", type=int, default=5, help="n_max value for line graphs")
+    parser.add_argument("--baseline-nmax", type=int, default=8, help="n_max value for line graphs")
     
     args = parser.parse_args()
     
@@ -403,7 +421,7 @@ if __name__ == "__main__":
     plot_hyperparameter_trends(metrics_df, args.output_dir)
     
     print(f"Generating Graph 3: Critical Density Comparisons (N={args.n_crit})...")
-    plot_critical_density_bars(metrics_df, args.n_crit, args.output_dir)
+    plot_critical_density_bars(metrics_df, args.baseline_ntrain, args.n_crit, args.output_dir)
     
     print("Generating Graph 4: Behavioral Breakdown Curves...")
     plot_behavioral_breakdowns(metrics_df, args.baseline_ntrain, args.baseline_nmax, args.output_dir)

@@ -14,9 +14,12 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch_geometric.nn import GATConv, global_mean_pool, global_max_pool, MessagePassing
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
-from vmas.scenarios.flocking import Scenario as BaseFlocking
+from vmas.scenarios.navigation import Scenario as BaseNavigation
+from torch_geometric.nn import radius_graph
+from torch_geometric.nn import GCNConv
 
 def parse_args():
     # fmt: off
@@ -31,7 +34,7 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="vmas-flocking-transformer",
+    parser.add_argument("--wandb-project-name", type=str, default="vmas-navigation-radius",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
@@ -39,9 +42,9 @@ def parse_args():
         help="whether to capture videos of the agent performances (check out `videos` folder)")
 
     # Algorithm specific arguments
-    parser.add_argument("--env-id", type=str, default="flocking",
+    parser.add_argument("--env-id", type=str, default="navigation",
         help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=200000000,
+    parser.add_argument("--total-timesteps", type=int, default=300000000,
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=7e-4,
         help="the learning rate of the optimizer")
@@ -79,68 +82,27 @@ def parse_args():
         help="number of agents and landmarks")
     parser.add_argument("--max-cycles", type=int, default=250,
         help="length of environment run")
-    parser.add_argument("--n-max", type=int, default=5, help="Fixed context window size")
+    parser.add_argument("--n-max", type=int, default=5, help="Fixed context window size for the GNN")
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
     # fmt: on
     return args
 
-class FlockingCleanObs(BaseFlocking):
+class NavigationCleanObs(BaseNavigation):
     def observation(self, agent):
-        # 1. Base kinematics
+        # 1. Base kinematics (Ego Agent)
         obs = [agent.state.pos, agent.state.vel]
         
-        # 2. Target Tracking (Direction fixed: Pointing FROM agent TO target)
-        obs.append(self._target.state.pos - agent.state.pos)
-        obs.append(self._target.state.vel - agent.state.vel)
+        # 2. Assigned Goal ONLY (Removes the distractors)
+        obs.append(agent.state.pos - agent.goal.state.pos)
             
-        # 3. Strict Index-Preserved Teammates
-        # We iterate over ALL agents so the array structure never shifts.
-        # When a == agent, the relative pos/vel becomes [0, 0], which the network ignores.
-        for a in self.world.agents:
-            obs.append(a.state.pos - agent.state.pos)
-            obs.append(a.state.vel - agent.state.vel)
-                
-        # 4. Relative Obstacles
-        for landmark in self.world.landmarks:
-            if landmark != self._target:
-                obs.append(landmark.state.pos - agent.state.pos)
-                
-        return torch.cat(obs, dim=-1)
-    
-    def reward(self, agent):
-        # 1. Fetch base VMAS reward (Handles Individual Target Distance + Hard Collision Penalties)
-        base_reward = super().reward(agent)
-        
-        # --- EXPLICIT DENSE REYNOLDS REWARD SHAPING ---
-        
-        # 2. Target Cruising Alignment (Match target's speed and direction)
-        target_match_penalty = -torch.linalg.norm(self._target.state.vel - agent.state.vel, dim=-1)
-        
-        # 3. Flock Uniform Heading Alignment (Match teammate average speed/direction)
-        all_vels = torch.stack([a.state.vel for a in self.world.agents], dim=1) 
-        mean_vel = all_vels.mean(dim=1) 
-        flock_match_penalty = -torch.linalg.norm(mean_vel - agent.state.vel, dim=-1)
-        
-        # 4. Reynolds Separation / Uniform Spacing
-        # Penalize agents that intrude into a "personal bubble" to encourage a wide, uniform lattice
-        separation_penalty = 0.0
-        desired_spacing = 0.4
+        # 3. Relative Teammates (Position ONLY, respecting original info bounds)
         for a in self.world.agents:
             if a != agent:
-                dist = torch.linalg.norm(a.state.pos - agent.state.pos, dim=-1)
-                intrusion = torch.clamp(desired_spacing - dist, min=0.0)
-                separation_penalty -= (intrusion ** 2) * 5.0 # Scale up the squared penalty
-
-        # 5. Reynolds Cohesion (Steer towards the flock's center of mass)
-        all_pos = torch.stack([a.state.pos for a in self.world.agents], dim=1)
-        com = all_pos.mean(dim=1)
-        cohesion_penalty = -torch.linalg.norm(com - agent.state.pos, dim=-1)
-
-        # Combine base rewards with explicitly weighted Reynolds physics rules
-        shaped_reward = base_reward + (target_match_penalty * 0.05) + (flock_match_penalty * 0.05) + (separation_penalty * 0.1) + (cohesion_penalty * 0.05)
-        return shaped_reward
+                obs.append(a.state.pos - agent.state.pos)
+                
+        return torch.cat(obs, dim=-1)
 
 def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     torch.nn.init.orthogonal_(layer.weight, std)
@@ -148,7 +110,7 @@ def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
     return layer
 
 class GraphObservationNormalizer(nn.Module):
-    def __init__(self, n_max, feature_dim=10, continuous_dim=4, epsilon=1e-5):
+    def __init__(self, n_max, feature_dim=9, continuous_dim=4, epsilon=1e-5):
         super().__init__()
         self.n_max = n_max
         self.feature_dim = feature_dim
@@ -162,18 +124,18 @@ class GraphObservationNormalizer(nn.Module):
         B = x_flat.shape[0]
         x_reshaped = x_flat.view(B, self.n_max, self.feature_dim)
         
-        active_mask = x_reshaped[:, :, 8] > 0.5 
+        active_mask = x_reshaped[:, :, 6] > 0.5 
         
         # 1. SPATIAL ISOTROPIC VARIANCE (Pool X and Y together)
         valid_pos = x_reshaped[active_mask][:, :2]
         clamped_pos = torch.clamp(valid_pos, min=-5.0, max=5.0)
-        pos_var_scalar = torch.clamp((clamped_pos ** 2).mean(), min=0.1)
+        pos_var_scalar = (clamped_pos ** 2).mean() 
         
-        # 2. VELOCITY ISOTROPIC VARIANCE (Use all agent nodes: index 5 == 1.0)
-        agent_mask = (x_reshaped[:, :, 5] > 0.5) & active_mask
-        valid_vel = x_reshaped[agent_mask][:, 2:4]
+        # 2. VELOCITY ISOTROPIC VARIANCE (Strictly isolate the Ego node: index 4 == 1.0)
+        ego_mask = (x_reshaped[:, :, 4] > 0.5) & active_mask
+        valid_vel = x_reshaped[ego_mask][:, 2:4]
         clamped_vel = torch.clamp(valid_vel, min=-5.0, max=5.0)
-        vel_var_scalar = torch.clamp((clamped_vel ** 2).mean(), min=0.1)
+        vel_var_scalar = (clamped_vel ** 2).mean()
 
         # Reconstruct an isotropic variance buffer: [σ_p^2, σ_p^2, σ_v^2, σ_v^2]
         batch_var = torch.stack([pos_var_scalar, pos_var_scalar, vel_var_scalar, vel_var_scalar])
@@ -187,7 +149,7 @@ class GraphObservationNormalizer(nn.Module):
         B = x_flat.shape[0]
         x_reshaped = x_flat.view(B, self.n_max, self.feature_dim).clone()
         
-        active_mask = x_reshaped[:, :, 8] > 0.5
+        active_mask = x_reshaped[:, :, 6] > 0.5
         valid_x = x_reshaped[active_mask] 
         valid_continuous = valid_x[:, :self.continuous_dim]
         
@@ -198,6 +160,157 @@ class GraphObservationNormalizer(nn.Module):
         x_reshaped[active_mask] = valid_x
         
         return x_reshaped.view(B, -1)
+
+class MultiHeadGATBackbone(nn.Module):
+    def __init__(self, n_max, feature_dim=8, hidden_dim=64, out_dim=128, heads=4):
+        super().__init__()
+        self.n_max = n_max
+        self.feature_dim = feature_dim
+        
+        self.gat1 = GATConv(feature_dim, hidden_dim, heads=heads, concat=True, edge_dim=3, add_self_loops=True)
+        self.gat2 = GATConv(hidden_dim * heads, hidden_dim, heads=heads, concat=True, edge_dim=3, add_self_loops=True)
+        self.gat3 = GATConv(hidden_dim * heads, out_dim, heads=heads, concat=False, edge_dim=3, add_self_loops=True)
+        
+        self.skip_proj = nn.Linear(feature_dim, hidden_dim * heads)
+        self.elu = nn.ELU()
+
+    def _build_fc_dynamic_graph(self, x_flat, radius=1.5):
+        B = x_flat.shape[0]
+        device = x_flat.device
+        
+        # Corrected: Use self.n_max directly (it is already args.n_max * 2)
+        x_padded = x_flat.view(B, self.n_max, self.feature_dim)
+        
+        # This single mask effortlessly dumps all padded zeros AND out-of-radius agents
+        active_mask = x_padded[:, :, 6] > 0.5  
+        valid_x = x_padded[active_mask] 
+        
+        # Corrected: Replaced undefined self.max_capacity * 2 with self.n_max
+        batch_indices = torch.arange(B, device=device).view(-1, 1).expand(B, self.n_max)
+        valid_batch = batch_indices[active_mask] 
+        
+        # radius_graph now dynamically computes edges for exactly the number of agents present
+        edge_index = radius_graph(
+            x=valid_x[:, :2], 
+            r=radius, 
+            batch=valid_batch, 
+            loop=False
+        )
+        
+        row, col = edge_index
+        rel_pos = valid_x[row, :2] - valid_x[col, :2]
+        distances = torch.sqrt((rel_pos ** 2).sum(dim=-1, keepdim=True) + 1e-8)
+        
+        edge_attr = torch.cat([rel_pos, distances], dim=-1)
+        
+        return valid_x, edge_index, edge_attr, valid_batch
+
+    def forward(self, x_flat):
+        valid_x, edge_index, edge_attr, valid_batch = self._build_fc_dynamic_graph(x_flat)
+        
+        res = self.skip_proj(valid_x)
+        
+        h = self.gat1(valid_x, edge_index, edge_attr=edge_attr)
+        h = self.elu(h) + res 
+        
+        h2 = self.gat2(h, edge_index, edge_attr=edge_attr)
+        h2 = self.elu(h2) + h 
+        
+        node_embeddings = self.gat3(h2, edge_index, edge_attr=edge_attr) 
+        
+        return valid_x, node_embeddings, valid_batch
+
+class SeparatedVectorGCNConv(MessagePassing):
+    """
+    A GraphSAGE-style isotropic convolution that separates the root node from 
+    the neighbor average. This preserves 100% of the ego agent's kinematics 
+    (velocity/position) while averaging environmental context without attention.
+    """
+    def __init__(self, in_channels, out_channels, edge_dim=3):
+        super().__init__(aggr='mean') 
+        # Separate linear projections for the Ego node vs Neighbor nodes
+        self.root_proj = nn.Linear(in_channels, out_channels, bias=False)
+        self.node_proj = nn.Linear(in_channels, out_channels, bias=False)
+        self.edge_proj = nn.Linear(edge_dim, out_channels, bias=False)
+        self.bias = nn.Parameter(torch.zeros(out_channels))
+
+    def forward(self, x, edge_index, edge_attr):
+        # 1. Project the ego node independently at 100% strength
+        root_out = self.root_proj(x)
+        
+        # 2. Project neighbors and propagate messages
+        x_proj = self.node_proj(x)
+        aggr_out = self.propagate(edge_index, x=x_proj, edge_attr=edge_attr)
+        
+        # 3. Combine Ego Kinematics + Neighbor Context
+        return root_out + aggr_out + self.bias
+
+    def message(self, x_j, edge_attr):
+        return x_j + self.edge_proj(edge_attr)
+
+
+class FairVectorGCNBackbone(nn.Module):
+    def __init__(self, n_max, feature_dim=8, hidden_dim=64, out_dim=128, heads=4):
+        super().__init__()
+        self.n_max = n_max
+        self.feature_dim = feature_dim
+        
+        wide_dim = hidden_dim * heads  # 256
+        
+        # Swap to the Separated Vector GCN
+        self.gcn1 = SeparatedVectorGCNConv(feature_dim, wide_dim, edge_dim=3)
+        self.gcn2 = SeparatedVectorGCNConv(wide_dim, wide_dim, edge_dim=3)
+        self.gcn3 = SeparatedVectorGCNConv(wide_dim, out_dim, edge_dim=3)
+        
+        self.skip_proj = nn.Linear(feature_dim, wide_dim)
+        self.elu = nn.ELU()
+
+    def _build_fc_dynamic_graph(self, x_flat, radius=0.5):
+        B = x_flat.shape[0]
+        device = x_flat.device
+        
+        # Corrected variable name: using self.n_max
+        x_padded = x_flat.view(B, self.n_max, self.feature_dim)
+        
+        active_mask = x_padded[:, :, 6] > 0.5  
+        valid_x = x_padded[active_mask] 
+        
+        batch_indices = torch.arange(B, device=device).view(-1, 1).expand(B, self.n_max)
+        valid_batch = batch_indices[active_mask] 
+        
+        # loop=False cleanly strips self-loops for SeparatedVectorGCNConv
+        edge_index = radius_graph(
+            x=valid_x[:, :2], 
+            r=radius, 
+            batch=valid_batch, 
+            loop=False 
+        )
+        
+        row, col = edge_index
+        rel_pos = valid_x[row, :2] - valid_x[col, :2]
+        distances = torch.sqrt((rel_pos ** 2).sum(dim=-1, keepdim=True) + 1e-8)
+        
+        edge_attr = torch.cat([rel_pos, distances], dim=-1)
+        
+        return valid_x, edge_index, edge_attr, valid_batch
+
+    def forward(self, x_flat):
+        valid_x, edge_index, edge_attr, valid_batch = self._build_fc_dynamic_graph(x_flat)
+        
+        res = self.skip_proj(valid_x)
+        
+        # Layer 1: Identical skip + ELU routing
+        h = self.gcn1(valid_x, edge_index, edge_attr=edge_attr)
+        h = self.elu(h) + res 
+        
+        # Layer 2: Identical residual routing
+        h2 = self.gcn2(h, edge_index, edge_attr=edge_attr)
+        h2 = self.elu(h2) + h 
+        
+        # Layer 3: No final residual, matching GAT exactly
+        node_embeddings = self.gcn3(h2, edge_index, edge_attr=edge_attr) 
+        
+        return valid_x, node_embeddings, valid_batch
 
 class PopArt(nn.Module):
     def __init__(self, input_dim, output_dim, beta=0.99):
@@ -237,337 +350,120 @@ class PopArt(nn.Module):
     def normalize(self, x):
         return (x - self.mean) / torch.sqrt(self.std**2 + 1e-8)
 
-class TransformerAgent(nn.Module):
-    def __init__(self, single_action_space, single_obs_shape, num_agents, state_dim, n_max=10, d_model=256, nhead=4, num_layers=3):
+class GraphAgent(nn.Module):
+    def __init__(self, envs, n_max, num_agents): 
         super().__init__()
         self.num_agents = num_agents
-        self.obs_dim = np.array(single_obs_shape).prod() 
-        self.action_dim = np.prod(single_action_space.shape)
-        self.n_max_nodes = n_max 
+        self.n_max = n_max
+        self.action_dim = np.prod(envs.single_action_space.shape)
         
-        # FIX 1: Flocking graph uses 10 features, not 9
-        self.feature_dim = 10 
-        self.nhead = nhead 
+        # GAT
+        self.backbone = MultiHeadGATBackbone(n_max=n_max, feature_dim=9)
+
+        # GCN 
+        # self.backbone = FairVectorGCNBackbone(n_max=n_max, feature_dim=9)
+        gat_out_dim = 128
         
-        self.obs_normalizer = GraphObservationNormalizer(n_max=n_max, feature_dim=self.feature_dim, continuous_dim=4)
-        
-        self.geom_scale = nn.Parameter(torch.ones(1, nhead, 1, 1))
-        
-        self.token_proj = nn.Sequential(
-            layer_init(nn.Linear(self.feature_dim, d_model)),
-            nn.LayerNorm(d_model),
-            nn.ReLU(),
-            layer_init(nn.Linear(d_model, d_model)),
-            nn.LayerNorm(d_model) 
-        )
-        
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model=d_model, 
-            nhead=nhead, 
-            dim_feedforward=d_model * 4, 
-            batch_first=True, 
-            activation='gelu', 
-            norm_first=True,
-            dropout=0.0
-        )
-        self.transformer = nn.TransformerEncoder(
-            encoder_layer, 
-            num_layers=num_layers, 
-            norm=nn.LayerNorm(d_model), 
-            enable_nested_tensor=False
-        )
-        
-        self.actor = nn.Sequential(
-            nn.LayerNorm(d_model * 3), 
-            layer_init(nn.Linear(d_model * 3, 128)),
+        self.actor_mlp = nn.Sequential(
+            layer_init(nn.Linear(gat_out_dim, 128)),
             nn.LayerNorm(128), nn.ReLU(),
             layer_init(nn.Linear(128, 64)),
             nn.LayerNorm(64), nn.ReLU(),
-            layer_init(nn.Linear(64, 64)),
-            nn.ReLU(),
+            layer_init(nn.Linear(64,64)),
+            nn.ELU(),
         )
+
+        # The Mean Head (Restored Tanh for instant braking)
         self.actor_mean = nn.Sequential(
             layer_init(nn.Linear(64, self.action_dim), std=0.01),
             nn.Tanh() 
         )
-        self.actor_logstd = nn.Parameter(torch.zeros(1, self.action_dim))
 
-        joint_critic_dim = self.num_agents * self.obs_dim
-        self.critic_encoder = nn.Sequential(
-            layer_init(nn.Linear(joint_critic_dim, 512)), 
-            nn.LayerNorm(512), nn.ReLU(),
-            layer_init(nn.Linear(512, 512)),
-            nn.LayerNorm(512), nn.ReLU(),
-            layer_init(nn.Linear(512, 256)),
+        # The Variance Head
+        self.actor_logstd = nn.Parameter(torch.full((1, self.action_dim), -0.5))
+        
+        # FIX: Critic only sees the invariant graph (128) + density scalar (1)
+        critic_in_dim = (gat_out_dim * 3) + 1
+        self.critic_mlp = nn.Sequential(
+            layer_init(nn.Linear(critic_in_dim, 256)),
             nn.LayerNorm(256), nn.ReLU(),
-            layer_init(nn.Linear(256, 256)),
-            nn.ReLU(),
+            layer_init(nn.Linear(256, 128)),
+            nn.LayerNorm(128), nn.ReLU(),
         )
-        self.critic_popart = PopArt(256, 1)
+        self.critic_popart = PopArt(128, 1)
+        self.obs_normalizer = GraphObservationNormalizer(n_max=n_max, feature_dim=9, continuous_dim=4)
 
-    def _forward_actor_backbone(self, x_norm):
-        B = x_norm.shape[0]
-        tokens = x_norm.view(B, self.n_max_nodes, self.feature_dim)
+    def get_value(self, x_flat, denormalize=False):
+        x_norm = self.obs_normalizer.normalize(x_flat)
+        valid_x, node_embeddings, valid_batch = self.backbone(x_norm)
         
-        # Index 8 is the active flag in the flocking formatter
-        key_padding_mask = (tokens[:, :, 8] < 0.5)
-        
-        # Euclidean Attention Biasing
-        pos = tokens[:, :, 0:2] 
-        pos_i = pos.unsqueeze(2) 
-        pos_j = pos.unsqueeze(1) 
-        dist_matrix = torch.norm(pos_i - pos_j, dim=-1, keepdim=True).permute(0, 3, 1, 2)
-        
-        scaled_dist = -torch.abs(self.geom_scale) * dist_matrix
-        geom_mask = scaled_dist.view(B * self.nhead, self.n_max_nodes, self.n_max_nodes)
-        
-        h = self.token_proj(tokens)
-        out = self.transformer(h, mask=geom_mask, src_key_padding_mask=key_padding_mask)
-        
-        # Restored Tri-Token Concatenation with Flocking Indices
-        ego_final = out[:, 0, :]
-        ego_initial = h[:, 0, :]
-        target_initial = h[:, 1, :] # Target is deterministically anchored at index 1
-        
-        combined_ego = torch.cat([ego_final, ego_initial, target_initial], dim=-1)
-        
-        return combined_ego
+        # 1. Global Context (Poolings)
+        batch_size = x_flat.shape[0]
+        pooled_mean = global_mean_pool(node_embeddings, valid_batch, size=batch_size)
+        pooled_max = global_max_pool(node_embeddings, valid_batch, size=batch_size)
 
-    def get_actor_parameters(self):
-        return (
-            [self.geom_scale] +
-            list(self.token_proj.parameters()) +
-            list(self.transformer.parameters()) +
-            list(self.actor.parameters()) +
-            list(self.actor_mean.parameters()) +
-            [self.actor_logstd]
-        )
+        # 2. Local Ego Context
+        agent_mask = valid_x[:, 4] > 0.5 # Assuming index 4 is 'is_self' or 'is_agent'
+        ego_embeddings = node_embeddings[agent_mask]
+        
+        # 3. Network Density
+        active_counts = torch.bincount(valid_batch, minlength=x_flat.shape[0])
+        density_scalar_expanded = (active_counts.float() / self.n_max).view(-1, 1)
 
-    def get_value(self, x, denormalize=False):
-        x_norm = self.obs_normalizer.normalize(x)
-        batch_size = x.shape[0]
-        num_games = batch_size // self.num_agents
+        # 4. Concatenate for Ego-Aware God-View
+        critic_input = torch.cat([
+            pooled_mean, 
+            pooled_max, 
+            ego_embeddings, 
+            density_scalar_expanded
+        ], dim=-1)
         
-        joint_state = x_norm.view(num_games, -1)
-        expanded_joint_state = joint_state.repeat_interleave(self.num_agents, dim=0)
-        
-        values = self.critic_popart(self.critic_encoder(expanded_joint_state)) 
+        values = self.critic_popart(self.critic_mlp(critic_input))
         if denormalize:
             values = self.critic_popart.denormalize(values)
+            
         return values.view(-1, 1)
 
-    def get_action_and_value(self, x, action=None, denormalize=False, compute_value=True):
-        x_norm = self.obs_normalizer.normalize(x)
+    def get_action_and_value(self, x_flat, action=None, denormalize=False):
+        x_norm = self.obs_normalizer.normalize(x_flat)
+        valid_x, node_embeddings, valid_batch = self.backbone(x_norm)
         
-        ego_features = self._forward_actor_backbone(x_norm)
-        actor_features = self.actor(ego_features)
+        agent_mask = valid_x[:, 4] > 0.5
+        agent_embeddings = node_embeddings[agent_mask] 
         
+        actor_features = self.actor_mlp(agent_embeddings)
+
         action_means = self.actor_mean(actor_features)
         action_logstds = self.actor_logstd.expand_as(action_means)
         
+        # Loosely bound the logstd to prevent NaN explosions
         safe_logstds = torch.clamp(action_logstds, min=-5.0, max=2.0)
         action_stds = safe_logstds.exp()
         
         probs = Normal(action_means, action_stds)
+        
         if action is None:
             action = probs.sample()
 
-        value = self.get_value(x, denormalize) if compute_value else None
-            
-        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), value
+        batch_size = x_flat.shape[0]
+        pooled_mean = global_mean_pool(node_embeddings, valid_batch, size=batch_size)
+        pooled_max = global_max_pool(node_embeddings, valid_batch, size=batch_size)
 
-class PointNetAgent(nn.Module):
-    def __init__(self, single_action_space, single_obs_shape, num_agents, state_dim, n_max=10):
-        super().__init__()
-        self.num_agents = num_agents
-        self.obs_dim = np.array(single_obs_shape).prod() # Exactly 2 * n_max * 9
-        self.action_dim = np.prod(single_action_space.shape)
-        self.n_max_nodes = n_max 
-        self.feature_dim = 10
+        active_counts = torch.bincount(valid_batch, minlength=x_flat.shape[0])
+        density_scalar_expanded = (active_counts.float() / self.n_max).view(-1, 1)
         
-        # 1. SHARED NORMALIZER
-        self.obs_normalizer = GraphObservationNormalizer(n_max=n_max, feature_dim=self.feature_dim, continuous_dim=4)
+        critic_input = torch.cat([
+            pooled_mean, 
+            pooled_max, 
+            agent_embeddings, 
+            density_scalar_expanded
+        ], dim=-1)
         
-        # 2. DEEPSETS NODE ENCODER (phi) - Applied to each token independently
-        self.phi = nn.Sequential(
-            layer_init(nn.Linear(self.feature_dim, 128)),
-            nn.LayerNorm(128), nn.ReLU(),
-            layer_init(nn.Linear(128, 128)),
-            nn.LayerNorm(128), nn.ReLU(),
-            layer_init(nn.Linear(128, 128)),
-            nn.LayerNorm(128), nn.ReLU()
-        )
-        
-        # 3. GLOBAL ACTOR PROCESSOR (rho) - Applied to the aggregated feature
-        self.rho = nn.Sequential(
-            layer_init(nn.Linear(128, 128)),
-            nn.LayerNorm(128), nn.ReLU(),
-            layer_init(nn.Linear(128, 64)),
-            nn.LayerNorm(64), nn.ReLU(),
-            layer_init(nn.Linear(64, 64)),
-            nn.ReLU()
-        )
-        
-        self.actor_mean = nn.Sequential(
-            layer_init(nn.Linear(64, self.action_dim), std=0.01),
-            nn.Tanh() 
-        )
-        self.actor_logstd = nn.Parameter(torch.zeros(1, self.action_dim))
-
-        # 4. CENTRALIZED CRITIC (Retains identical CTDE architecture)
-        joint_critic_dim = self.num_agents * self.obs_dim
-        self.critic_encoder = nn.Sequential(
-            layer_init(nn.Linear(joint_critic_dim, 512)), 
-            nn.LayerNorm(512), nn.ReLU(),
-            layer_init(nn.Linear(512, 512)),
-            nn.LayerNorm(512), nn.ReLU(),
-            layer_init(nn.Linear(512, 256)),
-            nn.LayerNorm(256), nn.ReLU(),
-            layer_init(nn.Linear(256, 256)),
-            nn.ReLU(),
-        )
-        self.critic_popart = PopArt(256, 1)
-
-    def _forward_actor_backbone(self, x_norm):
-        B = x_norm.shape[0]
-        # Reshape into [Batch, Nodes, Features]
-        tokens = x_norm.view(B, self.n_max_nodes, self.feature_dim)
-        
-        # Identify active nodes to mask out padding before max pooling
-        # Using the is_active flag at index 6 from your graph formatting
-        is_active = (tokens[:, :, 8] >= 0.5).unsqueeze(-1).float()
-        
-        # 1. Independent Node Processing (phi)
-        node_features = self.phi(tokens) # Shape: [B, n_max_nodes, 128]
-        
-        # 2. Masking
-        # Set inactive nodes to a highly negative value so they drop out during max-pooling
-        masked_features = node_features + (1.0 - is_active) * -1e9
-        
-        # 3. Permutation-Invariant Aggregation (Max Pooling)
-        global_feature, _ = torch.max(masked_features, dim=1) # Shape: [B, 128]
-        
-        return global_feature
-
-    def get_actor_parameters(self):
-        return (
-            list(self.phi.parameters()) +
-            list(self.rho.parameters()) +
-            list(self.actor_mean.parameters()) +
-            [self.actor_logstd]
-        )
-
-    def get_value(self, x, denormalize=False):
-        x_norm = self.obs_normalizer.normalize(x)
-        batch_size = x.shape[0]
-        num_games = batch_size // self.num_agents
-        
-        joint_state = x_norm.view(num_games, -1)
-        expanded_joint_state = joint_state.repeat_interleave(self.num_agents, dim=0)
-        
-        values = self.critic_popart(self.critic_encoder(expanded_joint_state)) 
+        values = self.critic_popart(self.critic_mlp(critic_input))
         if denormalize:
             values = self.critic_popart.denormalize(values)
-        return values.view(-1, 1)
-
-    def get_action_and_value(self, x, action=None, denormalize=False, compute_value=True):
-        x_norm = self.obs_normalizer.normalize(x)
-        
-        # Get permutation-invariant global feature
-        global_feature = self._forward_actor_backbone(x_norm)
-        
-        # Pass through the final processor (rho)
-        actor_features = self.rho(global_feature)
-        
-        action_means = self.actor_mean(actor_features)
-        action_logstds = self.actor_logstd.expand_as(action_means)
-        
-        # STRICT PARITY: Retaining max=2.0 exactly as requested!
-        safe_logstds = torch.clamp(action_logstds, min=-5.0, max=2.0)
-        action_stds = safe_logstds.exp()
-        
-        probs = Normal(action_means, action_stds)
-        if action is None:
-            action = probs.sample()
-
-        value = self.get_value(x, denormalize) if compute_value else None
             
-        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), value
-
-class Agent(nn.Module):
-    def __init__(self, single_action_space, single_obs_shape, num_agents, state_dim, n_max=10):
-        super().__init__()
-        self.num_agents = num_agents
-
-        self.obs_dim = np.array(single_obs_shape).prod()
-        self.action_dim = np.prod(single_action_space.shape)
-
-        # Shared Isotropic Normalizer
-        self.obs_normalizer = GraphObservationNormalizer(n_max=n_max, feature_dim=10, continuous_dim=4)
-
-        # 1. DECENTRALIZED ACTOR (No embeddings, no global state -> 100% invariant to N!)
-        self.actor = nn.Sequential(
-            layer_init(nn.Linear(self.obs_dim, 1024)),
-            nn.LayerNorm(1024), nn.ReLU(),
-            layer_init(nn.Linear(1024, 512)),
-            nn.LayerNorm(512), nn.ReLU(),
-            layer_init(nn.Linear(512, 256)),
-            nn.LayerNorm(256), nn.ReLU(),
-            layer_init(nn.Linear(256, 256)),
-            nn.ReLU(),
-        )
-        self.actor_mean = nn.Sequential(
-            layer_init(nn.Linear(256, self.action_dim), std=0.01),
-            nn.Tanh() 
-        )
-        self.actor_logstd = nn.Parameter(torch.zeros(1, self.action_dim))
-
-        # 2. CENTRALIZED CRITIC (Receives joint state of ALL agents to stabilize GAE training!)
-        # Notice we use state_dim (or num_agents * obs_dim), which gives it true CTDE clarity.
-        joint_critic_dim = self.num_agents * self.obs_dim
-        self.critic_encoder = nn.Sequential(
-            layer_init(nn.Linear(joint_critic_dim, 512)), 
-            nn.LayerNorm(512), nn.ReLU(),
-            layer_init(nn.Linear(512, 512)),
-            nn.LayerNorm(512), nn.ReLU(),
-            layer_init(nn.Linear(512, 256)),
-            nn.LayerNorm(256), nn.ReLU(),
-            layer_init(nn.Linear(256, 256)),
-            nn.ReLU(),
-        )
-        self.critic_popart = PopArt(256, 1)
-
-    def get_value(self, x, denormalize=False):
-        x_norm = self.obs_normalizer.normalize(x)
-        batch_size = x.shape[0]
-        num_games = batch_size // self.num_agents
-        
-        # Concatenate local K-NN observations across all agents in the game into a joint state vector
-        joint_state = x_norm.view(num_games, -1)
-        expanded_joint_state = joint_state.repeat_interleave(self.num_agents, dim=0)
-        
-        values = self.critic_popart(self.critic_encoder(expanded_joint_state)) 
-        if denormalize:
-            values = self.critic_popart.denormalize(values)
-        return values.view(-1, 1)
-
-    def get_action_and_value(self, x, action=None, denormalize=False, compute_value=True):
-        x_norm = self.obs_normalizer.normalize(x)
-        
-        # Actor strictly observes local K-NN graph
-        actor_features = self.actor(x_norm)
-        action_means = self.actor_mean(actor_features)
-        action_logstds = self.actor_logstd.expand_as(action_means)
-        safe_logstds = torch.clamp(action_logstds, min=-5.0, max=2.0)
-        action_stds = safe_logstds.exp()
-        
-        probs = Normal(action_means, action_stds)
-        if action is None:
-            action = probs.sample()
-
-        value = self.get_value(x, denormalize) if compute_value else None
-            
-        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), value
+        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), values.view(-1, 1)
 
 class VMASVectorizedEnv:
     def __init__(self, args, seed, run_name, update_step=0):
@@ -580,21 +476,25 @@ class VMASVectorizedEnv:
         self.update_step = update_step
         
         self.env = vmas.make_env(
-            scenario= FlockingCleanObs() if args.env_id == "flocking" else args.env_id,
+            scenario=NavigationCleanObs() if args.env_id == "navigation" else args.env_id,
             num_envs=self.num_games,
             device=self.device,
             continuous_actions=True,
             n_agents=self.num_agents,
+            collisions=True,
+            observe_all_goals=False,
             seed=seed,
             dict_spaces=False,
-            n_obstacles = 0
+            world_spawning_x=2.5,
+            world_spawning_y=2.5,
+            enforce_bounds=True
         )
         
         self.single_action_space = self.env.action_space[0]
         self.n_max = args.n_max
-        self.feature_dim = 10
+        self.feature_dim = 9
         
-        target_dim = self.n_max * self.feature_dim
+        target_dim = self.n_max * self.feature_dim * 2
         self.single_observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(target_dim,))
         
         self.episode_returns = torch.zeros(self.num_envs, device=self.device)
@@ -603,106 +503,64 @@ class VMASVectorizedEnv:
         self.record_this_episode = self.args.capture_video
         self.video_frames = []
 
-        self.ep_polarization = torch.zeros(self.num_games, device=self.device)
-        self.ep_cohesion = torch.zeros(self.num_games, device=self.device)
-        self.ep_tracking = torch.zeros(self.num_games, device=self.device)
-        self.ep_collisions = torch.zeros(self.num_games, device=self.device)
-
     def _apply_graph_formatting(self, stacked_vmas_obs):
-        # 1. Dynamically read batch size so evaluation (B=1) doesn't crash
-        B = stacked_vmas_obs.shape[0]
-        N = stacked_vmas_obs.shape[1]
-        K = self.n_max 
+        B = self.num_games
+        N = self.num_agents
         
-        # 1. Infer Obstacle Count from Observation Dimension
-        # Flocking shape: pos(2) + vel(2) + target_rel_pos(2) + target_rel_vel(2) + N*(rel_pos(2)+rel_vel(2)) + O*rel_obs(2)
-        obs_dim = stacked_vmas_obs.shape[-1]
-        O = (obs_dim - 8 - 4 * N) // 2 
+        # This is your absolute maximum evaluation size (e.g., 105)
+        MAX_CAPACITY = self.args.n_max 
+        radius = 1.5
         
-        # 2. Extract Raw Components
+        # 1. Extract raw absolute positions and velocities
         abs_pos = stacked_vmas_obs[:, :, 0:2] # (B, N, 2)
         vel = stacked_vmas_obs[:, :, 2:4]     # (B, N, 2)
-        target_rel_pos = stacked_vmas_obs[:, :, 4:6] 
-        target_rel_vel = stacked_vmas_obs[:, :, 6:8] 
+        ego_to_goal = stacked_vmas_obs[:, :, 4:6] # (B, N, 2)
         
-        # 3. Reconstruct Absolute Positions
-        # Use agent 0 to anchor the absolute positions of shared landmarks
-        target_abs_pos = (abs_pos[:, 0:1, :] + target_rel_pos[:, 0:1, :]) 
-        # Accurately recover Target Absolute Velocity
-        target_abs_vel = (vel[:, 0:1, :] + target_rel_vel[:, 0:1, :]) 
+        # 2. Reconstruct absolute positions of ALL goals
+        goal_abs = abs_pos - ego_to_goal 
         
-        obstacles_rel = stacked_vmas_obs[:, 0:1, 8+4*N:].view(B, O, 2)
-        obstacles_abs = abs_pos[:, 0:1, :] + obstacles_rel # (B, O, 2)
-        
-        all_pos = torch.cat([abs_pos, target_abs_pos, obstacles_abs], dim=1) # (B, N + 1 + O, 2)
-        obstacles_vel = torch.zeros((B, O, 2), device=self.device)
-        all_vel = torch.cat([vel, target_abs_vel, obstacles_vel], dim=1) 
-        
-        # 4. Calculate Relative Metrics
+        # 3. Calculate Relative Positions independently
         ego_pos = abs_pos.unsqueeze(2) # (B, N, 1, 2)
-        rel_pos = all_pos.unsqueeze(1) - ego_pos # (B, N, N + 1 + O, 2)
-        distances = torch.norm(rel_pos, dim=-1) # (B, N, N + 1 + O)
+        rel_agents = abs_pos.unsqueeze(1) - ego_pos # (B, N, N, 2)
+        rel_goals = goal_abs.unsqueeze(1) - ego_pos # (B, N, N, 2)
         
-        # 5. K-Nearest Neighbors
-        # Force Ego to be selected by masking its distance to -1e9
-        batch_idx = torch.arange(B, device=self.device).view(B, 1).expand(B, N)
-        ego_idx = torch.arange(N, device=self.device).view(1, N).expand(B, N)
-        distances[batch_idx, ego_idx, ego_idx] = -1e9
+        # 4. Calculate Distances
+        dist_agents = torch.norm(rel_agents, dim=-1) # (B, N, N)
+        dist_goals = torch.norm(rel_goals, dim=-1) # (B, N, N)
         
-        # --- NEW: Force Target (index N) to ALWAYS be included in top-K ---
-        target_idx = torch.full((B, N), N, device=self.device, dtype=torch.long)
-        distances[batch_idx, ego_idx, target_idx] = -1e8
+        # 5. Build the Dense Feature Matrices for ALL N entities
+        is_self_matrix = torch.eye(N, device=self.device).view(1, N, N)
         
-        # --- NEW: Force the Nearest Obstacle to ALWAYS be included ---
-        if O > 0:
-            obs_distances = distances[:, :, N+1:N+1+O]
-            _, nearest_obs_local_idx = torch.min(obs_distances, dim=-1)
-            nearest_obs_global_idx = nearest_obs_local_idx + (N + 1)
-            # Mask the nearest obstacle distance to -1e7
-            distances[batch_idx, ego_idx, nearest_obs_global_idx] = -1e7
-        # ------------------------------------------------------------------
+        # --- Agents Matrix ---
+        graph_agents = torch.zeros((B, N, N, self.feature_dim), device=self.device)
+        graph_agents[..., 0:2] = rel_agents
+        graph_agents[..., 2:4] = vel.unsqueeze(1).expand(B, N, N, 2) * is_self_matrix.unsqueeze(-1)
+        graph_agents[..., 4] = is_self_matrix 
+        graph_agents[..., 6] = (dist_agents <= radius).float() # RADIUS MASK (No top-K)
+        graph_agents[..., 7] = self.episode_tags.unsqueeze(1).expand(B, N, N)
         
-        total_entities = N + 1 + O
-        actual_k = min(K, total_entities)
-        _, topk_idx = torch.topk(distances, k=actual_k, dim=-1, largest=False)
+        # --- Goals Matrix ---
+        graph_goals = torch.zeros((B, N, N, self.feature_dim), device=self.device)
+        graph_goals[..., 0:2] = rel_goals
+        graph_goals[..., 5] = 1.0 
+        graph_goals[..., 6] = (dist_goals <= radius).float() # RADIUS MASK (No top-K)
+        graph_goals[..., 7] = self.episode_tags.unsqueeze(1).expand(B, N, N)
+        graph_goals[..., 8] = is_self_matrix 
         
-        # 6. Build the Dense Feature Matrix (Feature Dim = 10)
-        graph = torch.zeros((B, N, total_entities, self.feature_dim), device=self.device)
+        # Combine Agents and Goals
+        graph = torch.cat([graph_agents, graph_goals], dim=2) # Shape: (B, N, 2N, 9)
         
-        graph[..., 0:2] = rel_pos
-
-        # --- Inject RELATIVE Velocity for All Entities ---
-        ego_vel = vel.unsqueeze(2) # (B, N, 1, 2)
-        rel_vel = all_vel.unsqueeze(1) - ego_vel # (B, N, total_entities, 2)
-        graph[..., 2:4] = rel_vel
+        # 6. Pad to the absolute MAX_CAPACITY to keep RL tensor sizes strict
+        current_entities = 2 * N
+        target_entities = 2 * MAX_CAPACITY
         
-        # Identifiers
-        is_self_matrix = torch.eye(N, device=self.device)
-        graph[:, :, :N, 4] = is_self_matrix.unsqueeze(0) # is_self
-        graph[:, :, :N, 5] = 1.0 # is_agent
-        graph[:, :, N:N+1, 6] = 1.0 # is_target
-        if O > 0:
-            graph[:, :, N+1:, 7] = 1.0 # is_obstacle
+        if current_entities < target_entities:
+            padding = torch.zeros((B, N, target_entities - current_entities, self.feature_dim), device=self.device)
+            # Ensure padded nodes are distinctly marked as inactive
+            padding[..., 6] = 0.0 
+            graph = torch.cat([graph, padding], dim=2)
             
-        graph[..., 8] = 1.0 # is_active
-        agent_tags = self.episode_tags.unsqueeze(1).expand(B, N, N)
-        graph[:, :, :N, 9] = agent_tags
-        
-        # Give landmarks/targets a static tag (e.g., -1.0) so the GNN distinguishes them from agents
-        if total_entities > N:
-            graph[:, :, N:, 9] = -1.0
-        
-        # 7. Gather Top K Features
-        exp_idx = topk_idx.unsqueeze(-1).expand(-1, -1, -1, self.feature_dim)
-        gathered_graph = torch.gather(graph, dim=2, index=exp_idx)
-        
-        # 8. Zero-Padding if K > actual_entities
-        if actual_k < K:
-            padding = torch.zeros((B, N, K - actual_k, self.feature_dim), device=self.device)
-            gathered_graph = torch.cat([gathered_graph, padding], dim=2)
-            
-        # 9. Dynamically reshape based on current batch size B * N
-        return gathered_graph.reshape(B * N, -1)
+        return graph.reshape(self.num_envs, -1)
 
     def reset(self, seed=None):
         if seed is not None:
@@ -711,12 +569,8 @@ class VMASVectorizedEnv:
         vmas_obs = self.env.reset()
         self.episode_returns.zero_()
         self.step_count = 0
-
-        self.ep_polarization.zero_()
-        self.ep_cohesion.zero_()
-        self.ep_tracking.zero_()
-        self.ep_collisions.zero_()
-
+        
+        # Generate new random tags for tracking identity across the episode
         self.episode_tags = torch.rand((self.num_games, self.num_agents), device=self.device)
         
         stacked_obs = torch.stack(vmas_obs, dim=1)
@@ -726,27 +580,15 @@ class VMASVectorizedEnv:
 
     def step(self, actions):
         actions_reshaped = actions.view(self.num_games, self.num_agents, -1)
-        
-        # Pass continuous force vectors directly to VMAS
         vmas_actions = [actions_reshaped[:, i, :] for i in range(self.num_agents)]
         
         vmas_obs, vmas_rews, _, vmas_info = self.env.step(vmas_actions)
         self.step_count += 1
         
-        rewards = torch.stack(vmas_rews, dim=1).reshape(-1).detach()
-
+        rewards = torch.stack(vmas_rews, dim=1).reshape(-1)
         self.episode_returns += rewards
 
-        stacked_obs = torch.stack(vmas_obs, dim=1).detach()
-
-        # --- CONTINUOUSLY ACCUMULATE METRICS ---
-        with torch.no_grad():
-            step_metrics = compute_flocking_metrics(stacked_obs)
-            self.ep_polarization += step_metrics["polarization"]
-            self.ep_cohesion += step_metrics["cohesion_spread"]
-            self.ep_tracking += step_metrics["tracking_error"]
-            self.ep_collisions += step_metrics["collision_rate"]
-
+        # --- RESTORED VIDEO LOGIC ---
         if self.record_this_episode:
             frames = []
             num_to_render = min(9, self.num_games)
@@ -766,34 +608,28 @@ class VMASVectorizedEnv:
                 
             grid = np.vstack([np.hstack(frames[i*cols:(i+1)*cols]) for i in range(rows)])
             self.video_frames.append(grid)
+        # ----------------------------
 
+        stacked_obs = torch.stack(vmas_obs, dim=1)
         final_obs = self._apply_graph_formatting(stacked_obs)
         
         is_done = self.step_count >= self.args.max_cycles
-
+        
+        # Navigation has no terminal states, only time truncations
         terminations = torch.zeros((self.num_envs,), device=self.device, dtype=torch.bool)
         truncations = torch.full((self.num_envs,), is_done, device=self.device, dtype=torch.bool)
         
-        info = {
-            "raw_obs": stacked_obs.reshape(self.num_envs, -1)
-        }
+        info = {"raw_obs": stacked_obs.reshape(self.num_envs, -1)}
         
         if is_done:
             self.episode_count += 1
-            
             info["terminal_raw_obs"] = info["raw_obs"].clone()
             info["terminal_observation"] = final_obs.clone()
-
-            info["episode_metrics"] = {
-                "polarization": (self.ep_polarization / self.step_count).mean().item(),
-                "cohesion_spread": (self.ep_cohesion / self.step_count).mean().item(),
-                "tracking_error": (self.ep_tracking / self.step_count).mean().item(),
-                "collision_rate": (self.ep_collisions / self.step_count).mean().item(),
-            }
             
+            # --- RESTORED VIDEO SAVE LOGIC ---
             if self.record_this_episode and self.video_frames:
-                os.makedirs(f"videos_vmas_flocking/{self.run_name}", exist_ok=True)
-                file_path = f"videos_vmas_flocking/{self.run_name}/rl-video-update_{self.update_step}-ep_{self.episode_count}.mp4"
+                os.makedirs(f"videos/{self.run_name}", exist_ok=True)
+                file_path = f"videos/{self.run_name}/rl-video-update_{self.update_step}-ep_{self.episode_count}.mp4"
                 imageio.mimsave(file_path, self.video_frames, fps=15)
                 self.video_frames = []
             
@@ -801,8 +637,8 @@ class VMASVectorizedEnv:
                 self.record_this_episode = True
             else:
                 self.record_this_episode = False
+            # ---------------------------------
 
-            # Surface the completed returns before wiping them
             info["episode"] = {
                 "r": self.episode_returns.clone(),
                 "l": torch.full((self.num_envs,), self.step_count, device=self.device)
@@ -811,70 +647,15 @@ class VMASVectorizedEnv:
             vmas_obs = self.env.reset()
             self.episode_returns.zero_()
             self.step_count = 0
-
-            self.ep_polarization.zero_()
-            self.ep_cohesion.zero_()
-            self.ep_tracking.zero_()
-            self.ep_collisions.zero_()
-
-            self.episode_tags = torch.rand((self.num_games, self.num_agents), device=self.device)
             
+            self.episode_tags = torch.rand((self.num_games, self.num_agents), device=self.device)
             stacked_obs = torch.stack(vmas_obs, dim=1)
             final_obs = self._apply_graph_formatting(stacked_obs)
-            
             info["raw_obs"] = stacked_obs.reshape(self.num_envs, -1)
                 
         return final_obs, rewards, terminations, truncations, info
 
-    def close(self): 
-        pass
-
-def compute_flocking_metrics(stacked_vmas_obs, agent_radius=0.1):
-    """
-    Computes scale-invariant physical metrics for multi-agent flocking.
-    Modified to return un-aggregated batched tensors so they can be integrated
-    across the entire episode cleanly.
-    """
-    B = stacked_vmas_obs.shape[0]
-    N = stacked_vmas_obs.shape[1]
-    
-    # 1. Extract Kinematics
-    pos = stacked_vmas_obs[:, :, 0:2] # (B, N, 2)
-    vel = stacked_vmas_obs[:, :, 2:4] # (B, N, 2)
-    target_rel = stacked_vmas_obs[:, 0:1, 4:6] # (B, 1, 2)
-    target_abs = pos[:, 0:1, :] + target_rel # (B, 1, 2)
-    
-    # --- Metric 1: Polarization Order Parameter ---
-    speeds = torch.norm(vel, dim=-1, keepdim=True) + 1e-8
-    headings = vel / speeds
-    mean_headings = headings.sum(dim=1) / N
-    polarization = torch.norm(mean_headings, dim=-1) # Shape (B,)
-    
-    # --- Metric 2: Center-of-Mass Cohesion Spread ---
-    com = pos.mean(dim=1, keepdim=True) # (B, 1, 2)
-    cohesion_spread = torch.norm(pos - com, dim=-1).mean(dim=1) # Shape (B,)
-    
-    # --- Metric 3: Target Tracking Error ---
-    tracking_error = torch.norm(com - target_abs, dim=-1).squeeze(1) # Shape (B,)
-    
-    # --- Metric 4: Collision / Crowding Rate ---
-    pos_expanded_1 = pos.unsqueeze(2) # (B, N, 1, 2)
-    pos_expanded_2 = pos.unsqueeze(1) # (B, 1, N, 2)
-    pairwise_distances = torch.norm(pos_expanded_1 - pos_expanded_2, dim=-1) # (B, N, N)
-    
-    eye_mask = torch.eye(N, device=pos.device).unsqueeze(0).bool()
-    pairwise_distances.masked_fill_(eye_mask, float('inf'))
-    
-    collision_threshold = agent_radius * 2.0
-    is_colliding = (pairwise_distances < collision_threshold).any(dim=-1).float() # (B, N)
-    collision_rate = is_colliding.mean(dim=1) # Shape (B,)
-    
-    return {
-        "polarization": polarization,
-        "cohesion_spread": cohesion_spread,
-        "tracking_error": tracking_error,
-        "collision_rate": collision_rate
-    }
+    def close(self): pass
 
 if __name__ == "__main__":
 
@@ -930,46 +711,39 @@ if __name__ == "__main__":
         next_info = {}
     next_done = torch.zeros(actual_num_envs).to(device)
 
-    state_dim = num_agents_per_game * np.array(envs.single_observation_space.shape).prod()
+    if "global_state" in next_info:
+        # Use the actual shape of the global state provided by your wrappers
+        # state_dim = next_info["global_state"].shape[-1]
+        state_dim = num_agents_per_game * np.array(envs.single_observation_space.shape).prod()
 
-    # agent = PointNetAgent(
-    #     envs.single_action_space, 
-    #     envs.single_observation_space.shape, 
-    #     num_agents_per_game, 
-    #     state_dim=state_dim, 
-    #     n_max=args.n_max
-    # ).to(device)
+        state0 = next_info["global_state"][0]
+        state1 = next_info["global_state"][num_agents_per_game] if len(next_info["global_state"]) > 1 else None
+        if state1 is not None:
+            diff = torch.abs(state0 - state1).sum().item()
+            print(f"DEBUG: Environmental Divergence Score: {diff}")
+            if diff == 0:
+                print("WARNING: Environments are still synchronized!")
+    else:
+        # Fallback for Atari or environments without a God-view state
+        state_dim = num_agents_per_game * np.array(envs.single_observation_space.shape).prod()
 
-    agent = TransformerAgent(
-        envs.single_action_space, 
-        envs.single_observation_space.shape, 
-        num_agents_per_game, 
-        state_dim=state_dim, 
-        n_max=args.n_max
+    n_max = args.n_max * 2
+
+    agent = GraphAgent(
+        envs=envs, 
+        n_max=n_max, 
+        num_agents=num_agents_per_game
     ).to(device)
 
-    # agent = Agent(
-    #     envs.single_action_space, 
-    #     envs.single_observation_space.shape, 
-    #     num_agents_per_game, 
-    #     state_dim=state_dim, 
-    #     n_max=args.n_max
-    # ).to(device)
-
     optimizer = optim.Adam([
-            {'params': agent.get_actor_parameters(), 'lr': 3e-4}, 
-            {'params': list(agent.critic_encoder.parameters()) + 
-                        list(agent.critic_popart.parameters()), 'lr': 1e-3} 
-        ], eps=1e-5)
-
-    # optimizer = optim.Adam([
-    #         {'params': list(agent.actor.parameters()) + 
-    #                    list(agent.actor_mean.parameters()) + 
-    #                    [agent.actor_logstd], 'lr': 3e-4}, 
+            {'params': list(agent.backbone.parameters()) + 
+                       list(agent.actor_mlp.parameters()) + 
+                       list(agent.actor_mean.parameters()) + 
+                       [agent.actor_logstd], 'lr': 3e-4}, 
             
-    #         {'params': list(agent.critic_encoder.parameters()) + 
-    #                    list(agent.critic_popart.parameters()), 'lr': 1e-3} 
-    #         ], eps=1e-5)
+            {'params': list(agent.critic_mlp.parameters()) + 
+                       list(agent.critic_popart.parameters()), 'lr': 1e-3} 
+        ], eps=1e-5)
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, actual_num_envs) + envs.single_observation_space.shape).to(device)
@@ -1034,6 +808,9 @@ if __name__ == "__main__":
                 next_info = {}
             next_done = torch.zeros(actual_num_envs).to(device)
             
+            # Re-sync the global state tracking
+            if "global_state" in next_info:
+                current_game_states = next_obs.view(num_games, -1)
             print("--- PHOENIX REBOOT COMPLETE ---")
 
         for step in range(0, args.num_steps):
@@ -1073,31 +850,21 @@ if __name__ == "__main__":
                 done_games = done_bool.view(num_games, num_agents_per_game)[:, 0]
                 
                 if done_games.any():
-                    ep_returns = next_info["episode"]["r"].view(num_games, num_agents_per_game)[done_games]
-                    ep_lengths = next_info["episode"]["l"].view(num_games, num_agents_per_game)[done_games]
+                    avg_return = next_info["episode"]["r"].view(num_games, num_agents_per_game)[done_games, 0].mean().item()
+                    avg_length = next_info["episode"]["l"].view(num_games, num_agents_per_game)[done_games, 0].float().mean().item()
                     
-                    # Option A: Mean Return per Agent across the team
-                    avg_return = ep_returns.mean().item()
-                    avg_length = ep_lengths.float().mean().item()
-
-                    # Grab the continuous episodic averages cleanly from next_info
-                    metrics = next_info["episode_metrics"]
-                    
-                    writer.add_scalar("charts/polarization", metrics["polarization"], global_step)
-                    writer.add_scalar("charts/cohesion_spread", metrics["cohesion_spread"], global_step)
-                    writer.add_scalar("charts/tracking_error", metrics["tracking_error"], global_step)
-                    writer.add_scalar("charts/collision_rate", metrics["collision_rate"], global_step)
-                    
-                    print(f"global_step={global_step}, episodic_return={avg_return:.2f}")
+                    print(f"global_step={global_step}, episodic_return={avg_return}")
                     writer.add_scalar("charts/team_episodic_return", avg_return, global_step)
                     writer.add_scalar("charts/team_episodic_length", avg_length, global_step)
         # bootstrap value if not done
         with torch.no_grad():
             boot_obs = next_obs.clone()
-
+            
+            # TELEPORTATION FIX: If the environment timed out, we MUST bootstrap 
+            # from the true final state (step 250), not the reset state (step 0).
             if "terminal_observation" in next_info:
                 boot_obs = next_info["terminal_observation"].clone()
-            
+
             # First Pass
             next_value = agent.get_value(boot_obs, denormalize=True).flatten()
     
@@ -1142,7 +909,6 @@ if __name__ == "__main__":
                 new_values_flat[start:end] = agent.get_value(b_obs_flat[start:end], denormalize=True).flatten()
                 
             new_values = new_values_flat.view(args.num_steps, actual_num_envs)
-            
             new_next_value = agent.get_value(boot_obs, denormalize=True).flatten()
             
             # Final GAE calculation for the actual SGD update
@@ -1186,6 +952,7 @@ if __name__ == "__main__":
                 
                 # This ensures we always pick Agent 0, 1, 2... from the same game/time together
                 mb_inds = (mb_joint_inds[:, None] * agent.num_agents + np.arange(agent.num_agents)).flatten()
+                mb_state_inds = mb_joint_inds
 
                 _, newlogprob, entropy, newvalue = agent.get_action_and_value(
                     b_obs[mb_inds], 
@@ -1201,10 +968,14 @@ if __name__ == "__main__":
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
                 mb_advantages = b_advantages[mb_inds]
+
+                # will need this for heterogenous
+                # if args.norm_adv:
+                #     mb_adv_reshaped = mb_advantages.view(-1, agent.num_agents)
+                #     mb_adv_reshaped = (mb_adv_reshaped - mb_adv_reshaped.mean(dim=0)) / (mb_adv_reshaped.std(dim=0) + 1e-7)
+                #     mb_advantages = mb_adv_reshaped.reshape(-1)
                 if args.norm_adv:
-                    mb_adv_reshaped = mb_advantages.view(-1, agent.num_agents)
-                    mb_adv_reshaped = (mb_adv_reshaped - mb_adv_reshaped.mean(dim=0)) / (mb_adv_reshaped.std(dim=0) + 1e-7)
-                    mb_advantages = mb_adv_reshaped.reshape(-1)
+                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
                 # Policy loss
                 pg_loss1 = -mb_advantages * ratio
@@ -1214,6 +985,7 @@ if __name__ == "__main__":
                 # Value loss
                 newvalue = newvalue.view(-1)
 
+                # Reshape to align with PopArt agent-specific stats
                 normalized_returns = agent.critic_popart.normalize(b_returns[mb_inds].view(-1, 1)).reshape(-1)
                 normalized_values = agent.critic_popart.normalize(b_values[mb_inds].view(-1, 1)).reshape(-1)
 
@@ -1280,59 +1052,3 @@ if __name__ == "__main__":
 
     envs.close()
     writer.close()
-
-    print("--- STARTING LONG INFERENCE EVALUATION ---")
-    
-    # 1. Lock the agent's normalizers (CRITICAL)
-    agent.eval() 
-        
-    eval_max_cycles = 1500 # Set this to however long you want to watch
-    eval_num_agents = 50
-    
-    # 2. Spin up a fresh, single-game environment with the long max-cycles
-    eval_env = vmas.make_env(
-        scenario=FlockingCleanObs() if args.env_id == "flocking" else args.env_id,
-        num_envs=1, # Just one game for the video
-        device=device,
-        continuous_actions=True,
-        n_agents=eval_num_agents,
-        seed=args.seed + 100, # Offset seed so it's a novel starting position
-        dict_spaces=False,
-        n_obstacles = 0
-    )
-    
-    # 3. Reset and prep the observation format
-    obs_list = eval_env.reset()
-    stacked_obs = torch.stack(obs_list, dim=1)
-    
-    # Generate eval tags and use the graph formatter directly
-    eval_tags = torch.rand((1, eval_num_agents), device=device)
-    envs.episode_tags = eval_tags  # Pass tags to our wrapper instance temporarily
-    next_obs = envs._apply_graph_formatting(stacked_obs)
-    
-    frames = []
-
-    # 4. The rollout loop
-    with torch.no_grad():
-        for step in range(eval_max_cycles):
-            action, _, _, _ = agent.get_action_and_value(next_obs, compute_value=False)
-            clipped_action = torch.clamp(action, -1.0, 1.0)
-            
-            actions_reshaped = clipped_action.view(1, eval_num_agents, -1)
-            vmas_actions = [actions_reshaped[:, i, :] for i in range(eval_num_agents)]
-            
-            vmas_obs, _, _, _ = eval_env.step(vmas_actions)
-            
-            frame = eval_env.render(mode="rgb_array", env_index=0)
-            if isinstance(frame, list): 
-                frame = frame[0]
-            frames.append(frame)
-            
-            stacked_obs = torch.stack(vmas_obs, dim=1)
-            next_obs = envs._apply_graph_formatting(stacked_obs)
-
-    
-    os.makedirs(f"videos_vmas_flocking/{run_name}", exist_ok=True)
-    video_path = f"videos_vmas_flocking/{run_name}/FINAL_LONG_EVAL_{eval_max_cycles}_cycles.mp4"
-    imageio.mimsave(video_path, frames, fps=15)
-    print(f"--- LONG EVALUATION SAVED TO {video_path} ---")

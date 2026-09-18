@@ -429,7 +429,8 @@ class TransformerAgent(nn.Module):
             dim_feedforward=d_model * 4, 
             batch_first=True, 
             activation='gelu', 
-            norm_first=True
+            norm_first=True,
+            dropout=0.0
         )
         self.transformer = nn.TransformerEncoder(
             encoder_layer, 
@@ -666,8 +667,9 @@ class VMASVectorizedEnv:
         for i in range(N):
             teammates = [j for j in range(N) if j != i]
             
-            # Build strict sequence: Ego first, then all Packages, then Goals, then Teammates
-            seq = [i] + list(range(N, N + P)) + list(range(N + P, N + P + G)) + teammates
+            # IMPORTANT NOTE: Swap the order so the Goal is strictly at Index 1 (immediately after Ego) ONLY FOR TRANSFORMER
+            # This aligns the semantic meaning of h[:, 1, :] with your Flocking/Navigation baselines.
+            seq = [i] + list(range(N + P, N + P + G)) + list(range(N, N + P)) + teammates
             seq = seq[:K] # Truncate to fit n_max context window
             
             idx_list.append(seq)

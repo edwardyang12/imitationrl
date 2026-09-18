@@ -30,6 +30,24 @@ MODEL_COLORS = {
     'PTN': "#a02c89"          
 }
 
+BEST_IN_CLASS_NMAX = {
+    'GAT': 3,
+    'GCN': 5,
+    'PTN': 5,
+    'T': 3,   # Adjust based on your top_configs_summary.csv
+    'MLP': 5  # Adjust based on your top_configs_summary.csv
+}
+
+def filter_best_in_class(df, n_train):
+    """Filters the dataframe so each model is plotted at its optimal n_max."""
+    optimal_dfs = []
+    for model, opt_nmax in BEST_IN_CLASS_NMAX.items():
+        subset = df[(df['Model'] == model) & (df['N_train'] == n_train) & (df['n_max'] == opt_nmax)]
+        optimal_dfs.append(subset)
+    if not optimal_dfs:
+        return pd.DataFrame()
+    return pd.concat(optimal_dfs, ignore_index=True)
+
 # Custom High-Contrast Colormap for Phase Diagrams
 # Black (0%) -> Dark Red (10%) -> Yellow/Orange (80%) -> Green (90-100%)
 c_nodes = [0.0, 0.1, 0.8, 0.9, 1.0]
@@ -103,10 +121,10 @@ def export_top_configs(df, output_dir="plots"):
 # Graph 1: OOD Survival Curves
 # ---------------------------------------------------------
 def plot_survival_curves(df, n_train, n_max, output_dir="plots"):
-    df_base = df[(df['N_train'] == n_train) & (df['n_max'] == n_max)].copy()
+    df_base = filter_best_in_class(df, n_train).copy()
     
     if df_base.empty:
-        print(f"[Warning] No data for baseline config (N_train={n_train}, n_max={n_max}). Skipping Graph 1.")
+        print(f"[Warning] No data for best-in-class config (N_train={n_train}). Skipping Graph 1.")
         return
 
     fig, ax = plt.subplots(figsize=(8, 6))
@@ -118,7 +136,7 @@ def plot_survival_curves(df, n_train, n_max, output_dir="plots"):
     )
     
     ax.axhline(80, ls='--', color='gray', alpha=0.7, label='80% Success Threshold')
-    ax.set_title(f'Zero-Shot Scaling Survival (Trained N={n_train}, n_max={n_max})')
+    ax.set_title(f'Zero-Shot Scaling Survival (Trained N={n_train}, Best-in-Class n_max)')
     ax.set_xlabel('Test Population Density (N_test)')
     ax.set_ylabel('Final Goal Retention Rate (%)')
     ax.set_ylim(0, 105)
@@ -204,8 +222,9 @@ def plot_hyperparameter_trends(df, output_dir="plots"):
 # ---------------------------------------------------------
 # Graph 3: Critical Density Benchmark (Visually Grouped)
 # ---------------------------------------------------------
-def plot_critical_density_bars(df, n_crit=50, output_dir="plots"):
-    df_crit = df[df['N_test'] == n_crit].copy()
+def plot_critical_density_bars(df, n_train=10, n_crit=50, output_dir="plots"):
+    df_crit = filter_best_in_class(df, n_train)
+    df_crit = df_crit[df_crit['N_test'] == n_crit].copy()
     if df_crit.empty: return
 
     df_crit['Cooperation Ratio'] = df_crit['Yields_Cooperative'] / (df_crit['Yields_Forced_Displacement'] + 1e-5)
@@ -253,7 +272,7 @@ def plot_critical_density_bars(df, n_crit=50, output_dir="plots"):
 # Graph 4: Behavioral Breakdowns
 # ---------------------------------------------------------
 def plot_behavioral_breakdowns(df, n_train, n_max, output_dir="plots"):
-    df_base = df[(df['N_train'] == n_train) & (df['n_max'] == n_max)].copy()
+    df_base = filter_best_in_class(df, n_train).copy()
     if df_base.empty: return
 
     metrics = [
@@ -293,7 +312,7 @@ def plot_behavioral_breakdowns(df, n_train, n_max, output_dir="plots"):
     axes[2].set_xlabel('Test Population Density (N_test)')
     axes[3].set_xlabel('Test Population Density (N_test)')
     
-    plt.suptitle(f'Pathological Breakdown Mechanics (Trained N={n_train}, n_max={n_max})', fontsize=16, y=1.02)
+    plt.suptitle(f'Pathological Breakdown Mechanics (Trained N={n_train}, Best-in-Class n_max)', fontsize=16, y=1.02)
     plt.tight_layout()
     
     os.makedirs(output_dir, exist_ok=True)
@@ -360,7 +379,7 @@ if __name__ == "__main__":
     plot_hyperparameter_trends(metrics_df, args.output_dir)
     
     print(f"Generating Graph 3: Critical Density Comparisons (N={args.n_crit})...")
-    plot_critical_density_bars(metrics_df, args.n_crit, args.output_dir)
+    plot_critical_density_bars(metrics_df, args.baseline_ntrain, args.n_crit, args.output_dir)
     
     print("Generating Graph 4: Behavioral Breakdown Curves...")
     plot_behavioral_breakdowns(metrics_df, args.baseline_ntrain, args.baseline_nmax, args.output_dir)
