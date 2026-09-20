@@ -178,26 +178,34 @@ class MultiHeadGATBackbone(nn.Module):
         B = x_flat.shape[0]
         device = x_flat.device
         
-        # Corrected: Use self.n_max directly (it is already args.n_max * 2)
         x_padded = x_flat.view(B, self.n_max, self.feature_dim)
         
-        # This single mask effortlessly dumps all padded zeros AND out-of-radius agents
         active_mask = x_padded[:, :, 6] > 0.5  
         valid_x = x_padded[active_mask] 
         
-        # Corrected: Replaced undefined self.max_capacity * 2 with self.n_max
         batch_indices = torch.arange(B, device=device).view(-1, 1).expand(B, self.n_max)
         valid_batch = batch_indices[active_mask] 
         
-        # radius_graph now dynamically computes edges for exactly the number of agents present
+        # --- THE FIX ---
+        # 1. Create a spatial clone specifically for the radius check
+        spatial_x = valid_x[:, :2].clone()
+        
+        # 2. Index 8 is the 'is_my_goal' flag. Teleport the goal to the ego's origin (0,0)
+        is_my_goal = valid_x[:, 8] > 0.5
+        spatial_x[is_my_goal] = 0.0 
+        
+        # 3. Build edges using the hacked spatial coordinates
         edge_index = radius_graph(
-            x=valid_x[:, :2], 
+            x=spatial_x, 
             r=radius, 
             batch=valid_batch, 
             loop=False
         )
+        # ---------------
         
         row, col = edge_index
+        
+        # Network continues to use the UNMODIFIED valid_x for actual edge attributes
         rel_pos = valid_x[row, :2] - valid_x[col, :2]
         distances = torch.sqrt((rel_pos ** 2).sum(dim=-1, keepdim=True) + 1e-8)
         
@@ -265,11 +273,10 @@ class FairVectorGCNBackbone(nn.Module):
         self.skip_proj = nn.Linear(feature_dim, wide_dim)
         self.elu = nn.ELU()
 
-    def _build_fc_dynamic_graph(self, x_flat, radius=0.5):
+    def _build_fc_dynamic_graph(self, x_flat, radius=1.5):
         B = x_flat.shape[0]
         device = x_flat.device
         
-        # Corrected variable name: using self.n_max
         x_padded = x_flat.view(B, self.n_max, self.feature_dim)
         
         active_mask = x_padded[:, :, 6] > 0.5  
@@ -278,15 +285,26 @@ class FairVectorGCNBackbone(nn.Module):
         batch_indices = torch.arange(B, device=device).view(-1, 1).expand(B, self.n_max)
         valid_batch = batch_indices[active_mask] 
         
-        # loop=False cleanly strips self-loops for SeparatedVectorGCNConv
+        # --- THE FIX ---
+        # 1. Create a spatial clone specifically for the radius check
+        spatial_x = valid_x[:, :2].clone()
+        
+        # 2. Index 8 is the 'is_my_goal' flag. Teleport the goal to the ego's origin (0,0)
+        is_my_goal = valid_x[:, 8] > 0.5
+        spatial_x[is_my_goal] = 0.0 
+        
+        # 3. Build edges using the hacked spatial coordinates
         edge_index = radius_graph(
-            x=valid_x[:, :2], 
+            x=spatial_x, 
             r=radius, 
             batch=valid_batch, 
-            loop=False 
+            loop=False
         )
+        # ---------------
         
         row, col = edge_index
+        
+        # Network continues to use the UNMODIFIED valid_x for actual edge attributes
         rel_pos = valid_x[row, :2] - valid_x[col, :2]
         distances = torch.sqrt((rel_pos ** 2).sum(dim=-1, keepdim=True) + 1e-8)
         
@@ -465,6 +483,342 @@ class GraphAgent(nn.Module):
             
         return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), values.view(-1, 1)
 
+class MappoAgent(nn.Module):
+    def __init__(self, single_action_space, single_obs_shape, num_agents, state_dim, n_max=10):
+        super().__init__()
+        self.num_agents = num_agents
+        self.obs_dim = np.array(single_obs_shape).prod() # Exactly 2 * n_max * 9
+        self.action_dim = np.prod(single_action_space.shape)
+        
+        # Shared Isotropic Normalizer
+        self.obs_normalizer = GraphObservationNormalizer(n_max=n_max, feature_dim=9, continuous_dim=4)
+
+        # 1. DECENTRALIZED ACTOR (No embeddings, no global state -> 100% invariant to N!)
+        self.actor = nn.Sequential(
+            layer_init(nn.Linear(self.obs_dim, 1024)),
+            nn.LayerNorm(1024), nn.ReLU(),
+            layer_init(nn.Linear(1024, 512)),
+            nn.LayerNorm(512), nn.ReLU(),
+            layer_init(nn.Linear(512, 256)),
+            nn.LayerNorm(256), nn.ReLU(),
+            layer_init(nn.Linear(256, 256)),
+            nn.ReLU(),
+        )
+        self.actor_mean = nn.Sequential(
+            layer_init(nn.Linear(256, self.action_dim), std=0.01),
+            nn.Tanh() 
+        )
+        self.actor_logstd = nn.Parameter(torch.zeros(1, self.action_dim))
+
+        # 2. CENTRALIZED CRITIC (Receives joint state of ALL agents to stabilize GAE training!)
+        # Notice we use state_dim (or num_agents * obs_dim), which gives it true CTDE clarity.
+        joint_critic_dim = self.num_agents * self.obs_dim
+        self.critic_encoder = nn.Sequential(
+            layer_init(nn.Linear(joint_critic_dim, 512)), 
+            nn.LayerNorm(512), nn.ReLU(),
+            layer_init(nn.Linear(512, 512)),
+            nn.LayerNorm(512), nn.ReLU(),
+            layer_init(nn.Linear(512, 256)),
+            nn.LayerNorm(256), nn.ReLU(),
+            layer_init(nn.Linear(256, 256)),
+            nn.ReLU(),
+        )
+        self.critic_popart = PopArt(256, 1)
+
+    def get_value(self, x, denormalize=False):
+        x_norm = self.obs_normalizer.normalize(x)
+        batch_size = x.shape[0]
+        num_games = batch_size // self.num_agents
+        
+        # Concatenate local K-NN observations across all agents in the game into a joint state vector
+        joint_state = x_norm.view(num_games, -1)
+        expanded_joint_state = joint_state.repeat_interleave(self.num_agents, dim=0)
+        
+        values = self.critic_popart(self.critic_encoder(expanded_joint_state)) 
+        if denormalize:
+            values = self.critic_popart.denormalize(values)
+        return values.view(-1, 1)
+
+    def get_action_and_value(self, x, action=None, denormalize=False):
+        x_norm = self.obs_normalizer.normalize(x)
+        
+        # Actor strictly observes local K-NN graph
+        actor_features = self.actor(x_norm)
+        action_means = self.actor_mean(actor_features)
+        action_logstds = self.actor_logstd.expand_as(action_means)
+        safe_logstds = torch.clamp(action_logstds, min=-5.0, max=2.0)
+        action_stds = safe_logstds.exp()
+        
+        probs = Normal(action_means, action_stds)
+        if action is None:
+            action = probs.sample()
+            
+        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.get_value(x, denormalize)
+
+class PointNetAgent(nn.Module):
+    def __init__(self, single_action_space, single_obs_shape, num_agents, state_dim, n_max=10):
+        super().__init__()
+        self.num_agents = num_agents
+        self.obs_dim = np.array(single_obs_shape).prod() # Exactly 2 * n_max * 9
+        self.action_dim = np.prod(single_action_space.shape)
+        self.n_max_nodes = n_max 
+        self.feature_dim = 9
+        
+        # 1. SHARED NORMALIZER
+        self.obs_normalizer = GraphObservationNormalizer(n_max=n_max, feature_dim=self.feature_dim, continuous_dim=4)
+        
+        # 2. DEEPSETS NODE ENCODER (phi) - Applied to each token independently
+        self.phi = nn.Sequential(
+            layer_init(nn.Linear(self.feature_dim, 128)),
+            nn.LayerNorm(128), nn.ReLU(),
+            layer_init(nn.Linear(128, 128)),
+            nn.LayerNorm(128), nn.ReLU(),
+            layer_init(nn.Linear(128, 128)),
+            nn.LayerNorm(128), nn.ReLU()
+        )
+        
+        # 3. GLOBAL ACTOR PROCESSOR (rho) - Applied to the aggregated feature
+        self.rho = nn.Sequential(
+            layer_init(nn.Linear(128, 128)),
+            nn.LayerNorm(128), nn.ReLU(),
+            layer_init(nn.Linear(128, 64)),
+            nn.LayerNorm(64), nn.ReLU(),
+            layer_init(nn.Linear(64, 64)),
+            nn.ReLU()
+        )
+        
+        self.actor_mean = nn.Sequential(
+            layer_init(nn.Linear(64, self.action_dim), std=0.01),
+            nn.Tanh() 
+        )
+        self.actor_logstd = nn.Parameter(torch.zeros(1, self.action_dim))
+
+        # 4. CENTRALIZED CRITIC (Retains identical CTDE architecture)
+        joint_critic_dim = self.num_agents * self.obs_dim
+        self.critic_encoder = nn.Sequential(
+            layer_init(nn.Linear(joint_critic_dim, 512)), 
+            nn.LayerNorm(512), nn.ReLU(),
+            layer_init(nn.Linear(512, 512)),
+            nn.LayerNorm(512), nn.ReLU(),
+            layer_init(nn.Linear(512, 256)),
+            nn.LayerNorm(256), nn.ReLU(),
+            layer_init(nn.Linear(256, 256)),
+            nn.ReLU(),
+        )
+        self.critic_popart = PopArt(256, 1)
+
+    def _forward_actor_backbone(self, x_norm):
+        B = x_norm.shape[0]
+        # Reshape into [Batch, Nodes, Features]
+        tokens = x_norm.view(B, self.n_max_nodes, self.feature_dim)
+        
+        # Identify active nodes to mask out padding before max pooling
+        # Using the is_active flag at index 6 from your graph formatting
+        is_active = (tokens[:, :, 6] >= 0.5).unsqueeze(-1).float()
+        
+        # 1. Independent Node Processing (phi)
+        node_features = self.phi(tokens) # Shape: [B, n_max_nodes, 128]
+        
+        # 2. Masking
+        # Set inactive nodes to a highly negative value so they drop out during max-pooling
+        masked_features = node_features + (1.0 - is_active) * -1e9
+        
+        # 3. Permutation-Invariant Aggregation (Max Pooling)
+        global_feature, _ = torch.max(masked_features, dim=1) # Shape: [B, 128]
+        
+        return global_feature
+
+    def get_actor_parameters(self):
+        return (
+            list(self.phi.parameters()) +
+            list(self.rho.parameters()) +
+            list(self.actor_mean.parameters()) +
+            [self.actor_logstd]
+        )
+
+    def get_value(self, x, denormalize=False):
+        x_norm = self.obs_normalizer.normalize(x)
+        batch_size = x.shape[0]
+        num_games = batch_size // self.num_agents
+        
+        joint_state = x_norm.view(num_games, -1)
+        expanded_joint_state = joint_state.repeat_interleave(self.num_agents, dim=0)
+        
+        values = self.critic_popart(self.critic_encoder(expanded_joint_state)) 
+        if denormalize:
+            values = self.critic_popart.denormalize(values)
+        return values.view(-1, 1)
+
+    def get_action_and_value(self, x, action=None, denormalize=False):
+        x_norm = self.obs_normalizer.normalize(x)
+        
+        # Get permutation-invariant global feature
+        global_feature = self._forward_actor_backbone(x_norm)
+        
+        # Pass through the final processor (rho)
+        actor_features = self.rho(global_feature)
+        
+        action_means = self.actor_mean(actor_features)
+        action_logstds = self.actor_logstd.expand_as(action_means)
+        
+        # STRICT PARITY: Retaining max=2.0 exactly as requested!
+        safe_logstds = torch.clamp(action_logstds, min=-5.0, max=2.0)
+        action_stds = safe_logstds.exp()
+        
+        probs = Normal(action_means, action_stds)
+        if action is None:
+            action = probs.sample()
+            
+        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.get_value(x, denormalize)
+
+class TransformerAgent(nn.Module):
+    def __init__(self, single_action_space, single_obs_shape, num_agents, state_dim, n_max=10, d_model=256, nhead=4, num_layers=3):
+        super().__init__()
+        self.num_agents = num_agents
+        self.obs_dim = np.array(single_obs_shape).prod() # Exactly 2 * n_max * 9
+        self.action_dim = np.prod(single_action_space.shape)
+        self.n_max_nodes = n_max 
+        self.feature_dim = 9
+        self.nhead = nhead # Needed for multi-head distance mask expansion
+        
+        # 1. SHARED NORMALIZER
+        self.obs_normalizer = GraphObservationNormalizer(n_max=n_max, feature_dim=self.feature_dim, continuous_dim=4)
+        
+        # 2. UPGRADE: Learnable Spatial Horizon per Attention Head!
+        # Initialized to 1.0 so Euclidean distance immediately biases attention on Step 0.
+        self.geom_scale = nn.Parameter(torch.ones(1, nhead, 1, 1))
+        
+        # 3. TERMINAL LAYERNORM TOKEN PROJECTION
+        self.token_proj = nn.Sequential(
+            layer_init(nn.Linear(self.feature_dim, d_model)),
+            nn.LayerNorm(d_model),
+            nn.ReLU(),
+            layer_init(nn.Linear(d_model, d_model)),
+            nn.LayerNorm(d_model) 
+        )
+        
+        # 4. TRANSFORMER ENCODER
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=d_model, 
+            nhead=nhead, 
+            dim_feedforward=d_model * 4, 
+            batch_first=True, 
+            activation='gelu', 
+            norm_first=True
+        )
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, 
+            num_layers=num_layers, 
+            norm=nn.LayerNorm(d_model), 
+            enable_nested_tensor=False
+        )
+        
+        # 5. TRI-TOKEN ACTOR HEAD (d_model * 3)
+        self.actor = nn.Sequential(
+            nn.LayerNorm(d_model * 3), 
+            layer_init(nn.Linear(d_model * 3, 128)),
+            nn.LayerNorm(128), nn.ReLU(),
+            layer_init(nn.Linear(128, 64)),
+            nn.LayerNorm(64), nn.ReLU(),
+            layer_init(nn.Linear(64, 64)),
+            nn.ReLU(),
+        )
+        self.actor_mean = nn.Sequential(
+            layer_init(nn.Linear(64, self.action_dim), std=0.01),
+            nn.Tanh() 
+        )
+        self.actor_logstd = nn.Parameter(torch.zeros(1, self.action_dim))
+
+        # 6. CENTRALIZED CRITIC
+        joint_critic_dim = self.num_agents * self.obs_dim
+        self.critic_encoder = nn.Sequential(
+            layer_init(nn.Linear(joint_critic_dim, 512)), 
+            nn.LayerNorm(512), nn.ReLU(),
+            layer_init(nn.Linear(512, 512)),
+            nn.LayerNorm(512), nn.ReLU(),
+            layer_init(nn.Linear(512, 256)),
+            nn.LayerNorm(256), nn.ReLU(),
+            layer_init(nn.Linear(256, 256)),
+            nn.ReLU(),
+        )
+        self.critic_popart = PopArt(256, 1)
+
+    def _forward_actor_backbone(self, x_norm):
+        B = x_norm.shape[0]
+        tokens = x_norm.view(B, self.n_max_nodes, self.feature_dim)
+        key_padding_mask = (tokens[:, :, 6] < 0.5)
+        
+        # --- UPGRADE: Euclidean Attention Biasing ---
+        # 1. Extract physical relative coordinates [dx, dy] for all 2K tokens
+        pos = tokens[:, :, 0:2] # [B, 2K, 2]
+        
+        # 2. Calculate Pairwise Euclidean Distance Matrix [B, 1, 2K, 2K]
+        pos_i = pos.unsqueeze(2) # [B, 2K, 1, 2]
+        pos_j = pos.unsqueeze(1) # [B, 1, 2K, 2]
+        dist_matrix = torch.norm(pos_i - pos_j, dim=-1, keepdim=True).permute(0, 3, 1, 2)
+        
+        # 3. Apply per-head learnable spatial scaling: (-gamma_h * distance) -> [B, nhead, 2K, 2K]
+        scaled_dist = -torch.abs(self.geom_scale) * dist_matrix
+        
+        # 4. Reshape to [B * nhead, 2K, 2K] as required by PyTorch nn.TransformerEncoder
+        geom_mask = scaled_dist.view(B * self.nhead, self.n_max_nodes, self.n_max_nodes)
+        
+        # Pass tokens AND the geometric distance kernel into the Transformer
+        h = self.token_proj(tokens)
+        out = self.transformer(h, mask=geom_mask, src_key_padding_mask=key_padding_mask)
+        
+        # Tri-Token Concatenation
+        ego_final = out[:, 0, :]
+        ego_initial = h[:, 0, :]
+        goal_initial = h[:, self.n_max_nodes // 2, :]
+        
+        combined_ego = torch.cat([ego_final, ego_initial, goal_initial], dim=-1)
+        
+        return combined_ego
+
+    def get_actor_parameters(self):
+        # Includes self.geom_scale so attention heads learn their spatial horizons!
+        return (
+            [self.geom_scale] +
+            list(self.token_proj.parameters()) +
+            list(self.transformer.parameters()) +
+            list(self.actor.parameters()) +
+            list(self.actor_mean.parameters()) +
+            [self.actor_logstd]
+        )
+
+    def get_value(self, x, denormalize=False):
+        x_norm = self.obs_normalizer.normalize(x)
+        batch_size = x.shape[0]
+        num_games = batch_size // self.num_agents
+        
+        joint_state = x_norm.view(num_games, -1)
+        expanded_joint_state = joint_state.repeat_interleave(self.num_agents, dim=0)
+        
+        values = self.critic_popart(self.critic_encoder(expanded_joint_state)) 
+        if denormalize:
+            values = self.critic_popart.denormalize(values)
+        return values.view(-1, 1)
+
+    def get_action_and_value(self, x, action=None, denormalize=False):
+        x_norm = self.obs_normalizer.normalize(x)
+        
+        combined_ego = self._forward_actor_backbone(x_norm)
+        actor_features = self.actor(combined_ego)
+        
+        action_means = self.actor_mean(actor_features)
+        action_logstds = self.actor_logstd.expand_as(action_means)
+        
+        # STRICT PARITY: Retaining max=2.0 exactly as requested!
+        safe_logstds = torch.clamp(action_logstds, min=-5.0, max=2.0)
+        action_stds = safe_logstds.exp()
+        
+        probs = Normal(action_means, action_stds)
+        if action is None:
+            action = probs.sample()
+            
+        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.get_value(x, denormalize)
+
 class VMASVectorizedEnv:
     def __init__(self, args, seed, run_name, update_step=0):
         self.args = args
@@ -507,57 +861,73 @@ class VMASVectorizedEnv:
         B = self.num_games
         N = self.num_agents
         
-        # This is your absolute maximum evaluation size (e.g., 105)
         MAX_CAPACITY = self.args.n_max 
         radius = 1.5
         
         # 1. Extract raw absolute positions and velocities
-        abs_pos = stacked_vmas_obs[:, :, 0:2] # (B, N, 2)
-        vel = stacked_vmas_obs[:, :, 2:4]     # (B, N, 2)
-        ego_to_goal = stacked_vmas_obs[:, :, 4:6] # (B, N, 2)
+        abs_pos = stacked_vmas_obs[:, :, 0:2] 
+        vel = stacked_vmas_obs[:, :, 2:4]     
+        ego_to_goal = stacked_vmas_obs[:, :, 4:6] 
         
         # 2. Reconstruct absolute positions of ALL goals
         goal_abs = abs_pos - ego_to_goal 
         
         # 3. Calculate Relative Positions independently
-        ego_pos = abs_pos.unsqueeze(2) # (B, N, 1, 2)
-        rel_agents = abs_pos.unsqueeze(1) - ego_pos # (B, N, N, 2)
-        rel_goals = goal_abs.unsqueeze(1) - ego_pos # (B, N, N, 2)
+        ego_pos = abs_pos.unsqueeze(2) 
+        rel_agents = abs_pos.unsqueeze(1) - ego_pos 
+        rel_goals = goal_abs.unsqueeze(1) - ego_pos 
         
         # 4. Calculate Distances
-        dist_agents = torch.norm(rel_agents, dim=-1) # (B, N, N)
-        dist_goals = torch.norm(rel_goals, dim=-1) # (B, N, N)
+        dist_agents = torch.norm(rel_agents, dim=-1) 
+        dist_goals = torch.norm(rel_goals, dim=-1) 
         
-        # 5. Build the Dense Feature Matrices for ALL N entities
+        # 5. THE SURVIVAL OVERRIDE
+        # Force Ego and Assigned Goal distances to -infinity so they are ALWAYS sorted to the top
+        batch_idx = torch.arange(B, device=self.device).view(B, 1).expand(B, N)
+        ego_idx = torch.arange(N, device=self.device).view(1, N).expand(B, N)
+        
+        dist_agents[batch_idx, ego_idx, ego_idx] = -1e9
+        dist_goals[batch_idx, ego_idx, ego_idx] = -1e9 
+        
+        # 6. MEMORY PRIORITIZATION (Sort by distance to ensure closest neighbors make the capacity cut)
+        actual_k = min(MAX_CAPACITY, N) 
+        dist_agents_sorted, topk_agents_idx = torch.topk(dist_agents, k=actual_k, dim=-1, largest=False) 
+        dist_goals_sorted, topk_goals_idx = torch.topk(dist_goals, k=actual_k, dim=-1, largest=False) 
+        
         is_self_matrix = torch.eye(N, device=self.device).view(1, N, N)
         
-        # --- Agents Matrix ---
+        # 7. Build the Dense Feature Matrices for ALL N entities
         graph_agents = torch.zeros((B, N, N, self.feature_dim), device=self.device)
         graph_agents[..., 0:2] = rel_agents
-        graph_agents[..., 2:4] = vel.unsqueeze(1).expand(B, N, N, 2) * is_self_matrix.unsqueeze(-1)
         graph_agents[..., 4] = is_self_matrix 
-        graph_agents[..., 6] = (dist_agents <= radius).float() # RADIUS MASK (No top-K)
         graph_agents[..., 7] = self.episode_tags.unsqueeze(1).expand(B, N, N)
         
-        # --- Goals Matrix ---
         graph_goals = torch.zeros((B, N, N, self.feature_dim), device=self.device)
         graph_goals[..., 0:2] = rel_goals
         graph_goals[..., 5] = 1.0 
-        graph_goals[..., 6] = (dist_goals <= radius).float() # RADIUS MASK (No top-K)
         graph_goals[..., 7] = self.episode_tags.unsqueeze(1).expand(B, N, N)
         graph_goals[..., 8] = is_self_matrix 
         
-        # Combine Agents and Goals
-        graph = torch.cat([graph_agents, graph_goals], dim=2) # Shape: (B, N, 2N, 9)
+        # 8. Gather ONLY the Top-K prioritized entities
+        exp_agents_idx = topk_agents_idx.unsqueeze(-1).expand(-1, -1, -1, self.feature_dim)
+        gathered_agents = torch.gather(graph_agents, dim=2, index=exp_agents_idx)
         
-        # 6. Pad to the absolute MAX_CAPACITY to keep RL tensor sizes strict
-        current_entities = 2 * N
-        target_entities = 2 * MAX_CAPACITY
+        exp_goals_idx = topk_goals_idx.unsqueeze(-1).expand(-1, -1, -1, self.feature_dim)
+        gathered_goals = torch.gather(graph_goals, dim=2, index=exp_goals_idx)
         
-        if current_entities < target_entities:
-            padding = torch.zeros((B, N, target_entities - current_entities, self.feature_dim), device=self.device)
-            # Ensure padded nodes are distinctly marked as inactive
-            padding[..., 6] = 0.0 
+        # 9. Apply Velocity strictly to Ego (Guaranteed to be at index 0 because of -1e9)
+        gathered_agents[:, :, 0, 2:4] = vel 
+        
+        # 10. APPLY THE RADIUS MASK
+        # Ego and Goal easily pass this check because their distance is -1e9.
+        gathered_agents[..., 6] = (dist_agents_sorted <= radius).float()
+        gathered_goals[..., 6] = (dist_goals_sorted <= radius).float()
+        
+        graph = torch.cat([gathered_agents, gathered_goals], dim=2) 
+        
+        # 11. Zero-Padding if env size N < MAX_CAPACITY
+        if actual_k < MAX_CAPACITY:
+            padding = torch.zeros((B, N, 2 * (MAX_CAPACITY - actual_k), self.feature_dim), device=self.device)
             graph = torch.cat([graph, padding], dim=2)
             
         return graph.reshape(self.num_envs, -1)
@@ -729,21 +1099,60 @@ if __name__ == "__main__":
 
     n_max = args.n_max * 2
 
-    agent = GraphAgent(
-        envs=envs, 
-        n_max=n_max, 
-        num_agents=num_agents_per_game
+    # agent = PointNetAgent(
+    #     envs.single_action_space, 
+    #     envs.single_observation_space.shape, 
+    #     num_agents_per_game, 
+    #     state_dim=state_dim, 
+    #     n_max=n_max
+    # ).to(device)
+
+    # agent = MappoAgent(
+    #     envs.single_action_space, 
+    #     envs.single_observation_space.shape, 
+    #     num_agents_per_game, 
+    #     state_dim=state_dim, 
+    #     n_max=n_max
+    # ).to(device)
+
+    agent = TransformerAgent(
+        envs.single_action_space, 
+        envs.single_observation_space.shape, 
+        num_agents_per_game, 
+        state_dim=state_dim, 
+        n_max=args.n_max * 2
     ).to(device)
 
     optimizer = optim.Adam([
-            {'params': list(agent.backbone.parameters()) + 
-                       list(agent.actor_mlp.parameters()) + 
+            {'params': list(agent.actor.parameters()) + 
                        list(agent.actor_mean.parameters()) + 
                        [agent.actor_logstd], 'lr': 3e-4}, 
             
-            {'params': list(agent.critic_mlp.parameters()) + 
+            {'params': list(agent.critic_encoder.parameters()) + 
                        list(agent.critic_popart.parameters()), 'lr': 1e-3} 
         ], eps=1e-5)
+
+    # agent = GraphAgent(
+    #     envs=envs, 
+    #     n_max=n_max, 
+    #     num_agents=num_agents_per_game
+    # ).to(device)
+
+    # optimizer = optim.Adam([
+    #         {'params': list(agent.backbone.parameters()) + 
+    #                    list(agent.actor_mlp.parameters()) + 
+    #                    list(agent.actor_mean.parameters()) + 
+    #                    [agent.actor_logstd], 'lr': 3e-4}, 
+            
+    #         {'params': list(agent.critic_mlp.parameters()) + 
+    #                    list(agent.critic_popart.parameters()), 'lr': 1e-3} 
+    #     ], eps=1e-5)
+
+    optimizer = optim.Adam([
+        {'params': agent.get_actor_parameters(), 'lr': 3e-4}, 
+        {'params': list(agent.critic_encoder.parameters()) + 
+                    list(agent.critic_popart.parameters()), 'lr': 1e-3} 
+    ], eps=1e-5)
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, actual_num_envs) + envs.single_observation_space.shape).to(device)
