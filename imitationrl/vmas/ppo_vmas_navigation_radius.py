@@ -483,7 +483,7 @@ class GraphAgent(nn.Module):
             
         return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), values.view(-1, 1)
 
-class MappoAgent(nn.Module):
+class MAPPOAgent(nn.Module):
     def __init__(self, single_action_space, single_obs_shape, num_agents, state_dim, n_max=10):
         super().__init__()
         self.num_agents = num_agents
@@ -745,27 +745,48 @@ class TransformerAgent(nn.Module):
 
     def _forward_actor_backbone(self, x_norm):
         B = x_norm.shape[0]
+        # Reshape into [Batch, Nodes, Features]
         tokens = x_norm.view(B, self.n_max_nodes, self.feature_dim)
-        key_padding_mask = (tokens[:, :, 6] < 0.5)
         
-        # --- UPGRADE: Euclidean Attention Biasing ---
-        # 1. Extract physical relative coordinates [dx, dy] for all 2K tokens
+        # 1. Identify padded tokens (True if padded)
+        key_padding_mask = (tokens[:, :, 6] < 0.5) 
+        
+        # --- Euclidean Attention Biasing ---
         pos = tokens[:, :, 0:2] # [B, 2K, 2]
         
-        # 2. Calculate Pairwise Euclidean Distance Matrix [B, 1, 2K, 2K]
-        pos_i = pos.unsqueeze(2) # [B, 2K, 1, 2]
-        pos_j = pos.unsqueeze(1) # [B, 1, 2K, 2]
+        # Calculate Pairwise Euclidean Distance Matrix [B, 1, 2K, 2K]
+        pos_i = pos.unsqueeze(2) 
+        pos_j = pos.unsqueeze(1) 
         dist_matrix = torch.norm(pos_i - pos_j, dim=-1, keepdim=True).permute(0, 3, 1, 2)
         
-        # 3. Apply per-head learnable spatial scaling: (-gamma_h * distance) -> [B, nhead, 2K, 2K]
-        scaled_dist = -torch.abs(self.geom_scale) * dist_matrix
+        # Apply per-head learnable spatial scaling
+        scaled_dist = -torch.abs(self.geom_scale) * dist_matrix # [B, nhead, 2K, 2K]
         
-        # 4. Reshape to [B * nhead, 2K, 2K] as required by PyTorch nn.TransformerEncoder
-        geom_mask = scaled_dist.view(B * self.nhead, self.n_max_nodes, self.n_max_nodes)
+        # --- THE FIX: SELF-ATTENDING PADDING MASK ---
+        # Initialize an additive float mask 
+        float_padding = torch.zeros(B, self.n_max_nodes, device=x_norm.device)
         
-        # Pass tokens AND the geometric distance kernel into the Transformer
+        # Use -1e9 instead of -inf to avoid hardware fast-path NaNs
+        float_padding[key_padding_mask] = -1e9 
+        
+        # Expand across queries and heads to match the attention matrix [B, nhead, 2K, 2K]
+        float_padding = float_padding.unsqueeze(1).unsqueeze(2).expand(B, self.nhead, self.n_max_nodes, self.n_max_nodes).clone()
+        
+        # CRITICAL: Allow padded nodes to attend to themselves to prevent Softmax division by zero (NaN)
+        diag_idx = torch.arange(self.n_max_nodes, device=x_norm.device)
+        float_padding[:, :, diag_idx, diag_idx] = 0.0
+        
+        # Combine the geometric mask and the padding mask
+        combined_mask = scaled_dist + float_padding
+        
+        # Reshape for PyTorch Transformer [B * nhead, 2K, 2K]
+        geom_mask = combined_mask.view(B * self.nhead, self.n_max_nodes, self.n_max_nodes)
+        # --------------------------------------------
+        
         h = self.token_proj(tokens)
-        out = self.transformer(h, mask=geom_mask, src_key_padding_mask=key_padding_mask)
+        
+        # Pass ONLY the combined float mask. Drop src_key_padding_mask entirely.
+        out = self.transformer(h, mask=geom_mask)
         
         # Tri-Token Concatenation
         ego_final = out[:, 0, :]
@@ -923,13 +944,21 @@ class VMASVectorizedEnv:
         gathered_agents[..., 6] = (dist_agents_sorted <= radius).float()
         gathered_goals[..., 6] = (dist_goals_sorted <= radius).float()
         
+        # 11. ZERO-PADDING FIX
+        if actual_k < MAX_CAPACITY:
+            pad_size = MAX_CAPACITY - actual_k
+            padding = torch.zeros((B, N, pad_size, self.feature_dim), device=self.device)
+            
+            # Push padded "ghost" nodes 100 meters away and deactivate them
+            padding[..., 0:2] = 100.0 
+            padding[..., 6] = 0.0 
+            
+            # Pad agents and goals SEPARATELY to preserve strict index boundaries
+            gathered_agents = torch.cat([gathered_agents, padding.clone()], dim=2)
+            gathered_goals = torch.cat([gathered_goals, padding.clone()], dim=2)
+            
         graph = torch.cat([gathered_agents, gathered_goals], dim=2) 
         
-        # 11. Zero-Padding if env size N < MAX_CAPACITY
-        if actual_k < MAX_CAPACITY:
-            padding = torch.zeros((B, N, 2 * (MAX_CAPACITY - actual_k), self.feature_dim), device=self.device)
-            graph = torch.cat([graph, padding], dim=2)
-            
         return graph.reshape(self.num_envs, -1)
 
     def reset(self, seed=None):
@@ -1120,23 +1149,23 @@ if __name__ == "__main__":
         envs.single_observation_space.shape, 
         num_agents_per_game, 
         state_dim=state_dim, 
-        n_max=args.n_max * 2
+        n_max=n_max
     ).to(device)
-
-    optimizer = optim.Adam([
-            {'params': list(agent.actor.parameters()) + 
-                       list(agent.actor_mean.parameters()) + 
-                       [agent.actor_logstd], 'lr': 3e-4}, 
-            
-            {'params': list(agent.critic_encoder.parameters()) + 
-                       list(agent.critic_popart.parameters()), 'lr': 1e-3} 
-        ], eps=1e-5)
 
     # agent = GraphAgent(
     #     envs=envs, 
     #     n_max=n_max, 
     #     num_agents=num_agents_per_game
     # ).to(device)
+
+    # optimizer = optim.Adam([
+    #             {'params': list(agent.actor.parameters()) + 
+    #                        list(agent.actor_mean.parameters()) + 
+    #                        [agent.actor_logstd], 'lr': 3e-4}, 
+                
+    #             {'params': list(agent.critic_encoder.parameters()) + 
+    #                        list(agent.critic_popart.parameters()), 'lr': 1e-3} 
+    #         ], eps=1e-5)
 
     # optimizer = optim.Adam([
     #         {'params': list(agent.backbone.parameters()) + 

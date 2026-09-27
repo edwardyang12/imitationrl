@@ -12,7 +12,7 @@ import json
 # Import the architecture and environment wrapper directly from your training script
 # from ppo_vmas_navigation_gnn import GraphAgent, VMASVectorizedEnv
 # from ppo_vmas_navigation_mappo import Agent, TransformerAgent, PointNetAgent, VMASVectorizedEnv
-from ppo_vmas_navigation_radius import MAPPOAgent, PointNetAgent, GraphAgent, VMASVectorizedEnv
+from ppo_vmas_navigation_radius import MAPPOAgent, TransformerAgent, PointNetAgent, GraphAgent, VMASVectorizedEnv
 
 class BehavioralMetricTracker:
     def __init__(self, num_games, num_agents, agent_radius=0.1, contact_threshold=0.20, goal_tolerance=0.25):
@@ -294,28 +294,37 @@ def parse_harvest_args():
 
 def load_oracle_model(args, envs, device):
     state_dim = envs.num_agents * np.array(envs.single_observation_space.shape).prod()
-
-    oracle = MAPPOAgent(
-        envs.single_action_space, 
-        envs.single_observation_space.shape, 
-        envs.num_agents, 
-        state_dim=state_dim, 
-        n_max=args.n_max
-    ).to(device)
-
-    # oracle = PointNetAgent(
+    
+    n_max = args.n_max * 2
+    # oracle = MAPPOAgent(
     #     envs.single_action_space, 
     #     envs.single_observation_space.shape, 
-    #     num_agents = envs.num_agents, 
+    #     envs.num_agents, 
     #     state_dim=state_dim, 
-    #     n_max=args.n_max
+    #     n_max=n_max
     # ).to(device)
-    
-    oracle = GraphAgent(
-        envs=envs, 
-        n_max=args.n_max, 
-        num_agents=envs.num_agents
+
+    # oracle = TransformerAgent(
+    #     envs.single_action_space, 
+    #     envs.single_observation_space.shape, 
+    #     envs.num_agents, 
+    #     state_dim=state_dim, 
+    #     n_max=n_max
+    # ).to(device)
+
+    oracle = PointNetAgent(
+        envs.single_action_space, 
+        envs.single_observation_space.shape, 
+        num_agents = envs.num_agents, 
+        state_dim=state_dim, 
+        n_max=n_max
     ).to(device)
+    
+    # oracle = GraphAgent(
+    #     envs=envs, 
+    #     n_max=n_max, 
+    #     num_agents=envs.num_agents
+    # ).to(device)
     
     print(f"Loading Oracle weights from {args.model_path}...")
     state_dict = torch.load(args.model_path, map_location=device, weights_only=True)
@@ -327,6 +336,7 @@ def load_oracle_model(args, envs, device):
             
     oracle.load_state_dict(state_dict, strict=False)
     oracle.eval()
+    # oracle.train()
     return oracle
 
 def get_action(oracle, obs):

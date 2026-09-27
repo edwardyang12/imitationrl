@@ -240,7 +240,8 @@ def load_oracle_model(args, envs, device):
             del state_dict[k]
             
     oracle.load_state_dict(state_dict, strict=False)
-    oracle.train() # for transformer this needs to be train() and not eval()
+    oracle.eval()
+    # oracle.train() # for transformer this needs to be train() and not eval()
     return oracle
 
 def get_action(oracle, obs):
