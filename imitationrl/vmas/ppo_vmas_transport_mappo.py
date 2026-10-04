@@ -663,15 +663,26 @@ class VMASVectorizedEnv:
         rel_vel = all_vel.unsqueeze(1) - ego_vel   # (B, N, total_entities, 2)
         
         # 3. K-Nearest Neighbors selection with priority distance masking
+        distances = torch.norm(rel_pos, dim=-1)    # (B, N, total_entities)
+        
         batch_idx = torch.arange(B, device=self.device).view(B, 1).expand(B, N)
         ego_idx = torch.arange(N, device=self.device).view(1, N).expand(B, N)
-        distances[batch_idx, ego_idx, ego_idx] = -1e9 # Force Ego inclusion
         
-        if P > 0:
-            distances[:, :, N : N + P] -= 1e8 # Heavily prioritize Packages
+        # 1. Permanently anchor Ego to Index 0
+        distances[batch_idx, ego_idx, ego_idx] = -1e10 
+        
+        # 2. Anchor Goals to Index 1 (Highest Priority)
         if G > 0:
-            distances[:, :, N + P : N + P + G] -= 1e7 # Prioritize Goals next
-            
+            for g_idx in range(G):
+                distances[:, :, N + P + g_idx] -= 1e9 - (g_idx * 1e8)
+                
+        # 3. Anchor Packages AFTER the Goal
+        if P > 0:
+            for p_idx in range(P):
+                distances[:, :, N + p_idx] -= 1e7 - (p_idx * 1e6)
+                
+        # 4. Teammates receive NO offset and naturally sort by physical distance.
+        
         actual_k = min(K, total_entities)
         _, topk_idx = torch.topk(distances, k=actual_k, dim=-1, largest=False)
         

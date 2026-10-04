@@ -34,7 +34,7 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="vmas-navigation-radius",
+    parser.add_argument("--wandb-project-name", type=str, default="vmas-navigation-lidar",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
@@ -44,7 +44,7 @@ def parse_args():
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="navigation",
         help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=300000000,
+    parser.add_argument("--total-timesteps", type=int, default=200000000,
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=7e-4,
         help="the learning rate of the optimizer")
@@ -82,7 +82,8 @@ def parse_args():
         help="number of agents and landmarks")
     parser.add_argument("--max-cycles", type=int, default=250,
         help="length of environment run")
-    parser.add_argument("--n-max", type=int, default=5, help="Fixed context window size for the GNN")
+    parser.add_argument("--lidar-rays", type=int, default=16, 
+        help="Number of rays in the LIDAR sensor")
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -91,16 +92,18 @@ def parse_args():
 
 class NavigationCleanObs(BaseNavigation):
     def observation(self, agent):
-        # 1. Base kinematics (Ego Agent)
         obs = [agent.state.pos, agent.state.vel]
         
-        # 2. Assigned Goal ONLY (Removes the distractors)
-        obs.append(agent.state.pos - agent.goal.state.pos)
-            
-        # 3. Relative Teammates (Position ONLY, respecting original info bounds)
-        for a in self.world.agents:
-            if a != agent:
-                obs.append(a.state.pos - agent.state.pos)
+        # Target - Source geometry (pointing from Agent to Goal)
+        obs.append(agent.goal.state.pos - agent.state.pos)
+        
+        # Extract Raycast directly from the sensor attached by the base scenario
+        if len(agent.sensors) > 0:
+            # We must invert the distance here because navigation.py automatically 
+            # inverts it in its default observation hook (max_range - measure).
+            # This ensures your point cloud parser receives the true distances.
+            raw_measure = agent.sensors[0].measure()
+            obs.append(raw_measure)
                 
         return torch.cat(obs, dim=-1)
 
@@ -849,6 +852,8 @@ class VMASVectorizedEnv:
         self.num_envs = self.num_games * self.num_agents
         self.run_name = run_name
         self.update_step = update_step
+        self.lidar_rays = args.lidar_rays
+        self.num_nodes = self.lidar_rays + 2
         
         self.env = vmas.make_env(
             scenario=NavigationCleanObs() if args.env_id == "navigation" else args.env_id,
@@ -862,14 +867,16 @@ class VMASVectorizedEnv:
             dict_spaces=False,
             world_spawning_x=2.5,
             world_spawning_y=2.5,
-            enforce_bounds=True
+            enforce_bounds=True,
+            # The critical fix: Pass the exact kwarg expected by navigation.py
+            n_lidar_rays=self.lidar_rays,
+            lidar_range=5.0
         )
         
         self.single_action_space = self.env.action_space[0]
-        self.n_max = args.n_max
         self.feature_dim = 9
         
-        target_dim = self.n_max * self.feature_dim * 2
+        target_dim = self.num_nodes * self.feature_dim
         self.single_observation_space = gym.spaces.Box(low=-np.inf, high=np.inf, shape=(target_dim,))
         
         self.episode_returns = torch.zeros(self.num_envs, device=self.device)
@@ -878,95 +885,43 @@ class VMASVectorizedEnv:
         self.record_this_episode = self.args.capture_video
         self.video_frames = []
 
-    def _apply_graph_formatting(self, stacked_vmas_obs):
+    def _apply_lidar_point_cloud(self, stacked_vmas_obs):
         B = self.num_games
         N = self.num_agents
+        R = self.lidar_rays 
         
-        MAX_CAPACITY = self.args.n_max 
-        radius = 1.5
+        vel = stacked_vmas_obs[:, :, 2:4]
+        goal_rel = stacked_vmas_obs[:, :, 4:6]
+        lidar = stacked_vmas_obs[:, :, 6:6+R]
         
-        # 1. Extract raw absolute positions and velocities
-        abs_pos = stacked_vmas_obs[:, :, 0:2] 
-        vel = stacked_vmas_obs[:, :, 2:4]     
-        ego_to_goal = stacked_vmas_obs[:, :, 4:6] 
+        angles = torch.linspace(-math.pi, math.pi, R, device=self.device)
+        x = lidar * torch.cos(angles).view(1, 1, R)
+        y = lidar * torch.sin(angles).view(1, 1, R)
+        lidar_rel_pos = torch.stack([x, y], dim=-1) 
         
-        # 2. Reconstruct absolute positions of ALL goals
-        goal_abs = abs_pos - ego_to_goal 
+        hit_mask = lidar < 4.99 
         
-        # 3. Calculate Relative Positions independently
-        ego_pos = abs_pos.unsqueeze(2) 
-        rel_agents = abs_pos.unsqueeze(1) - ego_pos 
-        rel_goals = goal_abs.unsqueeze(1) - ego_pos 
+        ego_nodes = torch.zeros((B, N, 1, self.feature_dim), device=self.device)
+        ego_nodes[..., 2:4] = vel.unsqueeze(2) 
+        ego_nodes[..., 4] = 1.0 
+        ego_nodes[..., 6] = 1.0 
+        ego_nodes[..., 7] = self.episode_tags.unsqueeze(2)
         
-        # 4. Calculate Distances
-        dist_agents = torch.norm(rel_agents, dim=-1) 
-        dist_goals = torch.norm(rel_goals, dim=-1) 
+        goal_nodes = torch.zeros((B, N, 1, self.feature_dim), device=self.device)
+        goal_nodes[..., 0:2] = goal_rel.unsqueeze(2) # Make sure this is Target - Source geometry if updated
+        goal_nodes[..., 5] = 1.0 
+        goal_nodes[..., 6] = 1.0 
+        goal_nodes[..., 7] = self.episode_tags.unsqueeze(2) 
+        goal_nodes[..., 8] = 1.0 
         
-        # 5. THE SURVIVAL OVERRIDE
-        # Force Ego and Assigned Goal distances to -infinity so they are ALWAYS sorted to the top
-        batch_idx = torch.arange(B, device=self.device).view(B, 1).expand(B, N)
-        ego_idx = torch.arange(N, device=self.device).view(1, N).expand(B, N)
+        obs_nodes = torch.zeros((B, N, R, self.feature_dim), device=self.device)
+        obs_nodes[..., 0:2] = lidar_rel_pos
+        obs_nodes[..., 6] = hit_mask.float() 
         
-        dist_agents[batch_idx, ego_idx, ego_idx] = -1e9
-        dist_goals[batch_idx, ego_idx, ego_idx] = -1e9 
-        
-        # 6. MEMORY PRIORITIZATION (Sort by distance to ensure closest neighbors make the capacity cut)
-        actual_k = min(MAX_CAPACITY, N) 
-        dist_agents_sorted, topk_agents_idx = torch.topk(dist_agents, k=actual_k, dim=-1, largest=False) 
-        dist_goals_sorted, topk_goals_idx = torch.topk(dist_goals, k=actual_k, dim=-1, largest=False) 
-        
-        is_self_matrix = torch.eye(N, device=self.device).view(1, N, N)
-        
-        # 7. Build the Dense Feature Matrices for ALL N entities
-        graph_agents = torch.zeros((B, N, N, self.feature_dim), device=self.device)
-        graph_agents[..., 0:2] = rel_agents
-        graph_agents[..., 4] = is_self_matrix 
-        graph_agents[..., 7] = self.episode_tags.unsqueeze(1).expand(B, N, N)
-        
-        graph_goals = torch.zeros((B, N, N, self.feature_dim), device=self.device)
-        graph_goals[..., 0:2] = rel_goals
-        graph_goals[..., 5] = 1.0 
-        graph_goals[..., 7] = self.episode_tags.unsqueeze(1).expand(B, N, N)
-        graph_goals[..., 8] = is_self_matrix 
-        
-        # 8. Gather ONLY the Top-K prioritized entities
-        exp_agents_idx = topk_agents_idx.unsqueeze(-1).expand(-1, -1, -1, self.feature_dim)
-        gathered_agents = torch.gather(graph_agents, dim=2, index=exp_agents_idx)
-        
-        exp_goals_idx = topk_goals_idx.unsqueeze(-1).expand(-1, -1, -1, self.feature_dim)
-        gathered_goals = torch.gather(graph_goals, dim=2, index=exp_goals_idx)
-        
-        # 9. Apply Velocity strictly to Ego (Guaranteed to be at index 0 because of -1e9)
-        gathered_agents[:, :, 0, 2:4] = vel 
-
-        # graph = torch.cat([gathered_agents, gathered_goals], dim=2) 
-        
-        # # 11. Zero-Padding if env size N < MAX_CAPACITY
-        # if actual_k < MAX_CAPACITY:
-        #     padding = torch.zeros((B, N, 2 * (MAX_CAPACITY - actual_k), self.feature_dim), device=self.device)
-        #     graph = torch.cat([graph, padding], dim=2)
-        
-        # 10. APPLY THE RADIUS MASK
-        # Ego and Goal easily pass this check because their distance is -1e9.
-        gathered_agents[..., 6] = (dist_agents_sorted <= radius).float()
-        gathered_goals[..., 6] = (dist_goals_sorted <= radius).float()
-        
-        # 11. ZERO-PADDING FIX
-        if actual_k < MAX_CAPACITY:
-            pad_size = MAX_CAPACITY - actual_k
-            padding = torch.zeros((B, N, pad_size, self.feature_dim), device=self.device)
+        # Concatenate and return directly. No distance sorting or cropping needed!
+        all_nodes = torch.cat([ego_nodes, goal_nodes, obs_nodes], dim=2) 
             
-            # Push padded "ghost" nodes 100 meters away and deactivate them
-            padding[..., 0:2] = 100.0 
-            padding[..., 6] = 0.0 
-            
-            # Pad agents and goals SEPARATELY to preserve strict index boundaries
-            gathered_agents = torch.cat([gathered_agents, padding.clone()], dim=2)
-            gathered_goals = torch.cat([gathered_goals, padding.clone()], dim=2)
-            
-        graph = torch.cat([gathered_agents, gathered_goals], dim=2) 
-        
-        return graph.reshape(self.num_envs, -1)
+        return all_nodes.reshape(self.num_envs, -1)
 
     def reset(self, seed=None):
         if seed is not None:
@@ -980,7 +935,7 @@ class VMASVectorizedEnv:
         self.episode_tags = torch.rand((self.num_games, self.num_agents), device=self.device)
         
         stacked_obs = torch.stack(vmas_obs, dim=1)
-        final_obs = self._apply_graph_formatting(stacked_obs)
+        final_obs = self._apply_lidar_point_cloud(stacked_obs)
             
         return final_obs, {"raw_obs": stacked_obs.reshape(self.num_envs, -1)}
 
@@ -1017,7 +972,7 @@ class VMASVectorizedEnv:
         # ----------------------------
 
         stacked_obs = torch.stack(vmas_obs, dim=1)
-        final_obs = self._apply_graph_formatting(stacked_obs)
+        final_obs = self._apply_lidar_point_cloud(stacked_obs)
         
         is_done = self.step_count >= self.args.max_cycles
         
@@ -1056,7 +1011,7 @@ class VMASVectorizedEnv:
             
             self.episode_tags = torch.rand((self.num_games, self.num_agents), device=self.device)
             stacked_obs = torch.stack(vmas_obs, dim=1)
-            final_obs = self._apply_graph_formatting(stacked_obs)
+            final_obs = self._apply_lidar_point_cloud(stacked_obs)
             info["raw_obs"] = stacked_obs.reshape(self.num_envs, -1)
                 
         return final_obs, rewards, terminations, truncations, info
@@ -1133,22 +1088,22 @@ if __name__ == "__main__":
         # Fallback for Atari or environments without a God-view state
         state_dim = num_agents_per_game * np.array(envs.single_observation_space.shape).prod()
 
-    n_max = args.n_max * 2
+    num_nodes = args.lidar_rays + 2
 
     # agent = PointNetAgent(
     #     envs.single_action_space, 
     #     envs.single_observation_space.shape, 
     #     num_agents_per_game, 
     #     state_dim=state_dim, 
-    #     n_max=n_max
+    #     n_max=num_nodes
     # ).to(device)
 
-    # agent = MappoAgent(
+    # agent = MAPPOAgent(
     #     envs.single_action_space, 
     #     envs.single_observation_space.shape, 
     #     num_agents_per_game, 
     #     state_dim=state_dim, 
-    #     n_max=n_max
+    #     n_max=num_nodes
     # ).to(device)
 
     # agent = TransformerAgent(
@@ -1156,12 +1111,12 @@ if __name__ == "__main__":
     #     envs.single_observation_space.shape, 
     #     num_agents_per_game, 
     #     state_dim=state_dim, 
-    #     n_max=n_max
+    #     n_max=num_nodes
     # ).to(device)
 
     agent = GraphAgent(
         envs=envs, 
-        n_max=n_max, 
+        n_max=num_nodes, 
         num_agents=num_agents_per_game
     ).to(device)
 

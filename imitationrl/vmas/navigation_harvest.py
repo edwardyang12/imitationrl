@@ -12,7 +12,8 @@ import json
 # Import the architecture and environment wrapper directly from your training script
 # from ppo_vmas_navigation_gnn import GraphAgent, VMASVectorizedEnv
 # from ppo_vmas_navigation_mappo import Agent, TransformerAgent, PointNetAgent, VMASVectorizedEnv
-from ppo_vmas_navigation_radius import MAPPOAgent, TransformerAgent, PointNetAgent, GraphAgent, VMASVectorizedEnv
+# from ppo_vmas_navigation_radius import MAPPOAgent, TransformerAgent, PointNetAgent, GraphAgent, VMASVectorizedEnv
+from ppo_vmas_navigation_lidar import MAPPOAgent, TransformerAgent, PointNetAgent, GraphAgent, VMASVectorizedEnv
 
 class BehavioralMetricTracker:
     def __init__(self, num_games, num_agents, agent_radius=0.1, contact_threshold=0.20, goal_tolerance=0.25):
@@ -271,6 +272,7 @@ def parse_harvest_args():
     parser.add_argument("--model-path", type=str, required=True)
     parser.add_argument("--num-landmarks", type=int, default=7)
     parser.add_argument("--n-max", type=int, default=16)
+    parser.add_argument("--lidar-rays", type=int, default=16)
     parser.add_argument("--num-trajectories", type=int, default=500000)
     parser.add_argument("--chunk-size", type=int, default=100000)
     parser.add_argument("--seed", type=int, default=42)
@@ -295,7 +297,8 @@ def parse_harvest_args():
 def load_oracle_model(args, envs, device):
     state_dim = envs.num_agents * np.array(envs.single_observation_space.shape).prod()
     
-    n_max = args.n_max * 2
+    # n_max = args.n_max * 2
+    n_max = args.lidar_rays + 2
     # oracle = MAPPOAgent(
     #     envs.single_action_space, 
     #     envs.single_observation_space.shape, 
