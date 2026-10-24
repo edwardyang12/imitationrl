@@ -263,6 +263,56 @@ def plot_package_comparison(df, n_train, output_dir="plots_transport"):
     plt.close()
 
 # ---------------------------------------------------------
+# Graph 5: The "Straggler" Effect (Load-Balancing vs Clumping)
+# ---------------------------------------------------------
+def plot_straggler_emergence(df, n_packages, output_dir="plots_transport"):
+    """
+    Isolates how N_train alters the swarm's propensity to 'loiter' (straggling) 
+    versus crowding the objective, and the resulting collision penalty.
+    """
+    # Filter out MLP since its failure state skews the physical mechanics, 
+    # and isolate the target package count.
+    valid_models = [m for m in df['Model'].unique() if 'MLP' not in m]
+    df_mech = df[(df['Packages'] == n_packages) & (df['Model'].isin(valid_models))].copy()
+    
+    if df_mech.empty:
+        return
+
+    # Convert N_train to categorical for clean legend grouping
+    df_mech['Training_Density'] = "N_train = " + df_mech['N_train'].astype(str)
+    df_mech = df_mech.sort_values(by=['N_train', 'Model'])
+
+    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    
+    # We use a sequential palette where light/cool = Low N_train, dark/warm = High N_train
+    palette = sns.color_palette("flare", n_colors=df_mech['N_train'].nunique())
+
+    # Plot 1: Engagement Rate (Proof of the "Straggler" load-balancing)
+    sns.lineplot(data=df_mech, x='N_test', y='Active_Engagement_Rate_Mean', 
+                 hue='Training_Density', style='Model', palette=palette, 
+                 markers=True, dashes=False, linewidth=2, ax=axes[0])
+    axes[0].set_title(f'Emergent Load Balancing: Engagement Rate (P={n_packages})')
+    axes[0].set_xlabel('Test Population Density (N_test)')
+    axes[0].set_ylabel('Agent Engagement Rate (Lower = More Stragglers)')
+    axes[0].grid(True, linestyle='--', alpha=0.5)
+
+    # Plot 2: Collision Rate (The consequence of over-engagement)
+    sns.lineplot(data=df_mech, x='N_test', y='Active_Collision_Rate_Mean', 
+                 hue='Training_Density', style='Model', palette=palette, 
+                 markers=True, dashes=False, linewidth=2, ax=axes[1])
+    axes[1].set_title(f'Physical Clumping: Collision Penalty (P={n_packages})')
+    axes[1].set_xlabel('Test Population Density (N_test)')
+    axes[1].set_ylabel('Active Collision Rate (Lower is Better)')
+    axes[1].grid(True, linestyle='--', alpha=0.5)
+
+    plt.suptitle('The Free-Rider Tradeoff: High N_train Induces Space-Yielding to Prevent Gridlock', y=1.05, fontsize=14, fontweight='bold')
+    plt.tight_layout()
+    
+    os.makedirs(output_dir, exist_ok=True)
+    plt.savefig(os.path.join(output_dir, f'5_Straggler_Emergence_P{n_packages}.pdf'), bbox_inches='tight')
+    plt.close()
+
+# ---------------------------------------------------------
 # Main Execution
 # ---------------------------------------------------------
 if __name__ == "__main__":
@@ -270,7 +320,6 @@ if __name__ == "__main__":
     parser.add_argument("--data-dir", type=str, default=".", help="Directory containing CSVs")
     parser.add_argument("--output-dir", type=str, default="plots_transport", help="Directory for PDFs")
     parser.add_argument("--baseline-ntrain", type=int, default=30, help="N_train value for line graphs")
-    parser.add_argument("--baseline-packages", type=int, default=1, help="Package count for base line graphs")
     
     args = parser.parse_args()
     
@@ -281,15 +330,24 @@ if __name__ == "__main__":
         print(f"Error loading data: {e}")
         exit()
         
-    print(f"Generating Graph 1: Scaling / Survival Curves (P={args.baseline_packages})...")
-    plot_scaling_curves(metrics_df, args.baseline_ntrain, args.baseline_packages, args.output_dir)
-    
-    print(f"Generating Graph 2: Phase Diagrams (P={args.baseline_packages})...")
-    plot_phase_diagrams(metrics_df, args.baseline_packages, args.output_dir)
-    
-    print(f"Generating Graph 3: Behavioral Breakdown Curves (P={args.baseline_packages})...")
-    plot_behavioral_breakdowns(metrics_df, args.baseline_ntrain, args.baseline_packages, args.output_dir)
+    # We loop through both P=1 and P=2 to generate the full suite of comparisons
+    for p_count in [1, 2]:
+        if p_count in metrics_df['Packages'].values:
+            print(f"\n--- Generating Graphs for P={p_count} ---")
+            
+            print(f"Generating Graph 1: Scaling / Survival Curves...")
+            plot_scaling_curves(metrics_df, args.baseline_ntrain, p_count, args.output_dir)
+            
+            print(f"Generating Graph 2: Phase Diagrams...")
+            plot_phase_diagrams(metrics_df, p_count, args.output_dir)
+            
+            print(f"Generating Graph 3: Behavioral Breakdowns...")
+            plot_behavioral_breakdowns(metrics_df, args.baseline_ntrain, p_count, args.output_dir)
+            
+            print(f"Generating Graph 5: Straggler Emergence Analysis...")
+            plot_straggler_emergence(metrics_df, p_count, args.output_dir)
 
+    print("\n--- Generating Cross-Package Comparisons ---")
     print("Generating Graph 4: 1 vs 2 Package Scaling Comparison...")
     plot_package_comparison(metrics_df, args.baseline_ntrain, args.output_dir)
     

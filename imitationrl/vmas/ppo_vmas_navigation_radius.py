@@ -34,7 +34,7 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="vmas-navigation-radius",
+    parser.add_argument("--wandb-project-name", type=str, default="vmas-navigation-radius-ablate",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
@@ -44,7 +44,7 @@ def parse_args():
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="navigation",
         help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=300000000,
+    parser.add_argument("--total-timesteps", type=int, default=200000000,
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=7e-4,
         help="the learning rate of the optimizer")
@@ -174,7 +174,7 @@ class MultiHeadGATBackbone(nn.Module):
         self.skip_proj = nn.Linear(feature_dim, hidden_dim * heads)
         self.elu = nn.ELU()
 
-    def _build_fc_dynamic_graph(self, x_flat, radius=1.5):
+    def _build_fc_dynamic_graph(self, x_flat, radius=0.3):
         B = x_flat.shape[0]
         device = x_flat.device
         
@@ -273,7 +273,7 @@ class FairVectorGCNBackbone(nn.Module):
         self.skip_proj = nn.Linear(feature_dim, wide_dim)
         self.elu = nn.ELU()
 
-    def _build_fc_dynamic_graph(self, x_flat, radius=1.5):
+    def _build_fc_dynamic_graph(self, x_flat, radius=0.3):
         B = x_flat.shape[0]
         device = x_flat.device
         
@@ -883,7 +883,7 @@ class VMASVectorizedEnv:
         N = self.num_agents
         
         MAX_CAPACITY = self.args.n_max 
-        radius = 1.5
+        radius=0.3
         
         # 1. Extract raw absolute positions and velocities
         abs_pos = stacked_vmas_obs[:, :, 0:2] 
@@ -939,32 +939,43 @@ class VMASVectorizedEnv:
         # 9. Apply Velocity strictly to Ego (Guaranteed to be at index 0 because of -1e9)
         gathered_agents[:, :, 0, 2:4] = vel 
 
-        # graph = torch.cat([gathered_agents, gathered_goals], dim=2) 
-        
-        # # 11. Zero-Padding if env size N < MAX_CAPACITY
-        # if actual_k < MAX_CAPACITY:
-        #     padding = torch.zeros((B, N, 2 * (MAX_CAPACITY - actual_k), self.feature_dim), device=self.device)
-        #     graph = torch.cat([graph, padding], dim=2)
-        
         # 10. APPLY THE RADIUS MASK
         # Ego and Goal easily pass this check because their distance is -1e9.
         gathered_agents[..., 6] = (dist_agents_sorted <= radius).float()
         gathered_goals[..., 6] = (dist_goals_sorted <= radius).float()
-        
-        # 11. ZERO-PADDING FIX
-        if actual_k < MAX_CAPACITY:
-            pad_size = MAX_CAPACITY - actual_k
-            padding = torch.zeros((B, N, pad_size, self.feature_dim), device=self.device)
-            
-            # Push padded "ghost" nodes 100 meters away and deactivate them
-            padding[..., 0:2] = 100.0 
-            padding[..., 6] = 0.0 
-            
-            # Pad agents and goals SEPARATELY to preserve strict index boundaries
-            gathered_agents = torch.cat([gathered_agents, padding.clone()], dim=2)
-            gathered_goals = torch.cat([gathered_goals, padding.clone()], dim=2)
-            
+
         graph = torch.cat([gathered_agents, gathered_goals], dim=2) 
+        
+        # # 11. Zero-Padding if env size N < MAX_CAPACITY
+        if actual_k < MAX_CAPACITY:
+            padding = torch.zeros((B, N, 2 * (MAX_CAPACITY - actual_k), self.feature_dim), device=self.device)
+            graph = torch.cat([graph, padding], dim=2)
+        
+        # # 11. ZERO-PADDING FIX
+        # if actual_k < MAX_CAPACITY:
+        #     pad_size = MAX_CAPACITY - actual_k
+        #     padding = torch.zeros((B, N, pad_size, self.feature_dim), device=self.device)
+            
+        #     # Push padded "ghost" nodes 100 meters away and deactivate them
+        #     padding[..., 0:2] = 100.0 
+        #     padding[..., 6] = 0.0 
+            
+        #     # Pad agents and goals SEPARATELY to preserve strict index boundaries
+        #     gathered_agents = torch.cat([gathered_agents, padding.clone()], dim=2)
+        #     gathered_goals = torch.cat([gathered_goals, padding.clone()], dim=2)
+        # graph = torch.cat([gathered_agents, gathered_goals], dim=2) 
+
+        # 11. Zero-Padding if env size N < MAX_CAPACITY
+        # if actual_k < MAX_CAPACITY:
+        #     padding = torch.zeros((B, N, 2 * (MAX_CAPACITY - actual_k), self.feature_dim), device=self.device)
+            
+        #     # THE FIX: Push all padded "ghost" nodes 100 meters away
+        #     padding[..., 0:2] = 100.0 
+            
+        #     # Ensure padded nodes are distinctly marked as inactive
+        #     padding[..., 6] = 0.0 
+            
+        #     graph = torch.cat([graph, padding], dim=2)
         
         return graph.reshape(self.num_envs, -1)
 
@@ -1039,7 +1050,7 @@ class VMASVectorizedEnv:
                 imageio.mimsave(file_path, self.video_frames, fps=15)
                 self.video_frames = []
             
-            if self.args.capture_video and self.episode_count % 50 == 0:
+            if self.args.capture_video and self.episode_count % 30 == 0:
                 self.record_this_episode = True
             else:
                 self.record_this_episode = False

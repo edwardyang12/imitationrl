@@ -237,21 +237,21 @@ def load_oracle_model(args, envs, device):
     #         n_max=args.n_max
     #     ).to(device)
 
-    # oracle = TransformerAgent(
-    #         envs.single_action_space, 
-    #         envs.single_observation_space.shape, 
-    #         envs.num_agents,
-    #         state_dim=state_dim, 
-    #         n_max=args.n_max
-    #     ).to(device)
+    oracle = TransformerAgent(
+            envs.single_action_space, 
+            envs.single_observation_space.shape, 
+            envs.num_agents,
+            state_dim=state_dim, 
+            n_max=args.n_max
+        ).to(device)
 
-    oracle = PointNetAgent(
-        envs.single_action_space, 
-        envs.single_observation_space.shape, 
-        num_agents=envs.num_agents, 
-        state_dim=state_dim, 
-        n_max=args.n_max
-    ).to(device)
+    # oracle = PointNetAgent(
+    #     envs.single_action_space, 
+    #     envs.single_observation_space.shape, 
+    #     num_agents=envs.num_agents, 
+    #     state_dim=state_dim, 
+    #     n_max=args.n_max
+    # ).to(device)
 
     # oracle = GraphAgent(
     #     envs=envs, 

@@ -36,7 +36,7 @@ def parse_args():
         help="if toggled, cuda will be enabled by default")
     parser.add_argument("--track", type=lambda x: bool(strtobool(x)), default=False, nargs="?", const=True,
         help="if toggled, this experiment will be tracked with Weights and Biases")
-    parser.add_argument("--wandb-project-name", type=str, default="vmas-transport-mlp",
+    parser.add_argument("--wandb-project-name", type=str, default="vmas-transport-transformer",
         help="the wandb's project name")
     parser.add_argument("--wandb-entity", type=str, default=None,
         help="the entity (team) of wandb's project")
@@ -46,7 +46,7 @@ def parse_args():
     # Algorithm specific arguments
     parser.add_argument("--env-id", type=str, default="transport",
         help="the id of the environment")
-    parser.add_argument("--total-timesteps", type=int, default=500000000,
+    parser.add_argument("--total-timesteps", type=int, default=700000000,
         help="total timesteps of the experiments")
     parser.add_argument("--learning-rate", type=float, default=7e-4,
         help="the learning rate of the optimizer")
@@ -429,8 +429,7 @@ class TransformerAgent(nn.Module):
             dim_feedforward=d_model * 4, 
             batch_first=True, 
             activation='gelu', 
-            norm_first=True,
-            dropout=0.0
+            norm_first=True
         )
         self.transformer = nn.TransformerEncoder(
             encoder_layer, 
@@ -663,28 +662,20 @@ class VMASVectorizedEnv:
         rel_vel = all_vel.unsqueeze(1) - ego_vel   # (B, N, total_entities, 2)
         
         # 3. K-Nearest Neighbors selection with priority distance masking
-        distances = torch.norm(rel_pos, dim=-1)    # (B, N, total_entities)
-        
-        batch_idx = torch.arange(B, device=self.device).view(B, 1).expand(B, N)
-        ego_idx = torch.arange(N, device=self.device).view(1, N).expand(B, N)
-        
-        # 1. Permanently anchor Ego to Index 0
-        distances[batch_idx, ego_idx, ego_idx] = -1e10 
-        
-        # 2. Anchor Goals to Index 1 (Highest Priority)
-        if G > 0:
-            for g_idx in range(G):
-                distances[:, :, N + P + g_idx] -= 1e9 - (g_idx * 1e8)
-                
-        # 3. Anchor Packages AFTER the Goal
-        if P > 0:
-            for p_idx in range(P):
-                distances[:, :, N + p_idx] -= 1e7 - (p_idx * 1e6)
-                
-        # 4. Teammates receive NO offset and naturally sort by physical distance.
-        
-        actual_k = min(K, total_entities)
-        _, topk_idx = torch.topk(distances, k=actual_k, dim=-1, largest=False)
+        idx_list = []
+        for i in range(N):
+            teammates = [j for j in range(N) if j != i]
+            
+            # IMPORTANT NOTE: Swap the order so the Goal is strictly at Index 1 (immediately after Ego) ONLY FOR TRANSFORMER
+            # This aligns the semantic meaning of h[:, 1, :] with your Flocking/Navigation baselines.
+            seq = [i] + list(range(N + P, N + P + G)) + list(range(N, N + P)) + teammates
+            seq = seq[:K] # Truncate to fit n_max context window
+            
+            idx_list.append(seq)
+            
+        # Convert to tensor and expand to batch size: (B, N, actual_k)
+        topk_idx = torch.tensor(idx_list, device=self.device).unsqueeze(0).expand(B, -1, -1)
+        actual_k = topk_idx.shape[2]
         
         # 4. Build dense 11-dimensional feature matrix
         graph = torch.zeros((B, N, total_entities, self.feature_dim), device=self.device)
@@ -964,21 +955,21 @@ if __name__ == "__main__":
     #     n_max=args.n_max
     # ).to(device)
 
-    # agent = TransformerAgent(
-    #     envs.single_action_space, 
-    #     envs.single_observation_space.shape, 
-    #     num_agents_per_game, 
-    #     state_dim=state_dim, 
-    #     n_max=args.n_max
-    # ).to(device)
-
-    agent = PointNetAgent(
+    agent = TransformerAgent(
         envs.single_action_space, 
         envs.single_observation_space.shape, 
         num_agents_per_game, 
         state_dim=state_dim, 
         n_max=args.n_max
     ).to(device)
+
+    # agent = PointNetAgent(
+    #     envs.single_action_space, 
+    #     envs.single_observation_space.shape, 
+    #     num_agents_per_game, 
+    #     state_dim=state_dim, 
+    #     n_max=args.n_max
+    # ).to(device)
 
     # optimizer = optim.Adam([
     #         {'params': list(agent.actor.parameters()) + 
