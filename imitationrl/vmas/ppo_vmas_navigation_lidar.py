@@ -403,47 +403,118 @@ class GraphAgent(nn.Module):
         # The Variance Head
         self.actor_logstd = nn.Parameter(torch.full((1, self.action_dim), -0.5))
         
-        # FIX: Critic only sees the invariant graph (128) + density scalar (1)
-        critic_in_dim = (gat_out_dim * 3) + 1
+        # shared backbone
+        # critic_in_dim = (gat_out_dim * 3) + 1
+        # self.critic_mlp = nn.Sequential(
+        #     layer_init(nn.Linear(critic_in_dim, 256)),
+        #     nn.LayerNorm(256), nn.ReLU(),
+        #     layer_init(nn.Linear(256, 128)),
+        #     nn.LayerNorm(128), nn.ReLU(),
+        # )
+        # self.critic_popart = PopArt(128, 1)
+
+        # seperate backbone
+        self.obs_dim = np.array(envs.single_observation_space.shape).prod()
+        joint_critic_dim = self.num_agents * self.obs_dim
         self.critic_mlp = nn.Sequential(
-            layer_init(nn.Linear(critic_in_dim, 256)),
+            layer_init(nn.Linear(joint_critic_dim, 512)), 
+            nn.LayerNorm(512), nn.ReLU(),
+            layer_init(nn.Linear(512, 512)),
+            nn.LayerNorm(512), nn.ReLU(),
+            layer_init(nn.Linear(512, 256)),
             nn.LayerNorm(256), nn.ReLU(),
-            layer_init(nn.Linear(256, 128)),
-            nn.LayerNorm(128), nn.ReLU(),
+            layer_init(nn.Linear(256, 256)),
+            nn.ReLU(),
         )
-        self.critic_popart = PopArt(128, 1)
+
+        self.critic_popart = PopArt(256, 1)
         self.obs_normalizer = GraphObservationNormalizer(n_max=n_max, feature_dim=9, continuous_dim=4)
 
     def get_value(self, x_flat, denormalize=False):
         x_norm = self.obs_normalizer.normalize(x_flat)
-        valid_x, node_embeddings, valid_batch = self.backbone(x_norm)
-        
-        # 1. Global Context (Poolings)
         batch_size = x_flat.shape[0]
-        pooled_mean = global_mean_pool(node_embeddings, valid_batch, size=batch_size)
-        pooled_max = global_max_pool(node_embeddings, valid_batch, size=batch_size)
-
-        # 2. Local Ego Context
-        agent_mask = valid_x[:, 4] > 0.5 # Assuming index 4 is 'is_self' or 'is_agent'
-        ego_embeddings = node_embeddings[agent_mask]
+        num_games = batch_size // self.num_agents
         
-        # 3. Network Density
-        active_counts = torch.bincount(valid_batch, minlength=x_flat.shape[0])
-        density_scalar_expanded = (active_counts.float() / self.n_max).view(-1, 1)
-
-        # 4. Concatenate for Ego-Aware God-View
-        critic_input = torch.cat([
-            pooled_mean, 
-            pooled_max, 
-            ego_embeddings, 
-            density_scalar_expanded
-        ], dim=-1)
+        # Identical CTDE joint-state Critic across MLP, PointNet, Transformer, GCN, and GAT!
+        joint_state = x_norm.view(num_games, -1)
+        expanded_joint_state = joint_state.repeat_interleave(self.num_agents, dim=0)
         
-        values = self.critic_popart(self.critic_mlp(critic_input))
+        values = self.critic_popart(self.critic_mlp(expanded_joint_state)) 
         if denormalize:
             values = self.critic_popart.denormalize(values)
-            
         return values.view(-1, 1)
+
+    # def get_value(self, x_flat, denormalize=False):
+    #     x_norm = self.obs_normalizer.normalize(x_flat)
+    #     valid_x, node_embeddings, valid_batch = self.backbone(x_norm)
+        
+    #     # 1. Global Context (Poolings)
+    #     batch_size = x_flat.shape[0]
+    #     pooled_mean = global_mean_pool(node_embeddings, valid_batch, size=batch_size)
+    #     pooled_max = global_max_pool(node_embeddings, valid_batch, size=batch_size)
+
+    #     # 2. Local Ego Context
+    #     agent_mask = valid_x[:, 4] > 0.5 # Assuming index 4 is 'is_self' or 'is_agent'
+    #     ego_embeddings = node_embeddings[agent_mask]
+        
+    #     # 3. Network Density
+    #     active_counts = torch.bincount(valid_batch, minlength=x_flat.shape[0])
+    #     density_scalar_expanded = (active_counts.float() / self.n_max).view(-1, 1)
+
+    #     # 4. Concatenate for Ego-Aware God-View
+    #     critic_input = torch.cat([
+    #         pooled_mean, 
+    #         pooled_max, 
+    #         ego_embeddings, 
+    #         density_scalar_expanded
+    #     ], dim=-1)
+        
+    #     values = self.critic_popart(self.critic_mlp(critic_input))
+    #     if denormalize:
+    #         values = self.critic_popart.denormalize(values)
+            
+    #     return values.view(-1, 1)
+
+    # def get_action_and_value(self, x_flat, action=None, denormalize=False):
+    #     x_norm = self.obs_normalizer.normalize(x_flat)
+    #     valid_x, node_embeddings, valid_batch = self.backbone(x_norm)
+        
+    #     agent_mask = valid_x[:, 4] > 0.5
+    #     agent_embeddings = node_embeddings[agent_mask] 
+        
+    #     actor_features = self.actor_mlp(agent_embeddings)
+
+    #     action_means = self.actor_mean(actor_features)
+    #     action_logstds = self.actor_logstd.expand_as(action_means)
+        
+    #     # Loosely bound the logstd to prevent NaN explosions
+    #     safe_logstds = torch.clamp(action_logstds, min=-5.0, max=2.0)
+    #     action_stds = safe_logstds.exp()
+        
+    #     probs = Normal(action_means, action_stds)
+        
+    #     if action is None:
+    #         action = probs.sample()
+
+    #     batch_size = x_flat.shape[0]
+    #     pooled_mean = global_mean_pool(node_embeddings, valid_batch, size=batch_size)
+    #     pooled_max = global_max_pool(node_embeddings, valid_batch, size=batch_size)
+
+    #     active_counts = torch.bincount(valid_batch, minlength=x_flat.shape[0])
+    #     density_scalar_expanded = (active_counts.float() / self.n_max).view(-1, 1)
+        
+    #     critic_input = torch.cat([
+    #         pooled_mean, 
+    #         pooled_max, 
+    #         agent_embeddings, 
+    #         density_scalar_expanded
+    #     ], dim=-1)
+        
+    #     values = self.critic_popart(self.critic_mlp(critic_input))
+    #     if denormalize:
+    #         values = self.critic_popart.denormalize(values)
+            
+    #     return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), values.view(-1, 1)
 
     def get_action_and_value(self, x_flat, action=None, denormalize=False):
         x_norm = self.obs_normalizer.normalize(x_flat)
@@ -465,26 +536,10 @@ class GraphAgent(nn.Module):
         
         if action is None:
             action = probs.sample()
-
-        batch_size = x_flat.shape[0]
-        pooled_mean = global_mean_pool(node_embeddings, valid_batch, size=batch_size)
-        pooled_max = global_max_pool(node_embeddings, valid_batch, size=batch_size)
-
-        active_counts = torch.bincount(valid_batch, minlength=x_flat.shape[0])
-        density_scalar_expanded = (active_counts.float() / self.n_max).view(-1, 1)
-        
-        critic_input = torch.cat([
-            pooled_mean, 
-            pooled_max, 
-            agent_embeddings, 
-            density_scalar_expanded
-        ], dim=-1)
-        
-        values = self.critic_popart(self.critic_mlp(critic_input))
-        if denormalize:
-            values = self.critic_popart.denormalize(values)
             
-        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), values.view(-1, 1)
+        # FIX: Directly call the standalone raw-observation Critic!
+        # This also guarantees zero Critic value-loss gradients ever leak into self.backbone.
+        return action, probs.log_prob(action).sum(1), probs.entropy().sum(1), self.get_value(x_flat, denormalize)
 
 class MAPPOAgent(nn.Module):
     def __init__(self, single_action_space, single_obs_shape, num_agents, state_dim, n_max=10):
@@ -794,7 +849,7 @@ class TransformerAgent(nn.Module):
         # Tri-Token Concatenation
         ego_final = out[:, 0, :]
         ego_initial = h[:, 0, :]
-        goal_initial = h[:, self.n_max_nodes // 2, :]
+        goal_initial = h[:, 1, :]
         
         combined_ego = torch.cat([ego_final, ego_initial, goal_initial], dim=-1)
         
@@ -894,7 +949,7 @@ class VMASVectorizedEnv:
         goal_rel = stacked_vmas_obs[:, :, 4:6]
         lidar = stacked_vmas_obs[:, :, 6:6+R]
         
-        angles = torch.linspace(-math.pi, math.pi, R, device=self.device)
+        angles = torch.linspace(-math.pi, math.pi, R + 1, device=self.device)[:-1]
         x = lidar * torch.cos(angles).view(1, 1, R)
         y = lidar * torch.sin(angles).view(1, 1, R)
         lidar_rel_pos = torch.stack([x, y], dim=-1) 
@@ -1106,19 +1161,19 @@ if __name__ == "__main__":
     #     n_max=num_nodes
     # ).to(device)
 
-    # agent = TransformerAgent(
-    #     envs.single_action_space, 
-    #     envs.single_observation_space.shape, 
-    #     num_agents_per_game, 
-    #     state_dim=state_dim, 
-    #     n_max=num_nodes
-    # ).to(device)
-
-    agent = GraphAgent(
-        envs=envs, 
-        n_max=num_nodes, 
-        num_agents=num_agents_per_game
+    agent = TransformerAgent(
+        envs.single_action_space, 
+        envs.single_observation_space.shape, 
+        num_agents_per_game, 
+        state_dim=state_dim, 
+        n_max=num_nodes
     ).to(device)
+
+    # agent = GraphAgent(
+    #     envs=envs, 
+    #     n_max=num_nodes, 
+    #     num_agents=num_agents_per_game
+    # ).to(device)
 
     # optimizer = optim.Adam([
     #             {'params': list(agent.actor.parameters()) + 
@@ -1129,21 +1184,21 @@ if __name__ == "__main__":
     #                        list(agent.critic_popart.parameters()), 'lr': 1e-3} 
     #         ], eps=1e-5)
 
-    optimizer = optim.Adam([
-            {'params': list(agent.backbone.parameters()) + 
-                       list(agent.actor_mlp.parameters()) + 
-                       list(agent.actor_mean.parameters()) + 
-                       [agent.actor_logstd], 'lr': 3e-4}, 
-            
-            {'params': list(agent.critic_mlp.parameters()) + 
-                       list(agent.critic_popart.parameters()), 'lr': 1e-3} 
-        ], eps=1e-5)
-
     # optimizer = optim.Adam([
-    #     {'params': agent.get_actor_parameters(), 'lr': 3e-4}, 
-    #     {'params': list(agent.critic_encoder.parameters()) + 
-    #                 list(agent.critic_popart.parameters()), 'lr': 1e-3} 
-    # ], eps=1e-5)
+    #         {'params': list(agent.backbone.parameters()) + 
+    #                    list(agent.actor_mlp.parameters()) + 
+    #                    list(agent.actor_mean.parameters()) + 
+    #                    [agent.actor_logstd], 'lr': 3e-4}, 
+            
+    #         {'params': list(agent.critic_mlp.parameters()) + 
+    #                    list(agent.critic_popart.parameters()), 'lr': 1e-3} 
+    #     ], eps=1e-5)
+
+    optimizer = optim.Adam([
+        {'params': agent.get_actor_parameters(), 'lr': 3e-4}, 
+        {'params': list(agent.critic_encoder.parameters()) + 
+                    list(agent.critic_popart.parameters()), 'lr': 1e-3} 
+    ], eps=1e-5)
 
     # ALGO Logic: Storage setup
     obs = torch.zeros((args.num_steps, actual_num_envs) + envs.single_observation_space.shape).to(device)

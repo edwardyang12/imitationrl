@@ -947,23 +947,23 @@ class VMASVectorizedEnv:
         graph = torch.cat([gathered_agents, gathered_goals], dim=2) 
         
         # # 11. Zero-Padding if env size N < MAX_CAPACITY
-        if actual_k < MAX_CAPACITY:
-            padding = torch.zeros((B, N, 2 * (MAX_CAPACITY - actual_k), self.feature_dim), device=self.device)
-            graph = torch.cat([graph, padding], dim=2)
+        # if actual_k < MAX_CAPACITY:
+        #     padding = torch.zeros((B, N, 2 * (MAX_CAPACITY - actual_k), self.feature_dim), device=self.device)
+        #     graph = torch.cat([graph, padding], dim=2)
         
         # # 11. ZERO-PADDING FIX
-        # if actual_k < MAX_CAPACITY:
-        #     pad_size = MAX_CAPACITY - actual_k
-        #     padding = torch.zeros((B, N, pad_size, self.feature_dim), device=self.device)
+        if actual_k < MAX_CAPACITY:
+            pad_size = MAX_CAPACITY - actual_k
+            padding = torch.zeros((B, N, pad_size, self.feature_dim), device=self.device)
             
-        #     # Push padded "ghost" nodes 100 meters away and deactivate them
-        #     padding[..., 0:2] = 100.0 
-        #     padding[..., 6] = 0.0 
+            # Push padded "ghost" nodes 100 meters away and deactivate them
+            padding[..., 0:2] = 100.0 
+            padding[..., 6] = 0.0 
             
-        #     # Pad agents and goals SEPARATELY to preserve strict index boundaries
-        #     gathered_agents = torch.cat([gathered_agents, padding.clone()], dim=2)
-        #     gathered_goals = torch.cat([gathered_goals, padding.clone()], dim=2)
-        # graph = torch.cat([gathered_agents, gathered_goals], dim=2) 
+            # Pad agents and goals SEPARATELY to preserve strict index boundaries
+            gathered_agents = torch.cat([gathered_agents, padding.clone()], dim=2)
+            gathered_goals = torch.cat([gathered_goals, padding.clone()], dim=2)
+        graph = torch.cat([gathered_agents, gathered_goals], dim=2) 
 
         # 11. Zero-Padding if env size N < MAX_CAPACITY
         # if actual_k < MAX_CAPACITY:
